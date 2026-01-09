@@ -1,0 +1,80 @@
+[package]
+name = "gosh-dl"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, safe, and reliable download engine written in Rust"
+license = "MIT"
+repository = "https://github.com/goshitsarch-eng/gosh-dl"
+keywords = ["download", "http", "bittorrent", "async"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "sync", "time", "fs", "io-util"] }
+async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+futures = "0.3"
+
+# Platform directories
+dirs = "5"
+
+# URL encoding/decoding
+urlencoding = "2"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bencode = "0.2"
+
+# Crypto
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+rand = "0.8"
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+
+# Data structures
+bytes = "1"
+bitvec = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+
+# Rate limiting
+governor = "0.8"
+
+# DHT (for BitTorrent)
+mainline = "2"
+
+# Multicast sockets (for LPD)
+socket2 = { version = "0.5", features = ["all"] }
+
+# Error handling
+thiserror = "2"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Logging
+tracing = "0.1"
+
+# URL parsing
+url = "2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.6"
+tempfile = "3"
+tracing-subscriber = "0.3"
+
+[features]
+default = []
+io-uring = []  # Linux high-performance I/O (future)
