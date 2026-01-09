@@ -222,6 +222,33 @@ See [technical_spec.md](technical_spec.md) for architecture details.
 
 ---
 
+## Why an API Instead of RPC?
+
+Traditional download managers like aria2 use JSON-RPC for external communication. This works well for standalone tools, but creates friction when embedding download functionality into applications:
+
+**With RPC (aria2 approach):**
+```
+Your App → Serialize JSON → HTTP/WebSocket → aria2 Process → Parse JSON → Execute
+         ← Parse JSON    ← HTTP/WebSocket  ←              ← Serialize JSON ← Result
+```
+
+**With native API (gosh-dl approach):**
+```
+Your App → engine.add_http(url, opts) → Result
+```
+
+### Benefits of the API Approach
+
+- **Zero serialization overhead**: No JSON encoding/decoding on every call. Function arguments pass directly through memory.
+- **Compile-time guarantees**: The Rust compiler catches type mismatches, missing parameters, and invalid states before your code runs. RPC errors only surface at runtime.
+- **Native error handling**: Use `?` operator, pattern matching on `Result`, and standard Rust error propagation. No parsing error strings from JSON responses.
+- **No process coordination**: No need to spawn aria2, monitor if it crashed, restart it, or manage its lifecycle. The engine lives in your process.
+- **Shared memory space**: Progress callbacks, event streams, and status queries happen in-process. No IPC latency or message queue bottlenecks.
+- **Single deployment artifact**: Ship one binary. No bundling platform-specific aria2 executables or dealing with PATH issues.
+- **IDE integration**: Autocomplete, go-to-definition, inline docs all work. RPC calls are opaque strings to your editor.
+
+---
+
 ## Comparison with aria2
 
 gosh-dl was designed as a native Rust alternative to [aria2](https://aria2.github.io/), the popular C++ download utility. While aria2 is excellent as a standalone tool, embedding it in applications requires spawning an external process and communicating via JSON-RPC.
@@ -250,6 +277,40 @@ gosh-dl was designed as a native Rust alternative to [aria2](https://aria2.githu
 | `aria2.tellStopped()` | `engine.stopped()` |
 | `aria2.getGlobalStat()` | `engine.global_stats()` |
 | `aria2.changeOption(gid, {priority})` | `engine.set_priority(id, priority)` |
+
+---
+
+## FAQ
+
+### Why not just use aria2?
+
+aria2 is a battle-tested download utility and remains an excellent choice for many use cases. Use aria2 if:
+
+- You need a standalone command-line tool
+- You're scripting downloads from shell or other languages
+- You want a mature, widely-deployed solution with years of production use
+
+Use gosh-dl if:
+
+- You're building a Rust application and want download functionality as a library
+- You need tight integration without IPC overhead
+- You want compile-time type safety and native async/await
+- You prefer not to bundle and manage external binaries
+- You need direct access to download state without polling JSON-RPC
+
+Both tools support similar feature sets (multi-connection HTTP, BitTorrent, DHT, etc.). The difference is architectural: aria2 is a standalone process you communicate with, gosh-dl is a library you call directly.
+
+### Is there a CLI?
+
+A standalone `gosh-dl` CLI application is coming soon. It will provide command-line access to all engine features for users who prefer terminal workflows or need to script downloads without writing Rust code.
+
+### What Rust version is required?
+
+gosh-dl requires Rust 1.75+ for async trait support.
+
+### Does gosh-dl work on Windows?
+
+Yes. gosh-dl supports Linux, macOS, and Windows. Platform-specific code handles differences in file handling, network interfaces, and path conventions.
 
 ---
 
