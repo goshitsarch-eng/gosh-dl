@@ -833,6 +833,15 @@ impl TorrentDownloader {
                             self.choking_manager.write().peer_disconnected(addr);
                         }
                     }
+
+                    // Cancel stale pending pieces that haven't made progress
+                    // This allows pieces to be re-selected when peers disconnect mid-download
+                    {
+                        let pm_guard = self.piece_manager.read();
+                        if let Some(ref pm) = *pm_guard {
+                            pm.cancel_stale_pieces(self.config.request_timeout);
+                        }
+                    }
                 }
 
                 _ = connect_interval.tick() => {
@@ -1063,6 +1072,9 @@ impl TorrentDownloader {
         let mut last_downloaded: u64 = 0;
         let mut last_uploaded: u64 = 0;
 
+        // Track peer's ut_metadata extension ID for requesting more pieces
+        let mut peer_metadata_ext_id: Option<u8> = None;
+
         // Initialize peer stats entry
         {
             let mut stats = shared_stats.write();
@@ -1089,7 +1101,8 @@ impl TorrentDownloader {
                 break;
             }
 
-            // Receive message (avoid canceling reads to prevent stream desync)
+            // Receive message - DO NOT wrap in timeout as it corrupts the stream
+            // The recv() has its own internal 30s timeout
             match conn.recv().await {
                 Ok(msg) => {
                     match msg {
@@ -1097,19 +1110,33 @@ impl TorrentDownloader {
 
                         PeerMessage::Choke => {
                             // Peer choked us, clear pending
+                            tracing::debug!("[{}] Peer choked us", addr);
                             pending_requests.clear();
                         }
 
                         PeerMessage::Unchoke => {
                             // Can request pieces now
+                            tracing::debug!("[{}] Peer unchoked us", addr);
                         }
 
                         PeerMessage::Have { piece_index: _ } => {
                             // Peer has a new piece - already handled internally by conn
                         }
 
-                        PeerMessage::Bitfield { .. } => {
+                        PeerMessage::Bitfield { bitfield } => {
                             // Already handled internally by conn
+                            let has_count = bitfield.iter().map(|b| b.count_ones()).sum::<u32>();
+                            tracing::debug!("[{}] Received bitfield: peer has {} pieces", addr, has_count);
+                        }
+
+                        PeerMessage::HaveAll => {
+                            // BEP 6: Peer has all pieces - handled internally by conn
+                            tracing::debug!("[{}] Peer has all pieces (HaveAll)", addr);
+                        }
+
+                        PeerMessage::HaveNone => {
+                            // BEP 6: Peer has no pieces - handled internally by conn
+                            tracing::debug!("[{}] Peer has no pieces (HaveNone)", addr);
                         }
 
                         PeerMessage::Piece { index, begin, block } => {
@@ -1151,7 +1178,8 @@ impl TorrentDownloader {
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!("Error adding block: {}", e);
+                                        // This can happen if a stale piece was cancelled - not a real error
+                                        tracing::debug!("Block for cancelled piece: {}", e);
                                     }
                                 }
                             }
@@ -1229,6 +1257,8 @@ impl TorrentDownloader {
                                     // Check for ut_metadata support
                                     if let Some(metadata_id) = handshake.extensions.get(METADATA_EXTENSION_NAME) {
                                         tracing::debug!("Peer {} supports ut_metadata (id={})", addr, metadata_id);
+                                        // Store peer's metadata extension ID for later requests
+                                        peer_metadata_ext_id = Some(*metadata_id);
                                         // If we need metadata, request it
                                         if let Some(ref fetcher) = downloader.metadata_fetcher {
                                             if !fetcher.is_complete().await {
@@ -1264,6 +1294,17 @@ impl TorrentDownloader {
                                                     *downloader.piece_manager.write() = Some(pm);
                                                     *downloader.state.write() = TorrentState::Downloading;
                                                 }
+                                            } else {
+                                                // Not complete yet - request more pieces
+                                                if let Some(peer_ext_id) = peer_metadata_ext_id {
+                                                    let needed = fetcher.get_needed_pieces().await;
+                                                    for piece in needed.into_iter().take(2) {
+                                                        let msg = MetadataMessage::request(piece);
+                                                        if conn.send_extension_message(peer_ext_id, msg.encode()).await.is_ok() {
+                                                            fetcher.mark_requested(piece).await;
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1276,7 +1317,7 @@ impl TorrentDownloader {
                 }
 
                 Err(e) => {
-                    // Connection error
+                    // Connection error from recv
                     tracing::debug!("Peer {} recv error: {}", addr, e);
                     break;
                 }
@@ -1293,10 +1334,13 @@ impl TorrentDownloader {
 
             // Request more blocks if we have capacity and peer is unchoked
             if !conn.peer_choking() && pending_requests.len() < max_pending {
-                // Get blocks to request while holding the lock briefly
+                // Get all blocks to request in one pass
                 let blocks_to_request: Vec<BlockRequest> = {
                     let pm_guard = downloader.piece_manager.read();
                     if let Some(ref pm) = *pm_guard {
+                        let peer_pieces = conn.peer_pieces();
+                        let slots_available = max_pending - pending_requests.len();
+
                         // Check for endgame mode (10 or fewer pieces remaining)
                         let endgame_pieces = pm.endgame_pieces();
                         if !endgame_pieces.is_empty() {
@@ -1311,37 +1355,56 @@ impl TorrentDownloader {
                             }
 
                             // In endgame mode: request all pending blocks that the peer has
-                            // This allows requesting same blocks from multiple peers
                             pm.endgame_requests()
                                 .into_iter()
                                 .filter(|req| conn.peer_has_piece(req.piece as usize))
-                                .take(max_pending - pending_requests.len())
+                                .take(slots_available)
                                 .collect()
                         } else {
-                            // Normal mode: use rarest-first piece selection
-                            if let Some(piece_idx) = pm.select_piece(conn.peer_pieces()) {
-                                if pm.start_piece(piece_idx).is_some() {
-                                    pm.get_block_requests(piece_idx)
-                                        .into_iter()
-                                        .take(max_pending - pending_requests.len())
-                                        .collect()
-                                } else {
-                                    Vec::new()
+                            // Normal mode: collect blocks to fill the pipeline
+                            let mut blocks = Vec::with_capacity(slots_available);
+
+                            // First, get unrequested blocks from pieces we're already downloading
+                            for piece_idx in pm.pending_pieces() {
+                                if blocks.len() >= slots_available {
+                                    break;
                                 }
-                            } else {
-                                Vec::new()
+                                if conn.peer_has_piece(piece_idx as usize) {
+                                    for b in pm.get_block_requests(piece_idx) {
+                                        if blocks.len() >= slots_available {
+                                            break;
+                                        }
+                                        blocks.push(b);
+                                    }
+                                }
                             }
+
+                            // Then select new pieces if we still have capacity
+                            while blocks.len() < slots_available {
+                                if let Some(piece_idx) = pm.select_piece(peer_pieces) {
+                                    if pm.start_piece(piece_idx).is_some() {
+                                        for b in pm.get_block_requests(piece_idx) {
+                                            if blocks.len() >= slots_available {
+                                                break;
+                                            }
+                                            blocks.push(b);
+                                        }
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            blocks
                         }
                     } else {
                         Vec::new()
                     }
                 };
 
-                // Now send requests without holding the lock
-                for block in blocks_to_request {
+                // Send all requests
+                for block in &blocks_to_request {
                     let key = (block.piece, block.offset, block.length);
-                    // In endgame mode we allow requesting blocks we've already requested
-                    // from other peers, but not from the same peer
                     if !pending_requests.contains(&key)
                         && conn.request_block(block.piece, block.offset, block.length).await.is_ok()
                     {

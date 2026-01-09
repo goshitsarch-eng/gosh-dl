@@ -64,6 +64,8 @@ pub struct PendingPiece {
     pub blocks_received: usize,
     /// When we started downloading this piece
     pub started_at: Instant,
+    /// Last time we received a block (for stale detection)
+    pub last_activity: Instant,
     /// Which blocks have been requested (block index -> peer that requested)
     pub requested_blocks: HashMap<u32, usize>,
 }
@@ -74,13 +76,15 @@ impl PendingPiece {
         let block_size = BLOCK_SIZE as u64;
         let num_blocks = piece_length.div_ceil(block_size) as usize;
 
+        let now = Instant::now();
         Self {
             index,
             length: piece_length,
             blocks: vec![None; num_blocks],
             block_size: BLOCK_SIZE,
             blocks_received: 0,
-            started_at: Instant::now(),
+            started_at: now,
+            last_activity: now,
             requested_blocks: HashMap::new(),
         }
     }
@@ -129,6 +133,7 @@ impl PendingPiece {
 
         self.blocks[block_index] = Some(data);
         self.requested_blocks.remove(&(block_index as u32));
+        self.last_activity = Instant::now();
 
         true
     }
@@ -492,6 +497,7 @@ impl PieceManager {
             block_size: p.block_size,
             blocks_received: 0,
             started_at: p.started_at,
+            last_activity: p.last_activity,
             requested_blocks: HashMap::new(),
         })
     }
@@ -651,6 +657,39 @@ impl PieceManager {
     /// Cancel a pending piece (e.g., due to timeout)
     pub fn cancel_piece(&self, index: u32) {
         self.pending.write().remove(&index);
+    }
+
+    /// Cancel stale pending pieces that haven't received any blocks recently.
+    ///
+    /// This prevents pieces from getting stuck in the pending state forever
+    /// when a peer disconnects mid-download.
+    ///
+    /// Returns the number of pieces cancelled.
+    pub fn cancel_stale_pieces(&self, timeout: std::time::Duration) -> usize {
+        let mut pending = self.pending.write();
+        let now = Instant::now();
+
+        let stale: Vec<u32> = pending
+            .iter()
+            .filter(|(_, piece)| {
+                // A piece is stale if:
+                // 1. No blocks have been received within the timeout period, AND
+                // 2. It hasn't received all its blocks yet
+                !piece.is_complete() && now.duration_since(piece.last_activity) > timeout
+            })
+            .map(|(&idx, _)| idx)
+            .collect();
+
+        let count = stale.len();
+        for idx in stale {
+            pending.remove(&idx);
+        }
+
+        if count > 0 {
+            tracing::debug!("Cancelled {} stale pending pieces (timeout {:?})", count, timeout);
+        }
+
+        count
     }
 
     /// Get blocks to request for a piece
@@ -999,6 +1038,7 @@ impl Clone for PendingPiece {
             block_size: self.block_size,
             blocks_received: self.blocks_received,
             started_at: self.started_at,
+            last_activity: self.last_activity,
             requested_blocks: self.requested_blocks.clone(),
         }
     }

@@ -862,6 +862,14 @@ impl PeerConnection {
             PeerMessage::Piece { block, .. } => {
                 self.downloaded += block.len() as u64;
             }
+            PeerMessage::HaveAll => {
+                // BEP 6: Peer has all pieces
+                self.peer_pieces.fill(true);
+            }
+            PeerMessage::HaveNone => {
+                // BEP 6: Peer has no pieces
+                self.peer_pieces.fill(false);
+            }
             _ => {}
         }
     }
