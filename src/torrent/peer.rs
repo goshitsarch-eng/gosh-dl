@@ -1013,12 +1013,17 @@ impl PeerConnection {
     /// Send extension handshake to peer.
     ///
     /// Should be called after the regular handshake if both peers support extensions.
-    pub async fn send_extension_handshake(&mut self, listen_port: Option<u16>) -> Result<()> {
+    pub async fn send_extension_handshake(
+        &mut self,
+        metadata_id: Option<u8>,
+        listen_port: Option<u16>,
+    ) -> Result<()> {
         if !self.supports_extensions() {
             return Ok(()); // Peer doesn't support extensions
         }
 
-        let payload = pex::build_extension_handshake(OUR_PEX_EXTENSION_ID, listen_port);
+        let payload =
+            pex::build_extension_handshake(OUR_PEX_EXTENSION_ID, metadata_id, listen_port);
         self.send(PeerMessage::Extended { id: 0, payload }).await
     }
 

@@ -21,6 +21,7 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use url::Url;
 
@@ -52,6 +53,7 @@ struct HttpDownloadHandle {
 struct TorrentDownloadHandle {
     downloader: Arc<TorrentDownloader>,
     task: tokio::task::JoinHandle<Result<()>>,
+    progress_task: tokio::task::JoinHandle<()>,
 }
 
 /// The main download engine
@@ -288,6 +290,27 @@ impl DownloadEngine {
         Ok(())
     }
 
+    fn build_torrent_status_info(metainfo: &Metainfo) -> TorrentStatusInfo {
+        TorrentStatusInfo {
+            files: metainfo
+                .info
+                .files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| TorrentFile {
+                    index: i,
+                    path: f.path.clone(),
+                    size: f.length,
+                    completed: 0,
+                    selected: true,
+                })
+                .collect(),
+            piece_length: metainfo.info.piece_length,
+            pieces_count: metainfo.info.pieces.len(),
+            private: metainfo.info.private,
+        }
+    }
+
     /// Add an HTTP/HTTPS download
     pub async fn add_http(
         self: &Arc<Self>,
@@ -428,24 +451,7 @@ impl DownloadEngine {
                 etag: None,
                 last_modified: None,
             },
-            torrent_info: Some(TorrentStatusInfo {
-                files: metainfo
-                    .info
-                    .files
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| TorrentFile {
-                        index: i,
-                        path: f.path.clone(),
-                        size: f.length,
-                        completed: 0,
-                        selected: true,
-                    })
-                    .collect(),
-                piece_length: metainfo.info.piece_length,
-                pieces_count: metainfo.info.pieces.len() / 20,
-                private: metainfo.info.private,
-            }),
+            torrent_info: Some(Self::build_torrent_status_info(&metainfo)),
             peers: Some(Vec::new()),
             created_at: Utc::now(),
             completed_at: None,
@@ -644,6 +650,12 @@ impl DownloadEngine {
             Ok(())
         });
 
+        let progress_task = Self::spawn_torrent_progress_task(
+            Arc::clone(self),
+            id,
+            Arc::clone(&downloader),
+        );
+
         // Store the handle
         {
             let mut downloads = self.downloads.write();
@@ -651,6 +663,7 @@ impl DownloadEngine {
                 download.handle = Some(DownloadHandle::Torrent(TorrentDownloadHandle {
                     downloader,
                     task,
+                    progress_task,
                 }));
             }
         }
@@ -743,6 +756,12 @@ impl DownloadEngine {
             Ok(())
         });
 
+        let progress_task = Self::spawn_torrent_progress_task(
+            Arc::clone(self),
+            id,
+            Arc::clone(&downloader),
+        );
+
         // Store the handle
         {
             let mut downloads = self.downloads.write();
@@ -750,11 +769,65 @@ impl DownloadEngine {
                 download.handle = Some(DownloadHandle::Torrent(TorrentDownloadHandle {
                     downloader,
                     task,
+                    progress_task,
                 }));
             }
         }
 
         Ok(())
+    }
+
+    fn spawn_torrent_progress_task(
+        engine: Arc<Self>,
+        id: DownloadId,
+        downloader: Arc<TorrentDownloader>,
+    ) -> tokio::task::JoinHandle<()> {
+        let shutdown = engine.shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+
+                let progress = downloader.progress();
+                let metainfo = downloader.metainfo();
+                let send_progress = {
+                    let mut downloads = engine.downloads.write();
+                    let download = match downloads.get_mut(&id) {
+                        Some(download) => download,
+                        None => break,
+                    };
+
+                    if matches!(download.status.state, DownloadState::Error { .. } | DownloadState::Completed) {
+                        break;
+                    }
+
+                    if let Some(ref metainfo) = metainfo {
+                        if download.status.torrent_info.is_none() {
+                            download.status.torrent_info =
+                                Some(Self::build_torrent_status_info(metainfo));
+                        }
+                        if download.status.metadata.name != metainfo.info.name {
+                            download.status.metadata.name = metainfo.info.name.clone();
+                        }
+                        if download.status.metadata.filename.as_deref()
+                            != Some(metainfo.info.name.as_str())
+                        {
+                            download.status.metadata.filename = Some(metainfo.info.name.clone());
+                        }
+                    }
+
+                    download.status.progress = progress.clone();
+                    download.status.state.is_active()
+                };
+
+                if send_progress {
+                    let _ = engine.event_tx.send(DownloadEvent::Progress { id, progress });
+                }
+            }
+        })
     }
 
     /// Start a download task
@@ -944,6 +1017,7 @@ impl DownloadEngine {
                     }
                     DownloadHandle::Torrent(h) => {
                         h.downloader.pause();
+                        download.handle = Some(DownloadHandle::Torrent(h));
                         // Don't await the task
                     }
                 }
@@ -1063,6 +1137,7 @@ impl DownloadEngine {
                 }
                 DownloadHandle::Torrent(h) => {
                     drop(h.downloader.stop());
+                    h.progress_task.abort();
                     h.task.abort();
                 }
             }
@@ -1255,6 +1330,7 @@ impl DownloadEngine {
                 }
                 DownloadHandle::Torrent(h) => {
                     drop(h.downloader.stop());
+                    h.progress_task.abort();
                     // Wait for task to finish (with timeout)
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(5),

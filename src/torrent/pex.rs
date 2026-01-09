@@ -364,12 +364,22 @@ impl PexState {
 /// Build the extension handshake dictionary for advertising PEX support.
 ///
 /// Returns the bencoded handshake message to send as Extended message id=0.
-pub fn build_extension_handshake(pex_id: u8, listen_port: Option<u16>) -> Vec<u8> {
+pub fn build_extension_handshake(
+    pex_id: u8,
+    metadata_id: Option<u8>,
+    listen_port: Option<u16>,
+) -> Vec<u8> {
     let mut m = BTreeMap::new();
     m.insert(
         b"ut_pex".to_vec(),
         BencodeValue::Integer(pex_id as i64),
     );
+    if let Some(metadata_id) = metadata_id {
+        m.insert(
+            b"ut_metadata".to_vec(),
+            BencodeValue::Integer(metadata_id as i64),
+        );
+    }
 
     let mut dict = BTreeMap::new();
     dict.insert(b"m".to_vec(), BencodeValue::Dict(m));
@@ -513,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_extension_handshake() {
-        let handshake = build_extension_handshake(1, Some(6881));
+        let handshake = build_extension_handshake(1, None, Some(6881));
         let parsed = parse_extension_handshake(&handshake).unwrap();
 
         assert!(parsed.supports_pex());

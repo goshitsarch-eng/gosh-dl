@@ -376,8 +376,21 @@ impl TorrentDownloader {
         }
     }
 
+    /// Get metainfo if available.
+    pub fn metainfo(&self) -> Option<Arc<Metainfo>> {
+        self.metainfo.read().clone()
+    }
+
     /// Get progress information
     pub fn progress(&self) -> DownloadProgress {
+        let (download_speed, upload_speed) = self.aggregate_transfer_rates();
+        self.stats
+            .download_speed
+            .store(download_speed, Ordering::Relaxed);
+        self.stats
+            .upload_speed
+            .store(upload_speed, Ordering::Relaxed);
+
         let pm_guard = self.piece_manager.read();
 
         let (completed_size, total_size) = if let Some(ref pm) = *pm_guard {
@@ -397,6 +410,19 @@ impl TorrentDownloader {
             peers: self.stats.leechers.load(Ordering::Relaxed) as u32,
             eta_seconds: self.calculate_eta(),
         }
+    }
+
+    fn aggregate_transfer_rates(&self) -> (u64, u64) {
+        let stats = self.shared_peer_stats.read();
+        let mut download_speed = 0u64;
+        let mut upload_speed = 0u64;
+
+        for peer_stats in stats.values() {
+            download_speed = download_speed.saturating_add(peer_stats.download_rate);
+            upload_speed = upload_speed.saturating_add(peer_stats.upload_rate);
+        }
+
+        (download_speed, upload_speed)
     }
 
     /// Calculate ETA in seconds
@@ -592,6 +618,8 @@ impl TorrentDownloader {
             if let Some(ref pm) = *pm_guard {
                 let progress = pm.progress();
                 (progress.verified_bytes, progress.bytes_remaining())
+            } else if let Some(ref magnet) = self.magnet {
+                (0, magnet.exact_length.unwrap_or(1))
             } else {
                 (0, 0)
             }
@@ -930,14 +958,16 @@ impl TorrentDownloader {
                 .collect()
         };
 
-        // Get metainfo for num_pieces
-        let metainfo = self.metainfo.read().clone();
-        let Some(metainfo) = metainfo else {
-            tracing::debug!("No metainfo yet, skipping peer connections");
-            return;
+        let num_pieces = match self.metainfo.read().as_ref() {
+            Some(metainfo) => metainfo.info.pieces.len(),
+            None => {
+                if self.metadata_fetcher.is_none() {
+                    tracing::debug!("No metainfo available, skipping peer connections");
+                    return;
+                }
+                0
+            }
         };
-
-        let num_pieces = metainfo.info.pieces.len();
         let peer_id = *self.tracker_client.peer_id();
         let info_hash = self.info_hash;
 
@@ -993,6 +1023,7 @@ impl TorrentDownloader {
         choking_decisions: Arc<RwLock<HashMap<SocketAddr, bool>>>,
     ) -> Result<()> {
         // Connect to peer
+        let metadata_only = downloader.metadata_fetcher.is_some() && num_pieces == 0;
         let mut conn = PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?;
         tracing::info!("Connected to peer {}", addr);
 
@@ -1000,7 +1031,11 @@ impl TorrentDownloader {
 
         // Send extension handshake if supported
         if conn.supports_extensions() {
-            conn.send_extension_handshake(None).await.ok();
+            let metadata_id = downloader
+                .metadata_fetcher
+                .as_ref()
+                .map(|_| OUR_METADATA_EXTENSION_ID);
+            conn.send_extension_handshake(metadata_id, None).await.ok();
         }
 
         // Initialize PEX state for this connection
@@ -1024,7 +1059,6 @@ impl TorrentDownloader {
 
         // Track pending requests
         let mut pending_requests: HashSet<(u32, u32, u32)> = HashSet::new();
-        let mut last_activity = Instant::now();
         let mut last_stats_update = Instant::now();
         let mut last_downloaded: u64 = 0;
         let mut last_uploaded: u64 = 0;
@@ -1055,16 +1089,9 @@ impl TorrentDownloader {
                 break;
             }
 
-            // Receive message with timeout
-            let recv_result = tokio::time::timeout(
-                Duration::from_millis(100),
-                conn.recv()
-            ).await;
-
-            match recv_result {
-                Ok(Ok(msg)) => {
-                    last_activity = Instant::now();
-
+            // Receive message (avoid canceling reads to prevent stream desync)
+            match conn.recv().await {
+                Ok(msg) => {
                     match msg {
                         PeerMessage::KeepAlive => {}
 
@@ -1248,15 +1275,20 @@ impl TorrentDownloader {
                     }
                 }
 
-                Ok(Err(e)) => {
+                Err(e) => {
                     // Connection error
                     tracing::debug!("Peer {} recv error: {}", addr, e);
                     break;
                 }
+            }
 
-                Err(_) => {
-                    // Timeout - no message, check if we need to request more
-                }
+            if metadata_only && downloader.metainfo.read().is_some() {
+                tracing::debug!(
+                    "Metadata available for {}, reconnecting peer {}",
+                    downloader.name(),
+                    addr
+                );
+                break;
             }
 
             // Request more blocks if we have capacity and peer is unchoked
@@ -1268,6 +1300,16 @@ impl TorrentDownloader {
                         // Check for endgame mode (10 or fewer pieces remaining)
                         let endgame_pieces = pm.endgame_pieces();
                         if !endgame_pieces.is_empty() {
+                            let mut pending = pm.pending_pieces();
+                            for piece_idx in endgame_pieces {
+                                if !pending.contains(&piece_idx)
+                                    && !pm.have_piece(piece_idx as usize)
+                                    && pm.start_piece(piece_idx).is_some()
+                                {
+                                    pending.insert(piece_idx);
+                                }
+                            }
+
                             // In endgame mode: request all pending blocks that the peer has
                             // This allows requesting same blocks from multiple peers
                             pm.endgame_requests()
@@ -1278,10 +1320,14 @@ impl TorrentDownloader {
                         } else {
                             // Normal mode: use rarest-first piece selection
                             if let Some(piece_idx) = pm.select_piece(conn.peer_pieces()) {
-                                pm.get_block_requests(piece_idx)
-                                    .into_iter()
-                                    .take(max_pending - pending_requests.len())
-                                    .collect()
+                                if pm.start_piece(piece_idx).is_some() {
+                                    pm.get_block_requests(piece_idx)
+                                        .into_iter()
+                                        .take(max_pending - pending_requests.len())
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                }
                             } else {
                                 Vec::new()
                             }
@@ -1379,11 +1425,6 @@ impl TorrentDownloader {
                 }
             }
 
-            // Check for timeout
-            if last_activity.elapsed() > Duration::from_secs(120) {
-                tracing::debug!("Peer {} timed out", addr);
-                break;
-            }
         }
 
         // Clean up peer stats on exit
