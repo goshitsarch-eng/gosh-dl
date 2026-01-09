@@ -2,11 +2,16 @@
 name = "gosh-dl"
 version = "0.1.0"
 edition = "2021"
-description = "A fast, safe, and reliable download engine written in Rust"
+rust-version = "1.75"
+description = "A fast, embeddable download engine for Rust. HTTP/HTTPS with multi-connection acceleration and full BitTorrent protocol support."
 license = "MIT"
 repository = "https://github.com/goshitsarch-eng/gosh-dl"
-keywords = ["download", "http", "bittorrent", "async"]
-categories = ["network-programming", "asynchronous"]
+homepage = "https://github.com/goshitsarch-eng/gosh-dl"
+documentation = "https://docs.rs/gosh-dl"
+readme = "README.md"
+authors = ["goshitsarch-eng"]
+keywords = ["download", "http", "bittorrent", "torrent", "async"]
+categories = ["network-programming", "asynchronous", "web-programming"]
 
 [dependencies]
 # Async runtime
