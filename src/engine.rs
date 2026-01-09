@@ -929,25 +929,35 @@ impl DownloadEngine {
 
             match result {
                 Ok((final_path, _segmented_download)) => {
-                    // Update status to completed
-                    {
+                    // Update status to completed (but not if paused - race condition)
+                    let should_complete = {
                         let mut downloads = engine.downloads.write();
                         if let Some(download) = downloads.get_mut(&id) {
-                            download.status.state = DownloadState::Completed;
-                            download.status.completed_at = Some(Utc::now());
-                            download.status.metadata.filename =
-                                final_path.file_name().map(|s| s.to_string_lossy().to_string());
+                            // Don't overwrite Paused state - user paused before completion
+                            if download.status.state == DownloadState::Paused {
+                                false
+                            } else {
+                                download.status.state = DownloadState::Completed;
+                                download.status.completed_at = Some(Utc::now());
+                                download.status.metadata.filename =
+                                    final_path.file_name().map(|s| s.to_string_lossy().to_string());
+                                true
+                            }
+                        } else {
+                            false
                         }
-                    }
+                    };
 
-                    // Clean up saved segments from storage
-                    if let Some(ref storage) = engine.storage {
-                        if let Err(e) = storage.delete_segments(id).await {
-                            tracing::debug!("Failed to clean up segments for {}: {}", id, e);
+                    if should_complete {
+                        // Clean up saved segments from storage
+                        if let Some(ref storage) = engine.storage {
+                            if let Err(e) = storage.delete_segments(id).await {
+                                tracing::debug!("Failed to clean up segments for {}: {}", id, e);
+                            }
                         }
-                    }
 
-                    let _ = engine.event_tx.send(DownloadEvent::Completed { id });
+                        let _ = engine.event_tx.send(DownloadEvent::Completed { id });
+                    }
                 }
                 Err(e) if cancel_token_clone.is_cancelled() => {
                     // Cancelled, already handled
@@ -994,7 +1004,7 @@ impl DownloadEngine {
 
     /// Pause a download
     pub async fn pause(&self, id: DownloadId) -> Result<()> {
-        let status_to_save = {
+        let (status_to_save, segments_to_save) = {
             let mut downloads = self.downloads.write();
             let download = downloads.get_mut(&id).ok_or_else(|| {
                 EngineError::NotFound(id.to_string())
@@ -1007,6 +1017,14 @@ impl DownloadEngine {
                     current_state: format!("{:?}", download.status.state),
                 });
             }
+
+            // Extract segments before taking the handle (for HTTP resume)
+            let segments = match &download.handle {
+                Some(DownloadHandle::Http(h)) => {
+                    h.segmented_download.read().as_ref().map(|sd| sd.segments_with_progress())
+                }
+                _ => None,
+            };
 
             // Cancel the task
             if let Some(handle) = download.handle.take() {
@@ -1035,13 +1053,19 @@ impl DownloadEngine {
             });
             let _ = self.event_tx.send(DownloadEvent::Paused { id });
 
-            download.status.clone()
+            (download.status.clone(), segments)
         };
 
         // Persist to database
         if let Some(ref storage) = self.storage {
             if let Err(e) = storage.save_download(&status_to_save).await {
                 tracing::warn!("Failed to persist paused download {}: {}", id, e);
+            }
+            // Save HTTP segments for resume
+            if let Some(segments) = segments_to_save {
+                if let Err(e) = storage.save_segments(id, &segments).await {
+                    tracing::warn!("Failed to persist segments for paused download {}: {}", id, e);
+                }
             }
         }
 
@@ -1050,7 +1074,8 @@ impl DownloadEngine {
 
     /// Resume a paused download
     pub async fn resume(self: &Arc<Self>, id: DownloadId) -> Result<()> {
-        let (url, options) = {
+        // Get download info and determine type
+        let (kind, url, options, has_torrent_handle) = {
             let downloads = self.downloads.read();
             let download = downloads.get(&id).ok_or_else(|| {
                 EngineError::NotFound(id.to_string())
@@ -1064,9 +1089,7 @@ impl DownloadEngine {
                 });
             }
 
-            let url = download.status.metadata.url.clone().ok_or_else(|| {
-                EngineError::Internal("HTTP download missing URL".to_string())
-            })?;
+            let has_torrent_handle = matches!(download.handle, Some(DownloadHandle::Torrent(_)));
 
             let options = DownloadOptions {
                 save_dir: Some(download.status.metadata.save_dir.clone()),
@@ -1082,28 +1105,52 @@ impl DownloadEngine {
                 ..Default::default()
             };
 
-            (url, options)
+            (download.status.kind, download.status.metadata.url.clone(), options, has_torrent_handle)
         };
 
-        // Load saved segments from storage if available
-        let saved_segments = if let Some(ref storage) = self.storage {
-            match storage.load_segments(id).await {
-                Ok(segments) if !segments.is_empty() => {
-                    tracing::debug!("Loaded {} saved segments for download {}", segments.len(), id);
-                    Some(segments)
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::debug!("Failed to load segments for {}: {}", id, e);
+        match kind {
+            DownloadKind::Http => {
+                // HTTP: restart download with saved segments
+                let url = url.ok_or_else(|| {
+                    EngineError::Internal("HTTP download missing URL".to_string())
+                })?;
+
+                // Load saved segments from storage if available
+                let saved_segments = if let Some(ref storage) = self.storage {
+                    match storage.load_segments(id).await {
+                        Ok(segments) if !segments.is_empty() => {
+                            tracing::debug!("Loaded {} saved segments for download {}", segments.len(), id);
+                            Some(segments)
+                        }
+                        Ok(_) => None,
+                        Err(e) => {
+                            tracing::debug!("Failed to load segments for {}: {}", id, e);
+                            None
+                        }
+                    }
+                } else {
                     None
+                };
+
+                self.start_download(id, url, options, saved_segments).await?;
+            }
+            DownloadKind::Torrent | DownloadKind::Magnet => {
+                // Torrent/Magnet: resume the existing downloader
+                if has_torrent_handle {
+                    let mut downloads = self.downloads.write();
+                    if let Some(download) = downloads.get_mut(&id) {
+                        if let Some(DownloadHandle::Torrent(ref h)) = download.handle {
+                            h.downloader.resume();
+                            download.status.state = DownloadState::Downloading;
+                        }
+                    }
+                } else {
+                    return Err(EngineError::Internal(
+                        "Torrent download has no active handle to resume".to_string()
+                    ));
                 }
             }
-        } else {
-            None
-        };
-
-        // Start the download again with saved segments
-        self.start_download(id, url, options, saved_segments).await?;
+        }
 
         let _ = self.event_tx.send(DownloadEvent::Resumed { id });
 
@@ -1146,7 +1193,13 @@ impl DownloadEngine {
         // Delete files and segments if requested
         if let Some(path) = save_path {
             if path.exists() {
-                tokio::fs::remove_file(&path).await.ok();
+                if path.is_dir() {
+                    // Multi-file torrent: remove entire directory
+                    tokio::fs::remove_dir_all(&path).await.ok();
+                } else {
+                    // Single file: remove the file
+                    tokio::fs::remove_file(&path).await.ok();
+                }
             }
             // Also try to remove partial file
             let partial_path = path.with_extension("part");
