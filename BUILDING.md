@@ -139,7 +139,7 @@ gosh-dl/
 ├── Cargo.toml                 # Crate manifest
 ├── BUILDING.md                # This file
 ├── README.md                  # User-facing documentation
-├── LICENSE                    # AGPL-3.0 license
+├── LICENSE                    # MIT license
 │
 ├── src/
 │   ├── lib.rs                 # Public API, re-exports

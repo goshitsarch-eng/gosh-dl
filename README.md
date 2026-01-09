@@ -197,14 +197,15 @@ let config = EngineConfig {
 ### Bandwidth Scheduling
 
 ```rust
-use gosh_dl::ScheduleRule;
+use gosh_dl::{EngineConfig, ScheduleRule};
 
-// Limit bandwidth during work hours
-let work_hours = ScheduleRule::new()
-    .start_hour(9)
-    .end_hour(17)
-    .weekdays()
-    .download_limit(Some(1024 * 1024)); // 1 MB/s
+// Limit bandwidth during work hours (Mon-Fri, 9am-5pm)
+let work_hours = ScheduleRule::weekdays(
+    9,                      // start_hour
+    17,                     // end_hour
+    Some(1024 * 1024),      // download_limit: 1 MB/s
+    None,                   // upload_limit: unlimited
+);
 
 let config = EngineConfig::default()
     .add_schedule_rule(work_hours);
