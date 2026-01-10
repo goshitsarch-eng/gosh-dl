@@ -1208,10 +1208,13 @@ impl DownloadEngine {
             }
         }
 
-        // Clean up saved segments from storage
+        // Clean up saved segments and download record from storage
         if let Some(ref storage) = self.storage {
             if let Err(e) = storage.delete_segments(id).await {
                 tracing::debug!("Failed to clean up segments for cancelled download {}: {}", id, e);
+            }
+            if let Err(e) = storage.delete_download(id).await {
+                tracing::debug!("Failed to delete download record for {}: {}", id, e);
             }
         }
 
