@@ -1323,17 +1323,27 @@ impl DownloadEngine {
     /// If the download is already active, the priority is updated but
     /// won't affect scheduling until the download is paused and resumed.
     pub fn set_priority(&self, id: DownloadId, priority: DownloadPriority) -> Result<()> {
-        // Update in downloads map
-        {
+        // Update in downloads map and get status for persistence
+        let status_to_save = {
             let mut downloads = self.downloads.write();
             let download = downloads.get_mut(&id).ok_or_else(|| {
                 EngineError::NotFound(id.to_string())
             })?;
             download.status.priority = priority;
-        }
+            download.status.clone()
+        };
 
         // Update in priority queue (affects scheduling if waiting)
         self.priority_queue.set_priority(id, priority);
+
+        // Persist in background (fire-and-forget)
+        if let Some(storage) = self.storage.as_ref().map(Arc::clone) {
+            tokio::spawn(async move {
+                if let Err(e) = storage.save_download(&status_to_save).await {
+                    tracing::debug!("Failed to persist priority change for {}: {}", id, e);
+                }
+            });
+        }
 
         Ok(())
     }
