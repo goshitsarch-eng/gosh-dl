@@ -53,7 +53,7 @@ parking_lot = "0.12"
 governor = "0.8"
 
 # DHT (for BitTorrent)
-mainline = "2"
+mainline = "6"
 
 # Multicast sockets (for LPD)
 socket2 = { version = "0.5", features = ["all"] }

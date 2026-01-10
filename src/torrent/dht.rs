@@ -117,14 +117,14 @@ impl DhtClient {
         };
 
         // Collect peers from the DHT lookup
-        // The mainline crate's get_peers returns Result<IntoIter<Vec<SocketAddr>>>
-        let peers: Vec<SocketAddr> = match self.dht.get_peers(id) {
-            Ok(iter) => iter.flatten().collect(),
-            Err(e) => {
-                tracing::debug!("DHT get_peers failed: {}", e);
-                vec![]
-            }
-        };
+        // In mainline v6, get_peers returns an iterator directly (no Result wrapping)
+        // and yields Vec<SocketAddrV4> items
+        let peers: Vec<SocketAddr> = self
+            .dht
+            .get_peers(id)
+            .flatten()
+            .map(SocketAddr::V4)
+            .collect();
 
         // Update cache
         if !peers.is_empty() {
