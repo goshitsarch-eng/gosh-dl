@@ -1322,6 +1322,8 @@ impl DownloadEngine {
     /// This affects the order in which downloads acquire slots when queued.
     /// If the download is already active, the priority is updated but
     /// won't affect scheduling until the download is paused and resumed.
+    ///
+    /// The priority change is persisted to storage immediately (non-blocking).
     pub fn set_priority(&self, id: DownloadId, priority: DownloadPriority) -> Result<()> {
         // Update in downloads map and get status for persistence
         let status_to_save = {
