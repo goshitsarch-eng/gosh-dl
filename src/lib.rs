@@ -43,6 +43,7 @@ pub mod engine;
 pub mod error;
 pub mod http;
 pub mod priority_queue;
+pub mod protocol;
 pub mod scheduler;
 pub mod storage;
 pub mod torrent;
@@ -52,6 +53,7 @@ pub mod types;
 pub use config::{AllocationMode, EngineConfig, HttpConfig, TorrentConfig};
 pub use engine::DownloadEngine;
 pub use error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result, StorageErrorKind};
+pub use protocol::{ProtocolError, ProtocolResult};
 pub use types::{
     DownloadEvent, DownloadId, DownloadKind, DownloadMetadata, DownloadOptions, DownloadProgress,
     DownloadState, DownloadStatus, GlobalStats, PeerInfo, TorrentFile, TorrentInfo,

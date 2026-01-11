@@ -4,54 +4,15 @@
 //! Downloads are scheduled based on priority (Critical > High > Normal > Low),
 //! with FIFO ordering within the same priority level.
 
-use crate::types::DownloadId;
+use crate::protocol::DownloadId;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-/// Priority levels for downloads
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[repr(i8)]
-pub enum DownloadPriority {
-    /// Low priority - downloads last
-    Low = -1,
-    /// Normal priority - default for most downloads
-    #[default]
-    Normal = 0,
-    /// High priority - downloads before normal
-    High = 1,
-    /// Critical priority - downloads first
-    Critical = 2,
-}
-
-impl std::fmt::Display for DownloadPriority {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Low => write!(f, "low"),
-            Self::Normal => write!(f, "normal"),
-            Self::High => write!(f, "high"),
-            Self::Critical => write!(f, "critical"),
-        }
-    }
-}
-
-impl std::str::FromStr for DownloadPriority {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "low" | "-1" => Ok(Self::Low),
-            "normal" | "0" => Ok(Self::Normal),
-            "high" | "1" => Ok(Self::High),
-            "critical" | "2" => Ok(Self::Critical),
-            _ => Err(format!("Invalid priority: {}", s)),
-        }
-    }
-}
+// Re-export DownloadPriority for backward compatibility
+pub use crate::protocol::DownloadPriority;
 
 /// Entry in the priority queue
 #[derive(Debug, Clone, Eq, PartialEq)]

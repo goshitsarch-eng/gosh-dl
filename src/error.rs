@@ -272,8 +272,48 @@ impl From<serde_json::Error> for EngineError {
     }
 }
 
-impl From<tokio::sync::broadcast::error::SendError<crate::types::DownloadEvent>> for EngineError {
-    fn from(_: tokio::sync::broadcast::error::SendError<crate::types::DownloadEvent>) -> Self {
+impl From<tokio::sync::broadcast::error::SendError<crate::protocol::DownloadEvent>> for EngineError {
+    fn from(_: tokio::sync::broadcast::error::SendError<crate::protocol::DownloadEvent>) -> Self {
         Self::Shutdown
+    }
+}
+
+// Conversion from EngineError to ProtocolError for the public API boundary
+impl From<EngineError> for crate::protocol::ProtocolError {
+    fn from(e: EngineError) -> Self {
+        use crate::protocol::ProtocolError;
+        match e {
+            EngineError::NotFound(id) => ProtocolError::NotFound { id },
+            EngineError::InvalidState {
+                action,
+                current_state,
+            } => ProtocolError::InvalidState {
+                action: action.to_string(),
+                current_state,
+            },
+            EngineError::InvalidInput { field, message } => ProtocolError::InvalidInput {
+                field: field.to_string(),
+                message,
+            },
+            EngineError::Network {
+                message, retryable, ..
+            } => ProtocolError::Network { message, retryable },
+            EngineError::Storage { message, .. } => ProtocolError::Storage { message },
+            EngineError::Protocol { message, .. } => ProtocolError::Network {
+                message,
+                retryable: false,
+            },
+            EngineError::Shutdown => ProtocolError::Shutdown,
+            EngineError::AlreadyExists(id) => ProtocolError::InvalidInput {
+                field: "id".to_string(),
+                message: format!("Download already exists: {}", id),
+            },
+            EngineError::ResourceLimit { resource, limit } => ProtocolError::InvalidInput {
+                field: resource.to_string(),
+                message: format!("Resource limit exceeded (limit: {})", limit),
+            },
+            EngineError::Database(msg) => ProtocolError::Storage { message: msg },
+            EngineError::Internal(msg) => ProtocolError::Internal { message: msg },
+        }
     }
 }
