@@ -6,9 +6,13 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use futures::{SinkExt, StreamExt};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::bencode::BencodeValue;
 use super::metainfo::Sha1Hash;
@@ -164,6 +168,64 @@ pub struct ScrapeResponse {
     pub files: Vec<ScrapeInfo>,
 }
 
+// ============================================================================
+// WebSocket Tracker Protocol Types (for wss:// trackers)
+// ============================================================================
+
+/// WebSocket announce request (JSON format per WebTorrent protocol)
+#[derive(Debug, Serialize)]
+struct WsAnnounceRequest<'a> {
+    action: &'static str,
+    info_hash: String,
+    peer_id: String,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    numwant: Option<u32>,
+    port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offers: Option<&'a [()]>, // Placeholder for WebRTC offers (not used)
+}
+
+/// WebSocket announce response (JSON format)
+#[derive(Debug, Deserialize)]
+struct WsAnnounceResponse {
+    #[serde(default)]
+    interval: Option<u32>,
+    #[serde(default)]
+    complete: Option<u32>,
+    #[serde(default)]
+    incomplete: Option<u32>,
+    #[serde(default)]
+    peers: Option<WsPeers>,
+    #[serde(rename = "failure reason")]
+    failure_reason: Option<String>,
+    #[serde(rename = "warning message")]
+    warning_message: Option<String>,
+}
+
+/// WebSocket peer list format (can be dictionary or compact base64)
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WsPeers {
+    /// Dictionary format with full peer info
+    Dict(Vec<WsPeerInfo>),
+    /// Compact format (base64-encoded binary, 6 bytes per peer)
+    Compact(String),
+}
+
+/// WebSocket peer info (dictionary format)
+#[derive(Debug, Deserialize)]
+struct WsPeerInfo {
+    ip: String,
+    port: u16,
+    #[serde(rename = "peer id")]
+    peer_id: Option<String>,
+}
+
 impl TrackerClient {
     /// Create a new tracker client with a random peer ID
     pub fn new() -> Self {
@@ -194,7 +256,7 @@ impl TrackerClient {
         &self.peer_id
     }
 
-    /// Announce to a tracker (auto-detects HTTP vs UDP)
+    /// Announce to a tracker (auto-detects HTTP, UDP, or WebSocket)
     pub async fn announce(
         &self,
         tracker_url: &str,
@@ -204,6 +266,8 @@ impl TrackerClient {
             self.announce_http(tracker_url, request).await
         } else if tracker_url.starts_with("udp://") {
             self.announce_udp(tracker_url, request).await
+        } else if tracker_url.starts_with("wss://") || tracker_url.starts_with("ws://") {
+            self.announce_ws(tracker_url, request).await
         } else {
             Err(EngineError::protocol(
                 ProtocolErrorKind::TrackerError,
@@ -475,18 +539,22 @@ impl TrackerClient {
         // Remove any path component
         let host_port = url.split('/').next().unwrap_or(url);
 
-        // Resolve address
-        let addr = host_port.to_socket_addrs().map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::DnsResolution,
-                format!("Failed to resolve tracker: {}", e),
-            )
-        })?.next().ok_or_else(|| {
-            EngineError::network(
-                NetworkErrorKind::DnsResolution,
-                "No addresses found for tracker",
-            )
-        })?;
+        // Resolve address (async DNS lookup)
+        let addr = tokio::net::lookup_host(host_port)
+            .await
+            .map_err(|e| {
+                EngineError::network(
+                    NetworkErrorKind::DnsResolution,
+                    format!("Failed to resolve tracker: {}", e),
+                )
+            })?
+            .next()
+            .ok_or_else(|| {
+                EngineError::network(
+                    NetworkErrorKind::DnsResolution,
+                    "No addresses found for tracker",
+                )
+            })?;
 
         // Create UDP socket
         let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
@@ -712,6 +780,173 @@ impl TrackerClient {
         })
     }
 
+    /// Announce to a WebSocket tracker (wss:// or ws://)
+    ///
+    /// Implements the WebTorrent tracker protocol which uses JSON messages
+    /// over WebSocket for announce and response.
+    async fn announce_ws(
+        &self,
+        tracker_url: &str,
+        request: &AnnounceRequest,
+    ) -> Result<AnnounceResponse> {
+        // Connect to WebSocket tracker with timeout
+        let (mut ws_stream, _) = timeout(self.timeout, connect_async(tracker_url))
+            .await
+            .map_err(|_| {
+                EngineError::network(NetworkErrorKind::Timeout, "WebSocket connection timeout")
+            })?
+            .map_err(|e| {
+                EngineError::network(
+                    NetworkErrorKind::ConnectionRefused,
+                    format!("WebSocket connection failed: {}", e),
+                )
+            })?;
+
+        // Build JSON request
+        let ws_request = WsAnnounceRequest {
+            action: "announce",
+            info_hash: hex::encode(request.info_hash),
+            peer_id: hex::encode(request.peer_id),
+            uploaded: request.uploaded,
+            downloaded: request.downloaded,
+            left: request.left,
+            event: match request.event {
+                AnnounceEvent::None => None,
+                AnnounceEvent::Started => Some("started"),
+                AnnounceEvent::Stopped => Some("stopped"),
+                AnnounceEvent::Completed => Some("completed"),
+            },
+            numwant: request.numwant,
+            port: request.port,
+            offers: None,
+        };
+
+        // Serialize and send request
+        let json = serde_json::to_string(&ws_request).map_err(|e| {
+            EngineError::protocol(
+                ProtocolErrorKind::TrackerError,
+                format!("Failed to serialize request: {}", e),
+            )
+        })?;
+
+        ws_stream.send(Message::Text(json)).await.map_err(|e| {
+            EngineError::network(
+                NetworkErrorKind::Other,
+                format!("WebSocket send failed: {}", e),
+            )
+        })?;
+
+        // Receive response with timeout
+        let response = timeout(self.timeout, ws_stream.next())
+            .await
+            .map_err(|_| {
+                EngineError::network(NetworkErrorKind::Timeout, "WebSocket response timeout")
+            })?
+            .ok_or_else(|| {
+                EngineError::network(NetworkErrorKind::ConnectionReset, "WebSocket closed")
+            })?
+            .map_err(|e| {
+                EngineError::network(
+                    NetworkErrorKind::Other,
+                    format!("WebSocket recv failed: {}", e),
+                )
+            })?;
+
+        // Parse response
+        let text = match response {
+            Message::Text(t) => t,
+            Message::Close(_) => {
+                return Err(EngineError::network(
+                    NetworkErrorKind::ConnectionReset,
+                    "WebSocket closed by tracker",
+                ))
+            }
+            _ => {
+                return Err(EngineError::protocol(
+                    ProtocolErrorKind::TrackerError,
+                    "Expected text message from tracker",
+                ))
+            }
+        };
+
+        let ws_response: WsAnnounceResponse = serde_json::from_str(&text).map_err(|e| {
+            EngineError::protocol(
+                ProtocolErrorKind::TrackerError,
+                format!("Invalid tracker response JSON: {}", e),
+            )
+        })?;
+
+        // Check for failure
+        if let Some(failure) = ws_response.failure_reason {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::TrackerError,
+                format!("Tracker error: {}", failure),
+            ));
+        }
+
+        // Parse peers
+        let peers = match ws_response.peers {
+            Some(WsPeers::Dict(list)) => list
+                .into_iter()
+                .map(|p| PeerAddr {
+                    ip: p.ip,
+                    port: p.port,
+                    peer_id: p.peer_id.and_then(|s| {
+                        hex::decode(&s).ok().and_then(|b| {
+                            if b.len() == 20 {
+                                let mut arr = [0u8; 20];
+                                arr.copy_from_slice(&b);
+                                Some(arr)
+                            } else {
+                                None
+                            }
+                        })
+                    }),
+                })
+                .collect(),
+            Some(WsPeers::Compact(encoded)) => {
+                // Decode base64 compact peers (6 bytes per peer: 4 IP + 2 port)
+                let data = BASE64.decode(&encoded).map_err(|_| {
+                    EngineError::protocol(
+                        ProtocolErrorKind::TrackerError,
+                        "Invalid base64 in compact peers",
+                    )
+                })?;
+
+                if data.len() % 6 != 0 {
+                    return Err(EngineError::protocol(
+                        ProtocolErrorKind::TrackerError,
+                        "Invalid compact peers length",
+                    ));
+                }
+
+                data.chunks_exact(6)
+                    .map(|c| PeerAddr {
+                        ip: format!("{}.{}.{}.{}", c[0], c[1], c[2], c[3]),
+                        port: u16::from_be_bytes([c[4], c[5]]),
+                        peer_id: None,
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+
+        let interval = ws_response
+            .interval
+            .unwrap_or(1800)
+            .clamp(MIN_ANNOUNCE_INTERVAL, MAX_ANNOUNCE_INTERVAL);
+
+        Ok(AnnounceResponse {
+            interval,
+            min_interval: None,
+            tracker_id: None,
+            complete: ws_response.complete,
+            incomplete: ws_response.incomplete,
+            peers,
+            warning_message: ws_response.warning_message,
+        })
+    }
+
     /// Scrape a tracker for torrent stats
     pub async fn scrape(
         &self,
@@ -861,17 +1096,22 @@ impl TrackerClient {
 
         let host_port = url.split('/').next().unwrap_or(url);
 
-        let addr = host_port.to_socket_addrs().map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::DnsResolution,
-                format!("Failed to resolve tracker: {}", e),
-            )
-        })?.next().ok_or_else(|| {
-            EngineError::network(
-                NetworkErrorKind::DnsResolution,
-                "No addresses found for tracker",
-            )
-        })?;
+        // Resolve address (async DNS lookup)
+        let addr = tokio::net::lookup_host(host_port)
+            .await
+            .map_err(|e| {
+                EngineError::network(
+                    NetworkErrorKind::DnsResolution,
+                    format!("Failed to resolve tracker: {}", e),
+                )
+            })?
+            .next()
+            .ok_or_else(|| {
+                EngineError::network(
+                    NetworkErrorKind::DnsResolution,
+                    "No addresses found for tracker",
+                )
+            })?;
 
         let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
             EngineError::network(

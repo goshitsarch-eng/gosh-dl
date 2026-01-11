@@ -33,7 +33,8 @@ A standalone CLI application is coming soon for those who need command-line acce
 - DHT for trackerless downloads (BEP 5)
 - Peer Exchange (BEP 11)
 - Local Peer Discovery (BEP 14)
-- UDP tracker support (BEP 15)
+- HTTP and UDP tracker support (BEP 3, BEP 15)
+- WebSocket tracker support (wss://, ws://) for WebTorrent compatibility
 - WebSeeds (BEP 17 Hoffman-style, BEP 19 GetRight-style)
 - Message Stream Encryption (MSE/PE)
 - uTP transport protocol (BEP 29) with LEDBAT congestion control
@@ -89,6 +90,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## API Overview
 
+All public types are available at the crate root via re-exports. For explicit imports, use `gosh_dl::protocol`:
+
+```rust
+use gosh_dl::protocol::{DownloadEvent, DownloadStatus, ProtocolError};
+```
+
 ### Download Management
 
 ```rust
@@ -117,8 +124,7 @@ let stats = engine.global_stats();
 ### Download Options
 
 ```rust
-use gosh_dl::{DownloadOptions, DownloadPriority};
-use gosh_dl::http::ExpectedChecksum;
+use gosh_dl::{DownloadOptions, DownloadPriority, ExpectedChecksum};
 
 let options = DownloadOptions {
     priority: DownloadPriority::High,

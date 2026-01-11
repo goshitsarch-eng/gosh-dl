@@ -31,11 +31,22 @@ A native Rust download engine supporting HTTP/HTTPS and BitTorrent protocols.
 src/
 ├── lib.rs                 # Public API, re-exports
 ├── engine.rs              # DownloadEngine - main coordinator
-├── types.rs               # Core types (DownloadId, Status, Progress)
-├── error.rs               # Typed error hierarchy
+├── types.rs               # Re-exports protocol types (backward compat)
+├── error.rs               # Internal EngineError + ProtocolError conversion
 ├── config.rs              # EngineConfig and sub-configs
 ├── priority_queue.rs      # Priority-based download scheduling
 ├── scheduler.rs           # Time-based bandwidth scheduling
+│
+├── protocol/              # Boundary types (engine ↔ consumer)
+│   ├── mod.rs             # Re-exports all protocol types
+│   ├── types.rs           # DownloadId, DownloadKind, State, Progress
+│   ├── options.rs         # DownloadOptions, DownloadPriority
+│   ├── status.rs          # DownloadStatus, DownloadMetadata, GlobalStats
+│   ├── events.rs          # DownloadEvent enum
+│   ├── torrent.rs         # TorrentInfo, TorrentFile, PeerInfo
+│   ├── checksum.rs        # ChecksumAlgorithm, ExpectedChecksum
+│   ├── scheduler.rs       # ScheduleRule, BandwidthLimits
+│   └── error.rs           # ProtocolError (simplified boundary error)
 │
 ├── http/                  # HTTP download engine
 │   ├── mod.rs             # HttpDownloader
@@ -43,7 +54,7 @@ src/
 │   ├── connection.rs      # Connection pooling, rate limiting
 │   ├── resume.rs          # Resume detection and validation
 │   ├── mirror.rs          # Mirror failover management
-│   └── checksum.rs        # MD5/SHA256 verification
+│   └── checksum.rs        # MD5/SHA256 verification (re-exports types)
 │
 ├── torrent/               # BitTorrent engine
 │   ├── mod.rs             # TorrentDownloader
@@ -230,6 +241,62 @@ pub enum ProtocolErrorKind {
     InvalidMagnet, HashMismatch, TrackerError, PeerProtocol, BencodeParse,
     DhtError, PexError, LpdError, MetadataError,
 }
+```
+
+### Protocol Error (Boundary)
+
+`ProtocolError` is a simplified error type for consumers, hiding internal implementation details:
+
+```rust
+pub enum ProtocolError {
+    NotFound { id: String },
+    InvalidState { action: String, current_state: String },
+    InvalidInput { field: String, message: String },
+    Network { message: String, retryable: bool },
+    Storage { message: String },
+    Shutdown,
+    Internal { message: String },
+}
+
+pub type ProtocolResult<T> = Result<T, ProtocolError>;
+```
+
+`EngineError` converts to `ProtocolError` at the public API boundary via `From` impl.
+
+---
+
+## Protocol Module
+
+The `protocol/` module contains all types that cross the engine boundary. These are the messages exchanged between the engine and its consumers (GUI, CLI, etc.).
+
+### Design Principles
+
+- **Types only**: No logic, just data structures
+- **Boundary types**: Everything that enters or exits the engine
+- **Serializable**: All types derive `serde::Serialize` and `serde::Deserialize`
+- **Backward compatible**: Original modules re-export from protocol
+
+### Protocol Types
+
+| File | Types | Purpose |
+|------|-------|---------|
+| `types.rs` | `DownloadId`, `DownloadKind`, `DownloadState`, `DownloadProgress` | Core identifiers and state |
+| `options.rs` | `DownloadOptions`, `DownloadPriority` | Input to add_* methods |
+| `status.rs` | `DownloadStatus`, `DownloadMetadata`, `GlobalStats` | Status queries |
+| `events.rs` | `DownloadEvent` | Event stream |
+| `torrent.rs` | `TorrentInfo`, `TorrentFile`, `TorrentStatusInfo`, `PeerInfo` | Torrent metadata |
+| `checksum.rs` | `ChecksumAlgorithm`, `ExpectedChecksum` | Verification |
+| `scheduler.rs` | `ScheduleRule`, `BandwidthLimits` | Bandwidth scheduling |
+| `error.rs` | `ProtocolError`, `ProtocolResult` | Simplified errors |
+
+### Usage
+
+```rust
+// New style: import directly from protocol
+use gosh_dl::protocol::{DownloadEvent, DownloadStatus, ProtocolError};
+
+// Old style: still works via re-exports
+use gosh_dl::{DownloadEvent, DownloadStatus};
 ```
 
 ---
@@ -475,6 +542,41 @@ pub struct AnnounceResponse {
 ```
 
 **UDP Tracker (BEP 15):** Uses connection ID handshake with magic `0x41727101980`.
+
+**WebSocket Tracker (WebTorrent Protocol):**
+
+WebSocket trackers use JSON messages over WebSocket connections, compatible with the WebTorrent ecosystem:
+
+```rust
+// Request format
+{
+    "action": "announce",
+    "info_hash": "<40-char hex>",
+    "peer_id": "<40-char hex>",
+    "uploaded": 0,
+    "downloaded": 0,
+    "left": 12345,
+    "event": "started",  // or "completed", "stopped", null
+    "numwant": 50,
+    "port": 6881
+}
+
+// Response format
+{
+    "action": "announce",
+    "interval": 120,
+    "complete": 5,      // seeders
+    "incomplete": 10,   // leechers
+    "peers": [
+        {"ip": "1.2.3.4", "port": 6881, "peer id": "<hex>"},
+        ...
+    ]
+    // OR compact format:
+    "peers": "<base64-encoded 6-byte-per-peer>"
+}
+```
+
+Supports both `wss://` (TLS) and `ws://` URLs. Connection timeout and response timeout match the configured tracker timeout (default 15 seconds).
 
 ### Peer Wire Protocol
 
