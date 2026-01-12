@@ -309,7 +309,7 @@ Both tools support similar feature sets (multi-connection HTTP, BitTorrent, DHT,
 
 ### Is there a CLI?
 
-A standalone `gosh-dl` CLI application is coming soon. It will provide command-line access to all engine features for users who prefer terminal workflows or need to script downloads without writing Rust code.
+A standalone `gosh-dl` CLI application is now available and can be found here: [gosh-dl-cli](https://github.com/goshitsarch-eng/gosh-dl-cli). It allows command-line access to all engine features for users who prefer terminal workflows or need to script downloads without writing Rust code.
 
 ### What Rust version is required?
 
