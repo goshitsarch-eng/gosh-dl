@@ -570,11 +570,14 @@ impl PieceManager {
             have.set(index as usize, true);
         }
 
-        self.pending.write().remove(&index);
-
-        self.verified_count.fetch_add(1, Ordering::Relaxed);
-        self.verified_bytes
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        // Only increment counters if we successfully removed the piece.
+        // This prevents double-counting in endgame mode when multiple peers
+        // send the same piece and both threads race through verify_and_save.
+        if self.pending.write().remove(&index).is_some() {
+            self.verified_count.fetch_add(1, Ordering::Relaxed);
+            self.verified_bytes
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
 
         Ok(true)
     }
