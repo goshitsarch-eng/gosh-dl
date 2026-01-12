@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Fixed progress reporting exceeding 100% in BitTorrent endgame mode
+  - Race condition in `verify_and_save()` allowed multiple threads to increment `verified_bytes` for the same piece
+  - Now only the first thread to remove a piece from pending increments the counters
+
 ## [0.1.4] - 2025-01-10
 
 ### Added
