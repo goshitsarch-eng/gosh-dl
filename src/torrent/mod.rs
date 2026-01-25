@@ -33,18 +33,23 @@ pub use choking::{ChokingConfig, ChokingDecision, ChokingManager, PeerStats};
 pub use dht::{DhtClient, DhtManager};
 pub use lpd::{LocalPeer, LpdManager, LpdService};
 pub use magnet::MagnetUri;
-pub use metadata::{MetadataFetcher, MetadataMessage, MetadataMessageType, METADATA_EXTENSION_NAME, OUR_METADATA_EXTENSION_ID};
+pub use metadata::{
+    MetadataFetcher, MetadataMessage, MetadataMessageType, METADATA_EXTENSION_NAME,
+    OUR_METADATA_EXTENSION_ID,
+};
 pub use metainfo::{FileInfo, Info, Metainfo, Sha1Hash};
+pub use mse::{connect_with_mse, EncryptedStream, EncryptionPolicy, MseConfig, PeerStream};
 pub use peer::{ConnectionState, PeerConnection, PeerMessage, BLOCK_SIZE, OUR_PEX_EXTENSION_ID};
 pub use pex::{ExtensionHandshake, PexMessage, PexState, PEX_EXTENSION_NAME};
 pub use piece::{BlockRequest, PendingPiece, PieceManager, PieceProgress};
-pub use webseed::{WebSeed, WebSeedConfig, WebSeedEvent, WebSeedManager, WebSeedState, WebSeedType};
-pub use mse::{EncryptedStream, EncryptionPolicy, MseConfig, PeerStream, connect_with_mse};
-pub use transport::{PeerTransport, TcpTransport, TransportType};
-pub use utp::{UtpConfig, UtpMux, UtpSocket};
 pub use tracker::{
     AnnounceEvent, AnnounceRequest, AnnounceResponse, PeerAddr, ScrapeInfo, ScrapeRequest,
     ScrapeResponse, TrackerClient,
+};
+pub use transport::{PeerTransport, TcpTransport, TransportType};
+pub use utp::{UtpConfig, UtpMux, UtpSocket};
+pub use webseed::{
+    WebSeed, WebSeedConfig, WebSeedEvent, WebSeedManager, WebSeedState, WebSeedType,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -401,7 +406,11 @@ impl TorrentDownloader {
         };
 
         DownloadProgress {
-            total_size: if total_size > 0 { Some(total_size) } else { None },
+            total_size: if total_size > 0 {
+                Some(total_size)
+            } else {
+                None
+            },
             completed_size,
             download_speed: self.stats.download_speed.load(Ordering::Relaxed),
             upload_speed: self.stats.upload_speed.load(Ordering::Relaxed),
@@ -511,10 +520,7 @@ impl TorrentDownloader {
 
         // Check if torrent has webseeds
         if !metainfo.has_webseeds() {
-            tracing::debug!(
-                "No webseeds for torrent {}",
-                self.info_hash_hex()
-            );
+            tracing::debug!("No webseeds for torrent {}", self.info_hash_hex());
             return;
         }
 
@@ -526,17 +532,18 @@ impl TorrentDownloader {
 
         // Create webseed manager
         let config = WebSeedConfig::default();
-        let (manager, mut event_rx) = match WebSeedManager::new(metainfo.clone(), piece_manager.clone(), config) {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to create WebSeedManager for torrent {}: {}",
-                    self.info_hash_hex(),
-                    e
-                );
-                return;
-            }
-        };
+        let (manager, mut event_rx) =
+            match WebSeedManager::new(metainfo.clone(), piece_manager.clone(), config) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to create WebSeedManager for torrent {}: {}",
+                        self.info_hash_hex(),
+                        e
+                    );
+                    return;
+                }
+            };
         let manager = Arc::new(manager);
 
         // Store manager reference
@@ -557,9 +564,16 @@ impl TorrentDownloader {
         let event_handle = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 match event {
-                    WebSeedEvent::PieceComplete { piece_index, data, source_url } => {
+                    WebSeedEvent::PieceComplete {
+                        piece_index,
+                        data,
+                        source_url,
+                    } => {
                         // Write piece to disk (already verified in webseed manager)
-                        match piece_manager_clone.write_piece_from_webseed(piece_index, &data).await {
+                        match piece_manager_clone
+                            .write_piece_from_webseed(piece_index, &data)
+                            .await
+                        {
                             Ok(()) => {
                                 tracing::debug!(
                                     "WebSeed piece {} saved from {}",
@@ -576,7 +590,12 @@ impl TorrentDownloader {
                             }
                         }
                     }
-                    WebSeedEvent::PieceFailed { piece_index, source_url, error, .. } => {
+                    WebSeedEvent::PieceFailed {
+                        piece_index,
+                        source_url,
+                        error,
+                        ..
+                    } => {
                         tracing::debug!(
                             "WebSeed piece {} failed from {}: {}",
                             piece_index,
@@ -585,11 +604,7 @@ impl TorrentDownloader {
                         );
                     }
                     WebSeedEvent::SpeedUpdate { source_url, speed } => {
-                        tracing::trace!(
-                            "WebSeed {} speed: {} bytes/sec",
-                            source_url,
-                            speed
-                        );
+                        tracing::trace!("WebSeed {} speed: {} bytes/sec", source_url, speed);
                     }
                 }
             }
@@ -605,10 +620,7 @@ impl TorrentDownloader {
         let trackers = self.get_tracker_urls();
 
         if trackers.is_empty() {
-            tracing::warn!(
-                "No trackers available for torrent {}",
-                self.info_hash_hex()
-            );
+            tracing::warn!("No trackers available for torrent {}", self.info_hash_hex());
             return Ok(());
         }
 
@@ -731,7 +743,10 @@ impl TorrentDownloader {
     /// Check if download is complete
     pub fn is_complete(&self) -> bool {
         let pm_guard = self.piece_manager.read();
-        pm_guard.as_ref().map(|pm| pm.is_complete()).unwrap_or(false)
+        pm_guard
+            .as_ref()
+            .map(|pm| pm.is_complete())
+            .unwrap_or(false)
     }
 
     /// Get number of connected peers
@@ -864,7 +879,10 @@ impl TorrentDownloader {
             // Check if download is complete
             let is_complete = {
                 let pm_guard = self.piece_manager.read();
-                pm_guard.as_ref().map(|pm| pm.is_complete()).unwrap_or(false)
+                pm_guard
+                    .as_ref()
+                    .map(|pm| pm.is_complete())
+                    .unwrap_or(false)
             };
 
             if is_complete {
@@ -925,7 +943,10 @@ impl TorrentDownloader {
             return;
         }
 
-        let decisions = self.choking_manager.write().recalculate(&peer_stats, is_seeding);
+        let decisions = self
+            .choking_manager
+            .write()
+            .recalculate(&peer_stats, is_seeding);
 
         if decisions.is_empty() {
             return;
@@ -1002,7 +1023,9 @@ impl TorrentDownloader {
                     max_pending_per_peer,
                     shared_stats,
                     choking_decisions,
-                ).await {
+                )
+                .await
+                {
                     Ok(()) => {
                         tracing::debug!("Peer connection {} ended normally", addr);
                     }
@@ -1036,7 +1059,10 @@ impl TorrentDownloader {
         let mut conn = PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?;
         tracing::info!("Connected to peer {}", addr);
 
-        downloader.stats.peers_connected.fetch_add(1, Ordering::Relaxed);
+        downloader
+            .stats
+            .peers_connected
+            .fetch_add(1, Ordering::Relaxed);
 
         // Send extension handshake if supported
         if conn.supports_extensions() {
@@ -1078,15 +1104,18 @@ impl TorrentDownloader {
         // Initialize peer stats entry
         {
             let mut stats = shared_stats.write();
-            stats.insert(addr, PeerStats {
+            stats.insert(
                 addr,
-                download_rate: 0,
-                upload_rate: 0,
-                peer_interested: conn.peer_interested(),
-                am_interested: conn.am_interested(),
-                is_unchoked: !conn.am_choking(),
-                is_seeder: false,
-            });
+                PeerStats {
+                    addr,
+                    download_rate: 0,
+                    upload_rate: 0,
+                    peer_interested: conn.peer_interested(),
+                    am_interested: conn.am_interested(),
+                    is_unchoked: !conn.am_choking(),
+                    is_seeder: false,
+                },
+            );
         }
 
         loop {
@@ -1126,7 +1155,11 @@ impl TorrentDownloader {
                         PeerMessage::Bitfield { bitfield } => {
                             // Already handled internally by conn
                             let has_count = bitfield.iter().map(|b| b.count_ones()).sum::<u32>();
-                            tracing::debug!("[{}] Received bitfield: peer has {} pieces", addr, has_count);
+                            tracing::debug!(
+                                "[{}] Received bitfield: peer has {} pieces",
+                                addr,
+                                has_count
+                            );
                         }
 
                         PeerMessage::HaveAll => {
@@ -1139,7 +1172,11 @@ impl TorrentDownloader {
                             tracing::debug!("[{}] Peer has no pieces (HaveNone)", addr);
                         }
 
-                        PeerMessage::Piece { index, begin, block } => {
+                        PeerMessage::Piece {
+                            index,
+                            begin,
+                            block,
+                        } => {
                             // Remove from pending
                             pending_requests.remove(&(index, begin, block.len() as u32));
 
@@ -1147,7 +1184,10 @@ impl TorrentDownloader {
                             let add_result = {
                                 let pm_guard = downloader.piece_manager.read();
                                 if let Some(ref pm) = *pm_guard {
-                                    Some((pm.add_block(index, begin, block.clone()), Arc::clone(pm)))
+                                    Some((
+                                        pm.add_block(index, begin, block.clone()),
+                                        Arc::clone(pm),
+                                    ))
                                 } else {
                                     None
                                 }
@@ -1157,22 +1197,32 @@ impl TorrentDownloader {
                                 match result {
                                     Ok(complete) => {
                                         // Update stats
-                                        downloader.stats.downloaded.fetch_add(
-                                            block.len() as u64,
-                                            Ordering::Relaxed
-                                        );
+                                        downloader
+                                            .stats
+                                            .downloaded
+                                            .fetch_add(block.len() as u64, Ordering::Relaxed);
 
                                         if complete {
                                             // Verify and save the piece (now pm is owned, not borrowed)
                                             match pm.verify_and_save(index).await {
                                                 Ok(true) => {
-                                                    tracing::debug!("Piece {} verified and saved", index);
+                                                    tracing::debug!(
+                                                        "Piece {} verified and saved",
+                                                        index
+                                                    );
                                                 }
                                                 Ok(false) => {
-                                                    tracing::warn!("Piece {} failed verification", index);
+                                                    tracing::warn!(
+                                                        "Piece {} failed verification",
+                                                        index
+                                                    );
                                                 }
                                                 Err(e) => {
-                                                    tracing::error!("Error saving piece {}: {}", index, e);
+                                                    tracing::error!(
+                                                        "Error saving piece {}: {}",
+                                                        index,
+                                                        e
+                                                    );
                                                 }
                                             }
                                         }
@@ -1185,7 +1235,11 @@ impl TorrentDownloader {
                             }
                         }
 
-                        PeerMessage::Request { index, begin, length } => {
+                        PeerMessage::Request {
+                            index,
+                            begin,
+                            length,
+                        } => {
                             // Peer is requesting a block from us (for seeding)
 
                             // Check if we're choking this peer - ignore request if so
@@ -1211,19 +1265,23 @@ impl TorrentDownloader {
                                     match conn.send_piece(index, begin, block.clone()).await {
                                         Ok(()) => {
                                             // Update upload statistics
-                                            downloader.stats.uploaded.fetch_add(
-                                                block.len() as u64,
-                                                Ordering::Relaxed
-                                            );
+                                            downloader
+                                                .stats
+                                                .uploaded
+                                                .fetch_add(block.len() as u64, Ordering::Relaxed);
                                             tracing::trace!(
                                                 "Sent block to {}: piece={}, offset={}, len={}",
-                                                addr, index, begin, length
+                                                addr,
+                                                index,
+                                                begin,
+                                                length
                                             );
                                         }
                                         Err(e) => {
                                             tracing::warn!(
                                                 "Failed to send piece to {}: {}",
-                                                addr, e
+                                                addr,
+                                                e
                                             );
                                         }
                                     }
@@ -1237,7 +1295,10 @@ impl TorrentDownloader {
                                     // Per BitTorrent protocol, just ignore invalid requests
                                 }
                                 None => {
-                                    tracing::debug!("No piece manager available to serve request from {}", addr);
+                                    tracing::debug!(
+                                        "No piece manager available to serve request from {}",
+                                        addr
+                                    );
                                 }
                             }
                         }
@@ -1247,16 +1308,28 @@ impl TorrentDownloader {
                             if id == 0 {
                                 // Extension handshake
                                 if let Ok(handshake) = parse_extension_handshake(&payload) {
-                                    if let Some(pex_id) = handshake.extensions.get(PEX_EXTENSION_NAME) {
-                                        tracing::debug!("Peer {} supports PEX (id={})", addr, pex_id);
+                                    if let Some(pex_id) =
+                                        handshake.extensions.get(PEX_EXTENSION_NAME)
+                                    {
+                                        tracing::debug!(
+                                            "Peer {} supports PEX (id={})",
+                                            addr,
+                                            pex_id
+                                        );
                                         // Update PEX state with peer's extension ID
                                         if let Some(ref mut state) = pex_state {
                                             state.set_peer_extension_id(*pex_id);
                                         }
                                     }
                                     // Check for ut_metadata support
-                                    if let Some(metadata_id) = handshake.extensions.get(METADATA_EXTENSION_NAME) {
-                                        tracing::debug!("Peer {} supports ut_metadata (id={})", addr, metadata_id);
+                                    if let Some(metadata_id) =
+                                        handshake.extensions.get(METADATA_EXTENSION_NAME)
+                                    {
+                                        tracing::debug!(
+                                            "Peer {} supports ut_metadata (id={})",
+                                            addr,
+                                            metadata_id
+                                        );
                                         // Store peer's metadata extension ID for later requests
                                         peer_metadata_ext_id = Some(*metadata_id);
                                         // If we need metadata, request it
@@ -1265,7 +1338,14 @@ impl TorrentDownloader {
                                                 let needed = fetcher.get_needed_pieces().await;
                                                 for piece in needed.into_iter().take(2) {
                                                     let msg = MetadataMessage::request(piece);
-                                                    if conn.send_extension_message(*metadata_id, msg.encode()).await.is_ok() {
+                                                    if conn
+                                                        .send_extension_message(
+                                                            *metadata_id,
+                                                            msg.encode(),
+                                                        )
+                                                        .await
+                                                        .is_ok()
+                                                    {
                                                         fetcher.mark_requested(piece).await;
                                                     }
                                                 }
@@ -1283,16 +1363,22 @@ impl TorrentDownloader {
                                         if let Ok(complete) = fetcher.process_message(msg).await {
                                             if complete {
                                                 // Metadata complete! Initialize piece manager
-                                                if let Ok(Some(metainfo)) = fetcher.parse_metainfo().await {
-                                                    tracing::info!("Metadata received for {}", downloader.name());
+                                                if let Ok(Some(metainfo)) =
+                                                    fetcher.parse_metainfo().await
+                                                {
+                                                    tracing::info!(
+                                                        "Metadata received for {}",
+                                                        downloader.name()
+                                                    );
                                                     let metainfo = Arc::new(metainfo);
                                                     let pm = Arc::new(PieceManager::new(
                                                         metainfo.clone(),
-                                                        downloader.save_dir.clone()
+                                                        downloader.save_dir.clone(),
                                                     ));
                                                     *downloader.metainfo.write() = Some(metainfo);
                                                     *downloader.piece_manager.write() = Some(pm);
-                                                    *downloader.state.write() = TorrentState::Downloading;
+                                                    *downloader.state.write() =
+                                                        TorrentState::Downloading;
                                                 }
                                             } else {
                                                 // Not complete yet - request more pieces
@@ -1300,7 +1386,14 @@ impl TorrentDownloader {
                                                     let needed = fetcher.get_needed_pieces().await;
                                                     for piece in needed.into_iter().take(2) {
                                                         let msg = MetadataMessage::request(piece);
-                                                        if conn.send_extension_message(peer_ext_id, msg.encode()).await.is_ok() {
+                                                        if conn
+                                                            .send_extension_message(
+                                                                peer_ext_id,
+                                                                msg.encode(),
+                                                            )
+                                                            .await
+                                                            .is_ok()
+                                                        {
                                                             fetcher.mark_requested(piece).await;
                                                         }
                                                     }
@@ -1406,7 +1499,10 @@ impl TorrentDownloader {
                 for block in &blocks_to_request {
                     let key = (block.piece, block.offset, block.length);
                     if !pending_requests.contains(&key)
-                        && conn.request_block(block.piece, block.offset, block.length).await.is_ok()
+                        && conn
+                            .request_block(block.piece, block.offset, block.length)
+                            .await
+                            .is_ok()
                     {
                         pending_requests.insert(key);
                     }
@@ -1426,7 +1522,11 @@ impl TorrentDownloader {
                         if let Err(e) = conn.send_pex(&pex_msg).await {
                             tracing::debug!("Failed to send PEX to {}: {}", addr, e);
                         } else {
-                            tracing::debug!("Sent PEX message to {} with {} added peers", addr, pex_msg.added.len());
+                            tracing::debug!(
+                                "Sent PEX message to {} with {} added peers",
+                                addr,
+                                pex_msg.added.len()
+                            );
                         }
                     }
                 }
@@ -1487,14 +1587,16 @@ impl TorrentDownloader {
                     }
                 }
             }
-
         }
 
         // Clean up peer stats on exit
         shared_stats.write().remove(&addr);
         choking_decisions.write().remove(&addr);
 
-        downloader.stats.peers_connected.fetch_sub(1, Ordering::Relaxed);
+        downloader
+            .stats
+            .peers_connected
+            .fetch_sub(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1709,7 +1811,11 @@ impl TorrentDownloader {
                 };
 
                 if !new_peers.is_empty() {
-                    tracing::debug!("PEX received {} new peers for {}", new_peers.len(), self.name());
+                    tracing::debug!(
+                        "PEX received {} new peers for {}",
+                        new_peers.len(),
+                        self.name()
+                    );
                     self.add_known_peers(new_peers.iter().cloned());
                 }
 

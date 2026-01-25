@@ -11,6 +11,7 @@ use std::io;
 use std::time::Duration;
 
 use num_bigint::BigUint;
+use rand::Rng;
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -26,14 +27,12 @@ use crate::error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result};
 /// The 768-bit prime P used for Diffie-Hellman key exchange (96 bytes)
 /// This is the same prime used by most BitTorrent clients
 pub const DH_PRIME: [u8; 96] = [
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xC9, 0x0F, 0xDA, 0xA2,
-    0x21, 0x68, 0xC2, 0x34, 0xC4, 0xC6, 0x62, 0x8B, 0x80, 0xDC, 0x1C, 0xD1,
-    0x29, 0x02, 0x4E, 0x08, 0x8A, 0x67, 0xCC, 0x74, 0x02, 0x0B, 0xBE, 0xA6,
-    0x3B, 0x13, 0x9B, 0x22, 0x51, 0x4A, 0x08, 0x79, 0x8E, 0x34, 0x04, 0xDD,
-    0xEF, 0x95, 0x19, 0xB3, 0xCD, 0x3A, 0x43, 0x1B, 0x30, 0x2B, 0x0A, 0x6D,
-    0xF2, 0x5F, 0x14, 0x37, 0x4F, 0xE1, 0x35, 0x6D, 0x6D, 0x51, 0xC2, 0x45,
-    0xE4, 0x85, 0xB5, 0x76, 0x62, 0x5E, 0x7E, 0xC6, 0xF4, 0x4C, 0x42, 0xE9,
-    0xA6, 0x37, 0xED, 0x6B, 0x0B, 0xFF, 0x5C, 0xB6, 0xF4, 0x06, 0xB7, 0xED,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xC9, 0x0F, 0xDA, 0xA2, 0x21, 0x68, 0xC2, 0x34,
+    0xC4, 0xC6, 0x62, 0x8B, 0x80, 0xDC, 0x1C, 0xD1, 0x29, 0x02, 0x4E, 0x08, 0x8A, 0x67, 0xCC, 0x74,
+    0x02, 0x0B, 0xBE, 0xA6, 0x3B, 0x13, 0x9B, 0x22, 0x51, 0x4A, 0x08, 0x79, 0x8E, 0x34, 0x04, 0xDD,
+    0xEF, 0x95, 0x19, 0xB3, 0xCD, 0x3A, 0x43, 0x1B, 0x30, 0x2B, 0x0A, 0x6D, 0xF2, 0x5F, 0x14, 0x37,
+    0x4F, 0xE1, 0x35, 0x6D, 0x6D, 0x51, 0xC2, 0x45, 0xE4, 0x85, 0xB5, 0x76, 0x62, 0x5E, 0x7E, 0xC6,
+    0xF4, 0x4C, 0x42, 0xE9, 0xA6, 0x37, 0xED, 0x6B, 0x0B, 0xFF, 0x5C, 0xB6, 0xF4, 0x06, 0xB7, 0xED,
 ];
 
 /// Generator G = 2
@@ -138,9 +137,7 @@ impl Rc4Cipher {
 
         let mut j: u8 = 0;
         for i in 0..256 {
-            j = j
-                .wrapping_add(state[i])
-                .wrapping_add(key[i % key.len()]);
+            j = j.wrapping_add(state[i]).wrapping_add(key[i % key.len()]);
             state.swap(i, j as usize);
         }
 
@@ -163,9 +160,7 @@ impl Rc4Cipher {
 
         let mut j: u8 = 0;
         for i in 0..256 {
-            j = j
-                .wrapping_add(state[i])
-                .wrapping_add(key[i % key.len()]);
+            j = j.wrapping_add(state[i]).wrapping_add(key[i % key.len()]);
             state.swap(i, j as usize);
         }
 
@@ -178,8 +173,8 @@ impl Rc4Cipher {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.state[self.i as usize]);
             self.state.swap(self.i as usize, self.j as usize);
-            let k = self.state[(self.state[self.i as usize]
-                .wrapping_add(self.state[self.j as usize])) as usize];
+            let k = self.state
+                [(self.state[self.i as usize].wrapping_add(self.state[self.j as usize])) as usize];
             *byte ^= k;
         }
     }
@@ -200,11 +195,9 @@ pub struct DhKeyPair {
 impl DhKeyPair {
     /// Generate a new random key pair
     pub fn generate() -> Self {
-        use rand::Rng;
-
         // Generate 160-bit random private key
         let mut private_bytes = [0u8; 20];
-        rand::thread_rng().fill(&mut private_bytes);
+        rand::rng().fill(&mut private_bytes);
         let private = BigUint::from_bytes_be(&private_bytes);
 
         // Compute public = G^private mod P
@@ -384,10 +377,9 @@ pub async fn mse_handshake_outgoing(
     let key_pair = DhKeyPair::generate();
 
     // Step 1: Send Ya + random padding
-    let padding_len = rand::random::<usize>() % (config.max_padding - config.min_padding + 1)
-        + config.min_padding;
+    let padding_len = rand::rng().random_range(config.min_padding..=config.max_padding);
     let mut padding = vec![0u8; padding_len];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut padding[..]);
+    rand::Rng::fill(&mut rand::rng(), &mut padding[..]);
 
     let mut send_buf = Vec::with_capacity(96 + padding_len);
     send_buf.extend_from_slice(key_pair.public_bytes());
@@ -472,9 +464,9 @@ pub async fn mse_handshake_outgoing(
 
     // Build the encrypted payload
     // VC (8) + crypto_provide (4) + len(PadC) (2) + PadC + len(IA) (2) + IA
-    let padc_len: u16 = (rand::random::<usize>() % 512) as u16;
+    let padc_len: u16 = rand::rng().random_range(0..512);
     let mut padc = vec![0u8; padc_len as usize];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut padc[..]);
+    rand::Rng::fill(&mut rand::rng(), &mut padc[..]);
 
     // IA = Initial payload (we send nothing initially)
     let ia_len: u16 = 0;
@@ -855,7 +847,10 @@ mod tests {
         without_discard.process(&mut data2);
 
         // Output should differ due to 1024-byte discard
-        assert_ne!(data1, data2, "RC4 with discard should produce different output");
+        assert_ne!(
+            data1, data2,
+            "RC4 with discard should produce different output"
+        );
     }
 
     #[test]

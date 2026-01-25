@@ -128,7 +128,8 @@ impl UtpMux {
                                     &pending,
                                     &send_tx,
                                     &config,
-                                ).await;
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 tracing::debug!("Failed to decode uTP packet: {}", e);
@@ -171,13 +172,25 @@ impl UtpMux {
         // For other packets, it's the send ID
         let keys = if pkt.is_syn() {
             vec![
-                ConnectionKey { remote_addr, conn_id: pkt.connection_id },
-                ConnectionKey { remote_addr, conn_id: pkt.connection_id.wrapping_add(1) },
+                ConnectionKey {
+                    remote_addr,
+                    conn_id: pkt.connection_id,
+                },
+                ConnectionKey {
+                    remote_addr,
+                    conn_id: pkt.connection_id.wrapping_add(1),
+                },
             ]
         } else {
             vec![
-                ConnectionKey { remote_addr, conn_id: pkt.connection_id },
-                ConnectionKey { remote_addr, conn_id: pkt.connection_id.wrapping_sub(1) },
+                ConnectionKey {
+                    remote_addr,
+                    conn_id: pkt.connection_id,
+                },
+                ConnectionKey {
+                    remote_addr,
+                    conn_id: pkt.connection_id.wrapping_sub(1),
+                },
             ]
         };
 

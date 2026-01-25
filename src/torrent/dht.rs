@@ -148,11 +148,7 @@ impl DhtClient {
         info_hash: &Sha1Hash,
         timeout: Duration,
     ) -> Vec<SocketAddr> {
-        match tokio::time::timeout(timeout, async {
-            self.find_peers(info_hash).await
-        })
-        .await
-        {
+        match tokio::time::timeout(timeout, async { self.find_peers(info_hash).await }).await {
             Ok(peers) => peers,
             Err(_) => {
                 // Timeout - return cached peers if available
@@ -242,7 +238,7 @@ impl DhtManager {
         Self {
             client,
             tracked: Arc::new(RwLock::new(std::collections::HashSet::new())),
-            lookup_interval: Duration::from_secs(300),    // 5 minutes
+            lookup_interval: Duration::from_secs(300), // 5 minutes
             announce_interval: Duration::from_secs(1800), // 30 minutes
         }
     }
@@ -344,8 +340,8 @@ mod tests {
     async fn test_dht_find_peers() {
         // Ubuntu 22.04 torrent info_hash (a known popular torrent)
         let info_hash: Sha1Hash = [
-            0x2c, 0x6b, 0x6a, 0x1e, 0x9c, 0x2f, 0x9f, 0x53, 0x4c, 0x8a,
-            0x9c, 0x7a, 0x1b, 0x2a, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81,
+            0x2c, 0x6b, 0x6a, 0x1e, 0x9c, 0x2f, 0x9f, 0x53, 0x4c, 0x8a, 0x9c, 0x7a, 0x1b, 0x2a,
+            0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81,
         ];
 
         let client = DhtClient::new(6881).unwrap();

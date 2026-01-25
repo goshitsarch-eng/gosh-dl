@@ -1,6 +1,6 @@
 [package]
 name = "gosh-dl"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.75"
 description = "A fast, embeddable download engine for Rust. HTTP/HTTPS with multi-connection acceleration and full BitTorrent protocol support."
@@ -21,13 +21,13 @@ tokio-util = { version = "0.7", features = ["codec", "io"] }
 futures = "0.3"
 
 # Platform directories
-dirs = "5"
+dirs = "6"
 
 # URL encoding/decoding
 urlencoding = "2"
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -38,28 +38,28 @@ serde_bencode = "0.2"
 sha1 = "0.10"
 sha2 = "0.10"
 md-5 = "0.10"
-rand = "0.8"
+rand = "0.9"
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
 
 # Data structures
-bytes = "1"
+bytes = "1.11"
 bitvec = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 parking_lot = "0.12"
 
 # Rate limiting
-governor = "0.8"
+governor = "0.10"
 
 # DHT (for BitTorrent)
 mainline = "6"
 
 # Multicast sockets (for LPD)
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 # WebSocket (for WSS trackers)
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 
 # Base64 encoding
 base64 = "0.22"
@@ -68,7 +68,7 @@ base64 = "0.22"
 thiserror = "2"
 
 # Storage
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
 
 # Logging
 tracing = "0.1"

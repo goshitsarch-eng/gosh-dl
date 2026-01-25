@@ -121,8 +121,7 @@ impl PexMessage {
         let mut dict = BTreeMap::new();
 
         // Separate peers by IP version
-        let (v4_added, v6_added): (Vec<_>, Vec<_>) =
-            self.added.iter().partition(|a| a.is_ipv4());
+        let (v4_added, v6_added): (Vec<_>, Vec<_>) = self.added.iter().partition(|a| a.is_ipv4());
         let (v4_dropped, v6_dropped): (Vec<_>, Vec<_>) =
             self.dropped.iter().partition(|a| a.is_ipv4());
 
@@ -156,7 +155,9 @@ impl PexMessage {
         if !all_v6_added.is_empty() {
             dict.insert(
                 b"added6".to_vec(),
-                BencodeValue::Bytes(encode_compact_peers_v6(&all_v6_added.iter().collect::<Vec<_>>())),
+                BencodeValue::Bytes(encode_compact_peers_v6(
+                    &all_v6_added.iter().collect::<Vec<_>>(),
+                )),
             );
         }
 
@@ -174,7 +175,9 @@ impl PexMessage {
         if !all_v6_dropped.is_empty() {
             dict.insert(
                 b"dropped6".to_vec(),
-                BencodeValue::Bytes(encode_compact_peers_v6(&all_v6_dropped.iter().collect::<Vec<_>>())),
+                BencodeValue::Bytes(encode_compact_peers_v6(
+                    &all_v6_dropped.iter().collect::<Vec<_>>(),
+                )),
             );
         }
 
@@ -311,7 +314,8 @@ impl PexState {
             .difference(&self.shared_peers)
             .cloned()
             .collect();
-        let dropped: Vec<_> = self.shared_peers
+        let dropped: Vec<_> = self
+            .shared_peers
             .difference(current_peers)
             .cloned()
             .collect();
@@ -325,8 +329,7 @@ impl PexState {
         self.last_send = Instant::now();
 
         // Separate by IP version
-        let (v4_added, v6_added): (Vec<_>, Vec<_>) =
-            added.into_iter().partition(|a| a.is_ipv4());
+        let (v4_added, v6_added): (Vec<_>, Vec<_>) = added.into_iter().partition(|a| a.is_ipv4());
         let (v4_dropped, v6_dropped): (Vec<_>, Vec<_>) =
             dropped.into_iter().partition(|a| a.is_ipv4());
 
@@ -370,10 +373,7 @@ pub fn build_extension_handshake(
     listen_port: Option<u16>,
 ) -> Vec<u8> {
     let mut m = BTreeMap::new();
-    m.insert(
-        b"ut_pex".to_vec(),
-        BencodeValue::Integer(pex_id as i64),
-    );
+    m.insert(b"ut_pex".to_vec(), BencodeValue::Integer(pex_id as i64));
     if let Some(metadata_id) = metadata_id {
         m.insert(
             b"ut_metadata".to_vec(),

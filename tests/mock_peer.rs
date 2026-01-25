@@ -150,7 +150,11 @@ impl MockPeer {
                         self.send_unchoke(&mut stream).await?;
                     }
                 }
-                PeerMessage::Request { index, begin, length } => {
+                PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                } => {
                     // Serve the requested block
                     if let Some(piece_data) = self.config.piece_data.get(&index) {
                         let end = (begin + length) as usize;
@@ -164,7 +168,8 @@ impl MockPeer {
                 PeerMessage::Extended { id, payload } => {
                     if id == 0 {
                         // Extension handshake
-                        self.handle_extension_handshake(&mut stream, &payload).await?;
+                        self.handle_extension_handshake(&mut stream, &payload)
+                            .await?;
                     }
                 }
                 _ => {}
@@ -339,13 +344,35 @@ enum PeerMessage {
     Unchoke,
     Interested,
     NotInterested,
-    Have { piece_index: u32 },
-    Bitfield { bitfield: Vec<u8> },
-    Request { index: u32, begin: u32, length: u32 },
-    Piece { index: u32, begin: u32, block: Vec<u8> },
-    Cancel { index: u32, begin: u32, length: u32 },
-    Extended { id: u8, payload: Vec<u8> },
-    Unknown { id: u8, payload: Vec<u8> },
+    Have {
+        piece_index: u32,
+    },
+    Bitfield {
+        bitfield: Vec<u8>,
+    },
+    Request {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Piece {
+        index: u32,
+        begin: u32,
+        block: Vec<u8>,
+    },
+    Cancel {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Extended {
+        id: u8,
+        payload: Vec<u8>,
+    },
+    Unknown {
+        id: u8,
+        payload: Vec<u8>,
+    },
 }
 
 /// Helper to create test piece data with valid SHA1 hashes

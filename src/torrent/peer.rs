@@ -101,11 +101,7 @@ pub enum PeerMessage {
     Bitfield { bitfield: Vec<u8> },
 
     /// Request a block
-    Request {
-        index: u32,
-        begin: u32,
-        length: u32,
-    },
+    Request { index: u32, begin: u32, length: u32 },
 
     /// Piece data (response to request)
     Piece {
@@ -115,17 +111,12 @@ pub enum PeerMessage {
     },
 
     /// Cancel a pending request
-    Cancel {
-        index: u32,
-        begin: u32,
-        length: u32,
-    },
+    Cancel { index: u32, begin: u32, length: u32 },
 
     /// DHT port (BEP 5)
     Port { port: u16 },
 
     // BEP 6: Fast Extension messages
-
     /// Suggest a piece to download (BEP 6)
     SuggestPiece { piece_index: u32 },
 
@@ -136,11 +127,7 @@ pub enum PeerMessage {
     HaveNone,
 
     /// Reject a request (BEP 6) - peer won't send this block
-    RejectRequest {
-        index: u32,
-        begin: u32,
-        length: u32,
-    },
+    RejectRequest { index: u32, begin: u32, length: u32 },
 
     /// Piece is allowed to be requested while choked (BEP 6)
     AllowedFast { piece_index: u32 },
@@ -337,7 +324,8 @@ impl PeerMessage {
                         "Have message too short",
                     ));
                 }
-                let piece_index = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let piece_index =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 Ok(Self::Have { piece_index })
             }
 
@@ -416,7 +404,8 @@ impl PeerMessage {
                         "SuggestPiece message too short",
                     ));
                 }
-                let piece_index = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let piece_index =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 Ok(Self::SuggestPiece { piece_index })
             }
 
@@ -441,7 +430,11 @@ impl PeerMessage {
                 let index = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 let begin = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                 let length = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
-                Ok(Self::RejectRequest { index, begin, length })
+                Ok(Self::RejectRequest {
+                    index,
+                    begin,
+                    length,
+                })
             }
 
             0x11 => {
@@ -452,7 +445,8 @@ impl PeerMessage {
                         "AllowedFast message too short",
                     ));
                 }
-                let piece_index = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let piece_index =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 Ok(Self::AllowedFast { piece_index })
             }
 
@@ -795,17 +789,18 @@ impl PeerConnection {
 
         // Read message body
         self.read_buffer.resize(len, 0);
-        timeout(DEFAULT_TIMEOUT, self.stream.read_exact(&mut self.read_buffer))
-            .await
-            .map_err(|_| {
-                EngineError::network(NetworkErrorKind::Timeout, "Receive body timeout")
-            })?
-            .map_err(|e| {
-                EngineError::network(
-                    NetworkErrorKind::ConnectionReset,
-                    format!("Receive body failed: {}", e),
-                )
-            })?;
+        timeout(
+            DEFAULT_TIMEOUT,
+            self.stream.read_exact(&mut self.read_buffer),
+        )
+        .await
+        .map_err(|_| EngineError::network(NetworkErrorKind::Timeout, "Receive body timeout"))?
+        .map_err(|e| {
+            EngineError::network(
+                NetworkErrorKind::ConnectionReset,
+                format!("Receive body failed: {}", e),
+            )
+        })?;
 
         let msg = PeerMessage::decode(&self.read_buffer)?;
 
@@ -1038,7 +1033,11 @@ impl PeerConnection {
     /// Handle received extension message.
     ///
     /// Returns discovered peers if this was a PEX message.
-    pub fn handle_extension_message(&mut self, id: u8, payload: &[u8]) -> Result<Option<Vec<SocketAddr>>> {
+    pub fn handle_extension_message(
+        &mut self,
+        id: u8,
+        payload: &[u8],
+    ) -> Result<Option<Vec<SocketAddr>>> {
         if id == 0 {
             // Extension handshake
             self.handle_extension_handshake(payload)?;
@@ -1087,7 +1086,11 @@ impl PeerConnection {
         };
 
         let payload = msg.encode();
-        self.send(PeerMessage::Extended { id: pex_id, payload }).await
+        self.send(PeerMessage::Extended {
+            id: pex_id,
+            payload,
+        })
+        .await
     }
 
     /// Send a generic extension message to the peer.
@@ -1095,8 +1098,16 @@ impl PeerConnection {
     /// # Arguments
     /// * `extension_id` - The peer's extension ID for the message type
     /// * `payload` - The bencoded message payload
-    pub async fn send_extension_message(&mut self, extension_id: u8, payload: Vec<u8>) -> Result<()> {
-        self.send(PeerMessage::Extended { id: extension_id, payload }).await
+    pub async fn send_extension_message(
+        &mut self,
+        extension_id: u8,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        self.send(PeerMessage::Extended {
+            id: extension_id,
+            payload,
+        })
+        .await
     }
 
     /// Check if extension handshake has been completed.

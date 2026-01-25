@@ -64,7 +64,9 @@ impl SqliteStorage {
             Ok(conn)
         })
         .await
-        .map_err(|e| EngineError::Database(format!("Failed to create in-memory database: {}", e)))??;
+        .map_err(|e| {
+            EngineError::Database(format!("Failed to create in-memory database: {}", e))
+        })??;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -238,7 +240,7 @@ impl Storage for SqliteStorage {
                     error_kind,
                     error_msg,
                     error_retryable,
-                    status.progress.total_size,
+                    status.progress.total_size.map(|s| s as i64),
                     status.progress.completed_size as i64,
                     status.progress.download_speed as i64,
                     status.progress.upload_speed as i64,
@@ -550,8 +552,9 @@ fn row_to_status(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadStatus> {
     let completed_at_str: Option<String> = row.get(29)?;
 
     // Parse ID
-    let uuid = uuid::Uuid::parse_str(&id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let id = DownloadId::from_uuid(uuid);
 
     // Parse kind
@@ -565,7 +568,8 @@ fn row_to_status(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadStatus> {
         _ => {
             tracing::warn!(
                 "Unknown download kind '{}' for download {}, defaulting to Http",
-                kind_str, id_str
+                kind_str,
+                id_str
             );
             DownloadKind::Http
         }
@@ -590,7 +594,8 @@ fn row_to_status(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadStatus> {
         _ => {
             tracing::warn!(
                 "Unknown download state '{}' for download {}, defaulting to Queued",
-                state_str, id_str
+                state_str,
+                id_str
             );
             DownloadState::Queued
         }
@@ -612,8 +617,8 @@ fn row_to_status(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadStatus> {
         .unwrap_or_default();
 
     // Parse checksum
-    let checksum: Option<crate::http::ExpectedChecksum> = checksum_json
-        .and_then(|s| serde_json::from_str(&s).ok());
+    let checksum: Option<crate::http::ExpectedChecksum> =
+        checksum_json.and_then(|s| serde_json::from_str(&s).ok());
 
     // Parse mirrors
     let mirrors: Vec<String> = mirrors_json
@@ -833,24 +838,27 @@ mod tests {
         storage.save_download(&status).await.unwrap();
         let loaded = storage.load_download(id).await.unwrap().unwrap();
 
-        assert_eq!(loaded.priority, crate::priority_queue::DownloadPriority::High);
+        assert_eq!(
+            loaded.priority,
+            crate::priority_queue::DownloadPriority::High
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_cookies_persistence() {
         let storage = SqliteStorage::in_memory().await.unwrap();
         let mut status = create_test_status();
-        status.metadata.cookies = vec![
-            "session=abc123".to_string(),
-            "user=test".to_string(),
-        ];
+        status.metadata.cookies = vec!["session=abc123".to_string(), "user=test".to_string()];
         let id = status.id;
 
         storage.save_download(&status).await.unwrap();
         let loaded = storage.load_download(id).await.unwrap().unwrap();
 
         assert_eq!(loaded.metadata.cookies.len(), 2);
-        assert!(loaded.metadata.cookies.contains(&"session=abc123".to_string()));
+        assert!(loaded
+            .metadata
+            .cookies
+            .contains(&"session=abc123".to_string()));
         assert!(loaded.metadata.cookies.contains(&"user=test".to_string()));
     }
 
@@ -889,7 +897,10 @@ mod tests {
         let loaded = storage.load_download(id).await.unwrap().unwrap();
 
         assert_eq!(loaded.metadata.mirrors.len(), 2);
-        assert!(loaded.metadata.mirrors.contains(&"https://mirror1.example.com/file.zip".to_string()));
+        assert!(loaded
+            .metadata
+            .mirrors
+            .contains(&"https://mirror1.example.com/file.zip".to_string()));
     }
 
     #[tokio::test]
@@ -900,7 +911,9 @@ mod tests {
 
         status.priority = crate::priority_queue::DownloadPriority::Critical;
         status.metadata.cookies = vec!["auth=token".to_string()];
-        status.metadata.checksum = Some(crate::http::ExpectedChecksum::md5("d41d8cd98f00b204e9800998ecf8427e"));
+        status.metadata.checksum = Some(crate::http::ExpectedChecksum::md5(
+            "d41d8cd98f00b204e9800998ecf8427e",
+        ));
         status.metadata.mirrors = vec!["https://backup.example.com/file.zip".to_string()];
 
         let id = status.id;
@@ -908,7 +921,10 @@ mod tests {
 
         let loaded = storage.load_download(id).await.unwrap().unwrap();
 
-        assert_eq!(loaded.priority, crate::priority_queue::DownloadPriority::Critical);
+        assert_eq!(
+            loaded.priority,
+            crate::priority_queue::DownloadPriority::Critical
+        );
         assert_eq!(loaded.metadata.cookies, vec!["auth=token".to_string()]);
         assert!(loaded.metadata.checksum.is_some());
         assert_eq!(loaded.metadata.mirrors.len(), 1);

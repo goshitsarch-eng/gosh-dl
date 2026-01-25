@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 
 use super::congestion::LedbatController;
-use super::packet::{Packet, PacketType, SelectiveAck, MAX_PAYLOAD_SIZE, timestamp_us};
+use super::packet::{timestamp_us, Packet, PacketType, SelectiveAck, MAX_PAYLOAD_SIZE};
 use super::state::{ConnectionState, ConnectionStats, PendingPacket};
 
 /// Maximum number of retransmissions before giving up
@@ -290,7 +290,8 @@ impl UtpSocketInner {
     /// Process acknowledgments
     fn process_acks(&mut self, ack_nr: u16, sack: Option<&SelectiveAck>) {
         // Remove all packets up to and including ack_nr
-        let to_remove: Vec<u16> = self.pending_packets
+        let to_remove: Vec<u16> = self
+            .pending_packets
             .keys()
             .copied()
             .filter(|&seq| self.seq_before_eq(seq, ack_nr))
@@ -400,7 +401,10 @@ impl UtpSocketInner {
         };
 
         let seq_nr = self.seq_nr;
-        if pkt_type == PacketType::Data || pkt_type == PacketType::Syn || pkt_type == PacketType::Fin {
+        if pkt_type == PacketType::Data
+            || pkt_type == PacketType::Syn
+            || pkt_type == PacketType::Fin
+        {
             self.seq_nr = self.seq_nr.wrapping_add(1);
         }
 
@@ -409,7 +413,8 @@ impl UtpSocketInner {
             .with_window(self.available_recv_window());
 
         // Add selective ACK if we have out-of-order packets
-        if self.config.enable_sack && !self.ooo_packets.is_empty() && pkt_type == PacketType::State {
+        if self.config.enable_sack && !self.ooo_packets.is_empty() && pkt_type == PacketType::State
+        {
             let mut sack = SelectiveAck::default();
             for &seq in self.ooo_packets.keys() {
                 let offset = seq.wrapping_sub(self.ack_nr).wrapping_sub(2);
@@ -467,7 +472,8 @@ impl UtpSocketInner {
         let rto = self.congestion.rto();
         let now = Instant::now();
 
-        let to_retransmit: Vec<u16> = self.pending_packets
+        let to_retransmit: Vec<u16> = self
+            .pending_packets
             .iter()
             .filter(|(_, p)| now.duration_since(p.last_sent) > rto)
             .map(|(seq, _)| *seq)
@@ -480,7 +486,12 @@ impl UtpSocketInner {
                     Some(p) => p,
                     None => continue,
                 };
-                (pending.seq_nr, pending.payload.clone(), pending.retransmits, pending.retransmits >= MAX_RETRANSMITS)
+                (
+                    pending.seq_nr,
+                    pending.payload.clone(),
+                    pending.retransmits,
+                    pending.retransmits >= MAX_RETRANSMITS,
+                )
             };
 
             if max_exceeded {
@@ -628,7 +639,10 @@ impl UtpSocket {
             Err(_) => {
                 let mut inner = self.inner.lock().await;
                 inner.state = ConnectionState::TimedOut;
-                Err(io::Error::new(io::ErrorKind::TimedOut, "Connection timeout"))
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Connection timeout",
+                ))
             }
         }
     }
@@ -756,10 +770,14 @@ impl UtpSocket {
     /// Get peer address
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         // This is sync-safe since remote_addr doesn't change
-        Ok(self.inner.try_lock().map(|i| i.remote_addr).unwrap_or_else(|_| {
-            // Fallback - shouldn't happen in practice
-            "0.0.0.0:0".parse().unwrap()
-        }))
+        Ok(self
+            .inner
+            .try_lock()
+            .map(|i| i.remote_addr)
+            .unwrap_or_else(|_| {
+                // Fallback - shouldn't happen in practice
+                "0.0.0.0:0".parse().unwrap()
+            }))
     }
 
     /// Get connection state

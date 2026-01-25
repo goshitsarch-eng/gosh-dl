@@ -101,10 +101,7 @@ impl MetadataMessage {
         dict.insert(b"piece".to_vec(), BencodeValue::Integer(self.piece as i64));
 
         if let Some(size) = self.total_size {
-            dict.insert(
-                b"total_size".to_vec(),
-                BencodeValue::Integer(size as i64),
-            );
+            dict.insert(b"total_size".to_vec(), BencodeValue::Integer(size as i64));
         }
 
         let mut encoded = BencodeValue::Dict(dict).encode();
@@ -146,10 +143,7 @@ impl MetadataMessage {
             .and_then(|v: &BencodeValue| v.as_uint())
             .map(|v| v as usize)
             .ok_or_else(|| {
-                EngineError::protocol(
-                    ProtocolErrorKind::MetadataError,
-                    "Invalid or missing piece",
-                )
+                EngineError::protocol(ProtocolErrorKind::MetadataError, "Invalid or missing piece")
             })?;
 
         let total_size = dict
@@ -405,7 +399,9 @@ impl MetadataFetcher {
 }
 
 /// Build extension handshake advertising ut_metadata support.
-pub fn build_metadata_extension_handshake(metadata_size: Option<usize>) -> std::collections::BTreeMap<Vec<u8>, BencodeValue> {
+pub fn build_metadata_extension_handshake(
+    metadata_size: Option<usize>,
+) -> std::collections::BTreeMap<Vec<u8>, BencodeValue> {
     let mut m = std::collections::BTreeMap::new();
     m.insert(
         b"ut_metadata".to_vec(),

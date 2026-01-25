@@ -15,11 +15,11 @@ use bitvec::prelude::*;
 use parking_lot::RwLock;
 use sha1::{Digest, Sha1};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, AsyncReadExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::metainfo::{Metainfo, Sha1Hash};
 use super::peer::BLOCK_SIZE;
-use crate::error::{EngineError, ProtocolErrorKind, StorageErrorKind, Result};
+use crate::error::{EngineError, ProtocolErrorKind, Result, StorageErrorKind};
 
 /// Piece manager for coordinating downloads
 pub struct PieceManager {
@@ -586,18 +586,14 @@ impl PieceManager {
     fn validate_path_component(component: &std::path::Component) -> Result<()> {
         use std::path::Component;
         match component {
-            Component::ParentDir => {
-                Err(EngineError::protocol(
-                    ProtocolErrorKind::InvalidTorrent,
-                    "Invalid torrent: file path contains parent directory reference (..)",
-                ))
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                Err(EngineError::protocol(
-                    ProtocolErrorKind::InvalidTorrent,
-                    "Invalid torrent: file path contains absolute path",
-                ))
-            }
+            Component::ParentDir => Err(EngineError::protocol(
+                ProtocolErrorKind::InvalidTorrent,
+                "Invalid torrent: file path contains parent directory reference (..)",
+            )),
+            Component::RootDir | Component::Prefix(_) => Err(EngineError::protocol(
+                ProtocolErrorKind::InvalidTorrent,
+                "Invalid torrent: file path contains absolute path",
+            )),
             _ => Ok(()),
         }
     }
@@ -689,7 +685,11 @@ impl PieceManager {
         }
 
         if count > 0 {
-            tracing::debug!("Cancelled {} stale pending pieces (timeout {:?})", count, timeout);
+            tracing::debug!(
+                "Cancelled {} stale pending pieces (timeout {:?})",
+                count,
+                timeout
+            );
         }
 
         count
@@ -779,7 +779,8 @@ impl PieceManager {
             }
         }
 
-        self.verified_count.store(valid_count as u64, Ordering::Relaxed);
+        self.verified_count
+            .store(valid_count as u64, Ordering::Relaxed);
 
         Ok(valid_count)
     }
@@ -859,11 +860,15 @@ impl PieceManager {
         }
 
         // Get piece length and validate bounds
-        let piece_length = self.metainfo.piece_length(piece_index as usize)
-            .ok_or_else(|| EngineError::protocol(
-                ProtocolErrorKind::InvalidTorrent,
-                format!("Invalid piece index {}", piece_index),
-            ))?;
+        let piece_length = self
+            .metainfo
+            .piece_length(piece_index as usize)
+            .ok_or_else(|| {
+                EngineError::protocol(
+                    ProtocolErrorKind::InvalidTorrent,
+                    format!("Invalid piece index {}", piece_index),
+                )
+            })?;
 
         let block_end = offset as u64 + length as u64;
         if block_end > piece_length {
@@ -925,13 +930,15 @@ impl PieceManager {
             file.seek(SeekFrom::Start(file_offset)).await?;
 
             let mut buf = vec![0u8; file_length as usize];
-            file.read_exact(&mut buf).await.map_err(|e: std::io::Error| {
-                EngineError::storage(
-                    StorageErrorKind::Io,
-                    &file_path,
-                    format!("Failed to read block data: {}", e),
-                )
-            })?;
+            file.read_exact(&mut buf)
+                .await
+                .map_err(|e: std::io::Error| {
+                    EngineError::storage(
+                        StorageErrorKind::Io,
+                        &file_path,
+                        format!("Failed to read block data: {}", e),
+                    )
+                })?;
             piece_data.extend_from_slice(&buf);
         }
 
@@ -1179,8 +1186,8 @@ mod tests {
 
     #[test]
     fn test_validate_path_component_accepts_normal() {
-        use std::path::Component;
         use std::ffi::OsStr;
+        use std::path::Component;
 
         let normal = Component::Normal(OsStr::new("valid_filename.txt"));
         let result = PieceManager::validate_path_component(&normal);

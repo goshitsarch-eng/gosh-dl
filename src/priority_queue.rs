@@ -256,11 +256,7 @@ impl PriorityQueue {
         let mut inner = self.inner.lock();
         inner.waiting_priorities.remove(&id);
         // Rebuild heap without the removed entry
-        let entries: Vec<_> = inner
-            .waiting
-            .drain()
-            .filter(|e| e.id != id)
-            .collect();
+        let entries: Vec<_> = inner.waiting.drain().filter(|e| e.id != id).collect();
         for entry in entries {
             inner.waiting.push(entry);
         }
@@ -406,22 +402,23 @@ mod tests {
         let id_high = DownloadId::new();
 
         // Acquire first slot
-        let permit1 = queue.clone().acquire(DownloadId::new(), DownloadPriority::Normal).await;
+        let permit1 = queue
+            .clone()
+            .acquire(DownloadId::new(), DownloadPriority::Normal)
+            .await;
 
         // Add low priority to queue first
         let queue_clone = queue.clone();
-        let low_handle = tokio::spawn(async move {
-            queue_clone.acquire(id_low, DownloadPriority::Low).await
-        });
+        let low_handle =
+            tokio::spawn(async move { queue_clone.acquire(id_low, DownloadPriority::Low).await });
 
         // Give it time to enter the queue
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         // Add high priority to queue
         let queue_clone = queue.clone();
-        let high_handle = tokio::spawn(async move {
-            queue_clone.acquire(id_high, DownloadPriority::High).await
-        });
+        let high_handle =
+            tokio::spawn(async move { queue_clone.acquire(id_high, DownloadPriority::High).await });
 
         // Give it time to enter the queue
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -432,13 +429,10 @@ mod tests {
         drop(permit1);
 
         // Wait for high priority to acquire
-        let high_permit = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            high_handle,
-        )
-        .await
-        .expect("timeout")
-        .expect("join error");
+        let high_permit = tokio::time::timeout(std::time::Duration::from_millis(100), high_handle)
+            .await
+            .expect("timeout")
+            .expect("join error");
 
         assert_eq!(queue.active_count(), 1);
         assert_eq!(queue.waiting_count(), 1);
@@ -447,13 +441,10 @@ mod tests {
         drop(high_permit);
 
         // Wait for low priority to acquire
-        let _low_permit = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            low_handle,
-        )
-        .await
-        .expect("timeout")
-        .expect("join error");
+        let _low_permit = tokio::time::timeout(std::time::Duration::from_millis(100), low_handle)
+            .await
+            .expect("timeout")
+            .expect("join error");
 
         assert_eq!(queue.active_count(), 1);
         assert_eq!(queue.waiting_count(), 0);
@@ -496,7 +487,9 @@ mod tests {
                 priority: DownloadPriority::Normal,
                 sequence: 0,
             });
-            inner.waiting_priorities.insert(id, DownloadPriority::Normal);
+            inner
+                .waiting_priorities
+                .insert(id, DownloadPriority::Normal);
         }
 
         assert_eq!(queue.waiting_count(), 1);

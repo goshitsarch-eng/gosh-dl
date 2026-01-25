@@ -116,13 +116,9 @@ impl BencodeValue {
             ));
         }
 
-        let end = data[1..]
-            .iter()
-            .position(|&c| c == b'e')
-            .ok_or_else(|| {
-                EngineError::protocol(ProtocolErrorKind::BencodeParse, "Unterminated integer")
-            })?
-            + 1; // Add 1 because we started at index 1
+        let end = data[1..].iter().position(|&c| c == b'e').ok_or_else(|| {
+            EngineError::protocol(ProtocolErrorKind::BencodeParse, "Unterminated integer")
+        })? + 1; // Add 1 because we started at index 1
 
         let num_str = std::str::from_utf8(&data[1..end]).map_err(|_| {
             EngineError::protocol(ProtocolErrorKind::BencodeParse, "Invalid integer encoding")
@@ -160,12 +156,9 @@ impl BencodeValue {
 
     /// Parse a byte string: <length>:<data>
     fn parse_bytes(data: &[u8]) -> Result<ParseResult<'_>> {
-        let colon = data
-            .iter()
-            .position(|&c| c == b':')
-            .ok_or_else(|| {
-                EngineError::protocol(ProtocolErrorKind::BencodeParse, "Expected colon in string")
-            })?;
+        let colon = data.iter().position(|&c| c == b':').ok_or_else(|| {
+            EngineError::protocol(ProtocolErrorKind::BencodeParse, "Expected colon in string")
+        })?;
 
         let len_str = std::str::from_utf8(&data[..colon]).map_err(|_| {
             EngineError::protocol(ProtocolErrorKind::BencodeParse, "Invalid string length")
@@ -520,10 +513,7 @@ mod tests {
         // Binary data
         let data = b"5:\x00\x01\x02\x03\x04";
         let result = BencodeValue::parse(data).unwrap();
-        assert_eq!(
-            result.value,
-            BencodeValue::Bytes(vec![0, 1, 2, 3, 4])
-        );
+        assert_eq!(result.value, BencodeValue::Bytes(vec![0, 1, 2, 3, 4]));
     }
 
     #[test]
@@ -612,7 +602,10 @@ mod tests {
         assert_eq!(value.get("name").and_then(|v| v.as_string()), Some("test"));
         assert_eq!(value.get("value").and_then(|v| v.as_int()), Some(42));
         assert_eq!(
-            value.get("items").and_then(|v| v.as_list()).map(|l| l.len()),
+            value
+                .get("items")
+                .and_then(|v| v.as_list())
+                .map(|l| l.len()),
             Some(3)
         );
     }

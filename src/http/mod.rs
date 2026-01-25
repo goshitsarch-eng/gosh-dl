@@ -340,13 +340,15 @@ impl HttpDownloader {
                 }
 
                 // Rename .part file to final name
-                tokio::fs::rename(&part_path, &save_path).await.map_err(|e| {
-                    EngineError::storage(
-                        StorageErrorKind::Io,
-                        &save_path,
-                        format!("Failed to rename file: {}", e),
-                    )
-                })?;
+                tokio::fs::rename(&part_path, &save_path)
+                    .await
+                    .map_err(|e| {
+                        EngineError::storage(
+                            StorageErrorKind::Io,
+                            &save_path,
+                            format!("Failed to rename file: {}", e),
+                        )
+                    })?;
 
                 Ok(save_path)
             }
@@ -517,7 +519,10 @@ impl HttpDownloader {
 
         // Decide whether to use segmented download
         let use_segmented = capabilities.supports_range
-            && capabilities.content_length.map(|l| l > min_segment_size).unwrap_or(false);
+            && capabilities
+                .content_length
+                .map(|l| l > min_segment_size)
+                .unwrap_or(false);
 
         if use_segmented {
             let total_size = capabilities.content_length.unwrap();
@@ -586,19 +591,20 @@ impl HttpDownloader {
             Ok((save_path, Some(download_ref)))
         } else {
             // Fall back to single-connection download
-            let path = self.download(
-                url,
-                save_dir,
-                Some(&final_filename),
-                user_agent,
-                referer,
-                headers,
-                cookies,
-                checksum,
-                cancel_token,
-                progress_callback,
-            )
-            .await?;
+            let path = self
+                .download(
+                    url,
+                    save_dir,
+                    Some(&final_filename),
+                    user_agent,
+                    referer,
+                    headers,
+                    cookies,
+                    checksum,
+                    cancel_token,
+                    progress_callback,
+                )
+                .await?;
             Ok((path, None))
         }
     }

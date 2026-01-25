@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-01-24
+
+### Changed
+- Updated `rand` from 0.8 to 0.9
+  - Migrated from `thread_rng().gen()` to `rng().random()` API
+  - Migrated from `thread_rng().fill()` to `rng().fill()` API
+- Updated `tokio-tungstenite` from 0.24 to 0.28
+  - Adapted to `Message::Text` now using `Utf8Bytes` instead of `String`
+- Updated `rusqlite` from 0.32 to 0.38
+  - Fixed `u64` no longer implementing `ToSql` directly
+- Updated `reqwest` from 0.12 to 0.13
+  - Renamed `rustls-tls` feature to `rustls`
+- Updated `governor` from 0.8 to 0.10
+- Updated `socket2` from 0.5 to 0.6
+- Updated `dirs` from 5 to 6
+- Updated `bytes` from 1 to 1.11
+
 ## [0.1.5] - 2026-01-12
 
 ### Fixed
@@ -93,7 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.2...v0.1.3

@@ -46,7 +46,13 @@ impl ScheduleRule {
         download_limit: Option<u64>,
         upload_limit: Option<u64>,
     ) -> Self {
-        Self::new(start_hour, end_hour, Vec::new(), download_limit, upload_limit)
+        Self::new(
+            start_hour,
+            end_hour,
+            Vec::new(),
+            download_limit,
+            upload_limit,
+        )
     }
 
     /// Create a rule for weekdays only (Mon-Fri)

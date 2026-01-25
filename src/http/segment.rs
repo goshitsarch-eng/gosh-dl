@@ -117,7 +117,8 @@ impl SegmentedDownload {
 
     /// Initialize segments for a new download
     pub fn init_segments(&mut self, max_connections: usize, min_segment_size: u64) {
-        let num_segments = calculate_segment_count(self.total_size, max_connections, min_segment_size);
+        let num_segments =
+            calculate_segment_count(self.total_size, max_connections, min_segment_size);
         let segment_size = self.total_size / num_segments as u64;
 
         let mut segments = Vec::with_capacity(num_segments);
@@ -232,7 +233,10 @@ impl SegmentedDownload {
 
             let handle = tokio::spawn(async move {
                 // Acquire permit
-                let _permit = semaphore.acquire().await.map_err(|_| EngineError::Shutdown)?;
+                let _permit = semaphore
+                    .acquire()
+                    .await
+                    .map_err(|_| EngineError::Shutdown)?;
 
                 // Check cancellation
                 if cancel_token.is_cancelled() {
@@ -312,7 +316,9 @@ impl SegmentedDownload {
 
                                         // Verify the server is sending the range we requested
                                         if range_start != resume_start || range_end != end {
-                                            state.active_connections.fetch_sub(1, Ordering::Relaxed);
+                                            state
+                                                .active_connections
+                                                .fetch_sub(1, Ordering::Relaxed);
                                             return Err(EngineError::network(
                                                 NetworkErrorKind::Other,
                                                 format!(

@@ -44,7 +44,10 @@ impl ConnectionState {
 
     /// Check if the connection is in a state where data can be received
     pub fn can_receive_data(&self) -> bool {
-        matches!(self, Self::Connected | Self::SynRecv | Self::FinSent | Self::Closing)
+        matches!(
+            self,
+            Self::Connected | Self::SynRecv | Self::FinSent | Self::Closing
+        )
     }
 
     /// Check if the connection is closed (terminal state)
@@ -54,7 +57,10 @@ impl ConnectionState {
 
     /// Check if connection is in progress (handshake or connected)
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::SynSent | Self::SynRecv | Self::Connected | Self::FinSent | Self::Closing)
+        matches!(
+            self,
+            Self::SynSent | Self::SynRecv | Self::Connected | Self::FinSent | Self::Closing
+        )
     }
 }
 

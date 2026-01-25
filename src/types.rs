@@ -5,29 +5,29 @@
 
 // Re-export all types from protocol module for backward compatibility
 pub use crate::protocol::{
+    // Scheduler types
+    BandwidthLimits,
+    // Checksum types
+    ChecksumAlgorithm,
+    // Events
+    DownloadEvent,
     // Core types
     DownloadId,
     DownloadKind,
-    DownloadProgress,
-    DownloadState,
+    // Status types
+    DownloadMetadata,
     // Options
     DownloadOptions,
     DownloadPriority,
-    // Status types
-    DownloadMetadata,
+    DownloadProgress,
+    DownloadState,
     DownloadStatus,
+    ExpectedChecksum,
     GlobalStats,
-    // Events
-    DownloadEvent,
     // Torrent types
     PeerInfo,
+    ScheduleRule,
     TorrentFile,
     TorrentInfo,
     TorrentStatusInfo,
-    // Checksum types
-    ChecksumAlgorithm,
-    ExpectedChecksum,
-    // Scheduler types
-    BandwidthLimits,
-    ScheduleRule,
 };

@@ -135,7 +135,13 @@ impl WebSeed {
     }
 
     /// Record a failure and apply backoff
-    pub fn record_failure(&self, error: &str, max_failures: u32, initial_backoff: Duration, max_backoff: Duration) {
+    pub fn record_failure(
+        &self,
+        error: &str,
+        max_failures: u32,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) {
         let mut stats = self.stats.write();
         stats.failures += 1;
         stats.last_error = Some(error.to_string());
@@ -155,7 +161,11 @@ impl WebSeed {
 
         // Calculate backoff with exponential increase
         let backoff = initial_backoff * 2u32.pow((consecutive - 1).min(6));
-        let backoff = if backoff > max_backoff { max_backoff } else { backoff };
+        let backoff = if backoff > max_backoff {
+            max_backoff
+        } else {
+            backoff
+        };
 
         // Add jitter (±25%) and ensure we don't exceed max_backoff
         let jitter = (rand::random::<f64>() - 0.5) * 0.5;
@@ -273,10 +283,12 @@ impl WebSeedManager {
             .timeout(config.request_timeout)
             .user_agent(&config.user_agent)
             .build()
-            .map_err(|e| EngineError::network(
-                NetworkErrorKind::Other,
-                format!("Failed to create HTTP client for WebSeed: {}", e),
-            ))?;
+            .map_err(|e| {
+                EngineError::network(
+                    NetworkErrorKind::Other,
+                    format!("Failed to create HTTP client for WebSeed: {}", e),
+                )
+            })?;
 
         // Initialize seeds from metainfo
         let seeds: Vec<Arc<WebSeed>> = metainfo
@@ -482,7 +494,10 @@ impl WebSeedManager {
             // Expected response for Range request
         } else if status.is_success() {
             // Server returned full content - we'll extract what we need
-            tracing::debug!("WebSeed returned {} instead of 206, handling full response", status);
+            tracing::debug!(
+                "WebSeed returned {} instead of 206, handling full response",
+                status
+            );
         } else if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
             return Err(EngineError::network(
                 NetworkErrorKind::Other,
@@ -674,7 +689,10 @@ mod tests {
 
     #[test]
     fn test_webseed_state_transitions() {
-        let seed = WebSeed::new("http://example.com/file.iso".to_string(), WebSeedType::GetRight);
+        let seed = WebSeed::new(
+            "http://example.com/file.iso".to_string(),
+            WebSeedType::GetRight,
+        );
 
         // Initially idle
         assert_eq!(seed.state(), WebSeedState::Idle);
@@ -693,7 +711,10 @@ mod tests {
 
     #[test]
     fn test_webseed_backoff() {
-        let seed = WebSeed::new("http://example.com/file.iso".to_string(), WebSeedType::GetRight);
+        let seed = WebSeed::new(
+            "http://example.com/file.iso".to_string(),
+            WebSeedType::GetRight,
+        );
 
         // Record failure
         seed.record_failure(
@@ -713,7 +734,10 @@ mod tests {
 
     #[test]
     fn test_webseed_success_resets_failures() {
-        let seed = WebSeed::new("http://example.com/file.iso".to_string(), WebSeedType::GetRight);
+        let seed = WebSeed::new(
+            "http://example.com/file.iso".to_string(),
+            WebSeedType::GetRight,
+        );
 
         // Record some failures
         seed.record_failure(
@@ -741,7 +765,10 @@ mod tests {
 
     #[test]
     fn test_webseed_max_failures() {
-        let seed = WebSeed::new("http://example.com/file.iso".to_string(), WebSeedType::GetRight);
+        let seed = WebSeed::new(
+            "http://example.com/file.iso".to_string(),
+            WebSeedType::GetRight,
+        );
 
         // Record max failures
         for i in 0..5 {
@@ -765,7 +792,10 @@ mod tests {
 
     #[test]
     fn test_webseed_backoff_exponential() {
-        let seed = WebSeed::new("http://example.com/file.iso".to_string(), WebSeedType::GetRight);
+        let seed = WebSeed::new(
+            "http://example.com/file.iso".to_string(),
+            WebSeedType::GetRight,
+        );
         let initial_delay = Duration::from_millis(100);
         let max_delay = Duration::from_secs(10);
 
@@ -789,12 +819,18 @@ mod tests {
 
         // Backoff should increase (exponential)
         // With 2 consecutive failures, delay is min(100 * 2^1, 10000) = 200ms
-        assert!(backoff2 > backoff1, "Backoff should increase with more failures");
+        assert!(
+            backoff2 > backoff1,
+            "Backoff should increase with more failures"
+        );
     }
 
     #[test]
     fn test_webseed_backoff_respects_max() {
-        let seed = WebSeed::new("http://example.com/file.iso".to_string(), WebSeedType::GetRight);
+        let seed = WebSeed::new(
+            "http://example.com/file.iso".to_string(),
+            WebSeedType::GetRight,
+        );
         let initial_delay = Duration::from_secs(1);
         let max_delay = Duration::from_secs(5);
 
@@ -822,7 +858,10 @@ mod tests {
 
     #[test]
     fn test_webseed_types() {
-        let getright = WebSeed::new("http://example.com/file.iso".to_string(), WebSeedType::GetRight);
+        let getright = WebSeed::new(
+            "http://example.com/file.iso".to_string(),
+            WebSeedType::GetRight,
+        );
         let hoffman = WebSeed::new("http://seed.example.com".to_string(), WebSeedType::Hoffman);
 
         assert_eq!(getright.seed_type, WebSeedType::GetRight);
@@ -831,7 +870,10 @@ mod tests {
 
     #[test]
     fn test_webseed_failed_state_not_available() {
-        let seed = WebSeed::new("http://example.com/file.iso".to_string(), WebSeedType::GetRight);
+        let seed = WebSeed::new(
+            "http://example.com/file.iso".to_string(),
+            WebSeedType::GetRight,
+        );
 
         // Set to failed
         *seed.state.write() = WebSeedState::Failed;
@@ -841,19 +883,28 @@ mod tests {
 
     #[test]
     fn test_webseed_recovery_from_backoff() {
-        let seed = WebSeed::new("http://example.com/file.iso".to_string(), WebSeedType::GetRight);
+        let seed = WebSeed::new(
+            "http://example.com/file.iso".to_string(),
+            WebSeedType::GetRight,
+        );
 
         // Set to backoff with expired time
         *seed.state.write() = WebSeedState::Backoff;
         *seed.backoff_until.write() = Some(Instant::now() - Duration::from_secs(1));
 
         // Should be available since backoff expired
-        assert!(seed.is_available(), "Seed with expired backoff should be available");
+        assert!(
+            seed.is_available(),
+            "Seed with expired backoff should be available"
+        );
     }
 
     #[test]
     fn test_webseed_stats_accumulation() {
-        let seed = WebSeed::new("http://example.com/file.iso".to_string(), WebSeedType::GetRight);
+        let seed = WebSeed::new(
+            "http://example.com/file.iso".to_string(),
+            WebSeedType::GetRight,
+        );
 
         // Record multiple successes
         seed.record_success(1000);
@@ -867,7 +918,10 @@ mod tests {
 
     #[test]
     fn test_webseed_piece_tracking() {
-        let seed = WebSeed::new("http://example.com/file.iso".to_string(), WebSeedType::GetRight);
+        let seed = WebSeed::new(
+            "http://example.com/file.iso".to_string(),
+            WebSeedType::GetRight,
+        );
 
         // Set current piece
         *seed.current_piece.write() = Some(42);

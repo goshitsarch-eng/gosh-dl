@@ -151,7 +151,10 @@ impl Metainfo {
     /// Parse the info dictionary
     fn parse_info(value: &BencodeValue) -> Result<Info> {
         let dict = value.as_dict().ok_or_else(|| {
-            EngineError::protocol(ProtocolErrorKind::InvalidTorrent, "'info' must be a dictionary")
+            EngineError::protocol(
+                ProtocolErrorKind::InvalidTorrent,
+                "'info' must be a dictionary",
+            )
         })?;
 
         // Name (required)
@@ -264,8 +267,7 @@ impl Metainfo {
         };
 
         // Verify piece count matches total size
-        let expected_pieces =
-            total_size.div_ceil(piece_length); // Ceiling division
+        let expected_pieces = total_size.div_ceil(piece_length); // Ceiling division
         if pieces.len() as u64 != expected_pieces {
             return Err(EngineError::protocol(
                 ProtocolErrorKind::InvalidTorrent,
@@ -440,10 +442,7 @@ impl Metainfo {
         }
 
         let start = index as u64 * self.info.piece_length;
-        let end = std::cmp::min(
-            start + self.info.piece_length,
-            self.info.total_size,
-        );
+        let end = std::cmp::min(start + self.info.piece_length, self.info.total_size);
 
         Some((start, end))
     }

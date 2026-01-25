@@ -177,7 +177,11 @@ impl EngineError {
     }
 
     /// Create a storage error
-    pub fn storage(kind: StorageErrorKind, path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
+    pub fn storage(
+        kind: StorageErrorKind,
+        path: impl Into<PathBuf>,
+        message: impl Into<String>,
+    ) -> Self {
         Self::Storage {
             kind,
             path: path.into(),
@@ -272,7 +276,9 @@ impl From<serde_json::Error> for EngineError {
     }
 }
 
-impl From<tokio::sync::broadcast::error::SendError<crate::protocol::DownloadEvent>> for EngineError {
+impl From<tokio::sync::broadcast::error::SendError<crate::protocol::DownloadEvent>>
+    for EngineError
+{
     fn from(_: tokio::sync::broadcast::error::SendError<crate::protocol::DownloadEvent>) -> Self {
         Self::Shutdown
     }

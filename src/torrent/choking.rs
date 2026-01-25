@@ -216,8 +216,7 @@ impl ChokingManager {
         if self.optimistic_peer.as_ref() == Some(addr) {
             self.optimistic_peer = None;
             // Allow immediate re-selection
-            self.last_optimistic_rotate =
-                Instant::now() - self.config.optimistic_interval;
+            self.last_optimistic_rotate = Instant::now() - self.config.optimistic_interval;
         }
     }
 }
@@ -231,7 +230,12 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
     }
 
-    fn make_peer_stats(port: u16, download_rate: u64, interested: bool, unchoked: bool) -> (SocketAddr, PeerStats) {
+    fn make_peer_stats(
+        port: u16,
+        download_rate: u64,
+        interested: bool,
+        unchoked: bool,
+    ) -> (SocketAddr, PeerStats) {
         let addr = make_addr(port);
         (
             addr,
@@ -265,10 +269,10 @@ mod tests {
         let mut manager = ChokingManager::new(config);
 
         let peers: HashMap<_, _> = vec![
-            make_peer_stats(1000, 100, true, false),  // Low rate
-            make_peer_stats(1001, 500, true, false),  // High rate
-            make_peer_stats(1002, 300, true, false),  // Medium rate
-            make_peer_stats(1003, 50, true, false),   // Lowest rate
+            make_peer_stats(1000, 100, true, false), // Low rate
+            make_peer_stats(1001, 500, true, false), // High rate
+            make_peer_stats(1002, 300, true, false), // Medium rate
+            make_peer_stats(1003, 50, true, false),  // Lowest rate
         ]
         .into_iter()
         .collect();
@@ -285,9 +289,18 @@ mod tests {
             .collect();
 
         assert!(unchoked.contains(&1001), "Should unchoke highest (500)");
-        assert!(unchoked.contains(&1002), "Should unchoke second highest (300)");
-        assert!(!unchoked.contains(&1000), "Should not unchoke low performer");
-        assert!(!unchoked.contains(&1003), "Should not unchoke lowest performer");
+        assert!(
+            unchoked.contains(&1002),
+            "Should unchoke second highest (300)"
+        );
+        assert!(
+            !unchoked.contains(&1000),
+            "Should not unchoke low performer"
+        );
+        assert!(
+            !unchoked.contains(&1003),
+            "Should not unchoke lowest performer"
+        );
     }
 
     #[test]
@@ -320,7 +333,10 @@ mod tests {
         // Should only unchoke interested peers
         assert!(unchoked.contains(&1000));
         assert!(unchoked.contains(&1002));
-        assert!(!unchoked.contains(&1001), "Should not unchoke uninterested peer");
+        assert!(
+            !unchoked.contains(&1001),
+            "Should not unchoke uninterested peer"
+        );
     }
 
     #[test]
@@ -333,8 +349,8 @@ mod tests {
         let mut manager = ChokingManager::new(config);
 
         let peers: HashMap<_, _> = vec![
-            make_peer_stats(1000, 500, true, true),  // Currently unchoked, high rate
-            make_peer_stats(1001, 100, true, true),  // Currently unchoked, low rate
+            make_peer_stats(1000, 500, true, true), // Currently unchoked, high rate
+            make_peer_stats(1001, 100, true, true), // Currently unchoked, low rate
         ]
         .into_iter()
         .collect();
@@ -406,7 +422,10 @@ mod tests {
             .collect();
 
         // In seeding mode, should prefer peer we upload fastest to
-        assert!(unchoked.contains(&1001), "Should unchoke peer with high upload rate");
+        assert!(
+            unchoked.contains(&1001),
+            "Should unchoke peer with high upload rate"
+        );
     }
 
     #[test]

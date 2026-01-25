@@ -4,14 +4,12 @@
 //! real download scenarios including concurrent downloads, pause/resume,
 //! and error recovery.
 
-use gosh_dl::{
-    DownloadEngine, DownloadEvent, DownloadOptions, DownloadState, EngineConfig,
-};
+use gosh_dl::{DownloadEngine, DownloadEvent, DownloadOptions, DownloadState, EngineConfig};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
-use wiremock::matchers::{method, path, header};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Helper to create a test engine with a temp directory
@@ -23,7 +21,9 @@ async fn create_test_engine(temp_dir: &TempDir) -> std::sync::Arc<DownloadEngine
         min_segment_size: 1024 * 1024, // 1MB
         ..Default::default()
     };
-    DownloadEngine::new(config).await.expect("Failed to create engine")
+    DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine")
 }
 
 /// Helper to wait for a specific event type
@@ -107,7 +107,9 @@ async fn test_basic_http_download() {
     assert!(downloaded_file.exists(), "Downloaded file should exist");
 
     // Verify content
-    let content = tokio::fs::read(&downloaded_file).await.expect("Failed to read file");
+    let content = tokio::fs::read(&downloaded_file)
+        .await
+        .expect("Failed to read file");
     assert_eq!(content, test_content, "File content should match");
 
     // Verify status
@@ -153,7 +155,10 @@ async fn test_download_with_custom_filename() {
     };
 
     let url = format!("{}/original-name.txt", mock_server.uri());
-    let id = engine.add_http(&url, options).await.expect("Failed to add download");
+    let id = engine
+        .add_http(&url, options)
+        .await
+        .expect("Failed to add download");
 
     let completed = wait_for_event(
         &mut events,
@@ -165,7 +170,10 @@ async fn test_download_with_custom_filename() {
     assert!(completed.is_some(), "Download should complete");
 
     let downloaded_file = temp_dir.path().join("custom-name.txt");
-    assert!(downloaded_file.exists(), "Downloaded file with custom name should exist");
+    assert!(
+        downloaded_file.exists(),
+        "Downloaded file with custom name should exist"
+    );
 
     engine.shutdown().await.ok();
 }
@@ -183,7 +191,10 @@ async fn test_download_content_disposition_filename() {
             ResponseTemplate::new(200)
                 .insert_header("Content-Length", test_content.len().to_string())
                 .insert_header("Accept-Ranges", "bytes")
-                .insert_header("Content-Disposition", "attachment; filename=\"real-file.dat\""),
+                .insert_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"real-file.dat\"",
+                ),
         )
         .mount(&mock_server)
         .await;
@@ -193,7 +204,10 @@ async fn test_download_content_disposition_filename() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Length", test_content.len().to_string())
-                .insert_header("Content-Disposition", "attachment; filename=\"real-file.dat\"")
+                .insert_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"real-file.dat\"",
+                )
                 .set_body_bytes(test_content.to_vec()),
         )
         .mount(&mock_server)
@@ -203,7 +217,10 @@ async fn test_download_content_disposition_filename() {
     let mut events = engine.subscribe();
 
     let url = format!("{}/download", mock_server.uri());
-    let id = engine.add_http(&url, DownloadOptions::default()).await.expect("Failed to add download");
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
 
     let completed = wait_for_event(
         &mut events,
@@ -263,7 +280,10 @@ async fn test_download_events_sequence() {
     let mut events = engine.subscribe();
 
     let url = format!("{}/events-test.bin", mock_server.uri());
-    let id = engine.add_http(&url, DownloadOptions::default()).await.expect("Failed to add download");
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
 
     let mut received_events = Vec::new();
     let start = std::time::Instant::now();
@@ -273,7 +293,10 @@ async fn test_download_events_sequence() {
         match timeout(Duration::from_millis(100), events.recv()).await {
             Ok(Ok(event)) => {
                 received_events.push(event.clone());
-                if matches!(event, DownloadEvent::Completed { .. } | DownloadEvent::Failed { .. }) {
+                if matches!(
+                    event,
+                    DownloadEvent::Completed { .. } | DownloadEvent::Failed { .. }
+                ) {
                     break;
                 }
             }
@@ -282,15 +305,21 @@ async fn test_download_events_sequence() {
     }
 
     // Verify we received Added event
-    let has_added = received_events.iter().any(|e| matches!(e, DownloadEvent::Added { id: eid } if *eid == id));
+    let has_added = received_events
+        .iter()
+        .any(|e| matches!(e, DownloadEvent::Added { id: eid } if *eid == id));
     assert!(has_added, "Should receive Added event");
 
     // Verify we received Started event
-    let has_started = received_events.iter().any(|e| matches!(e, DownloadEvent::Started { id: eid } if *eid == id));
+    let has_started = received_events
+        .iter()
+        .any(|e| matches!(e, DownloadEvent::Started { id: eid } if *eid == id));
     assert!(has_started, "Should receive Started event");
 
     // Verify we received Completed event
-    let has_completed = received_events.iter().any(|e| matches!(e, DownloadEvent::Completed { id: eid } if *eid == id));
+    let has_completed = received_events
+        .iter()
+        .any(|e| matches!(e, DownloadEvent::Completed { id: eid } if *eid == id));
     assert!(has_completed, "Should receive Completed event");
 
     engine.shutdown().await.ok();
@@ -338,7 +367,10 @@ async fn test_concurrent_downloads() {
     let mut ids = Vec::new();
     for i in 0..3 {
         let url = format!("{}/file{}.txt", mock_server.uri(), i);
-        let id = engine.add_http(&url, DownloadOptions::default()).await.expect("Failed to add download");
+        let id = engine
+            .add_http(&url, DownloadOptions::default())
+            .await
+            .expect("Failed to add download");
         ids.push(id);
     }
 
@@ -409,14 +441,19 @@ async fn test_concurrent_limit_respected() {
         max_connections_per_download: 1,
         ..Default::default()
     };
-    let engine = DownloadEngine::new(config).await.expect("Failed to create engine");
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
     let mut events = engine.subscribe();
 
     // Start 5 downloads
     let mut ids = Vec::new();
     for i in 0..5 {
         let url = format!("{}/slow{}.bin", mock_server.uri(), i);
-        let id = engine.add_http(&url, DownloadOptions::default()).await.expect("Failed to add download");
+        let id = engine
+            .add_http(&url, DownloadOptions::default())
+            .await
+            .expect("Failed to add download");
         ids.push(id);
     }
 
@@ -442,7 +479,10 @@ async fn test_concurrent_limit_respected() {
         }
     }
 
-    assert_eq!(completed_count, 5, "All downloads should eventually complete");
+    assert_eq!(
+        completed_count, 5,
+        "All downloads should eventually complete"
+    );
 
     engine.shutdown().await.ok();
 }
@@ -484,7 +524,10 @@ async fn test_cancel_download() {
     let mut events = engine.subscribe();
 
     let url = format!("{}/large-file.bin", mock_server.uri());
-    let id = engine.add_http(&url, DownloadOptions::default()).await.expect("Failed to add download");
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
 
     // Wait for download to start
     wait_for_event(
@@ -498,7 +541,10 @@ async fn test_cancel_download() {
     engine.cancel(id, true).await.expect("Failed to cancel");
 
     // Verify download is removed
-    assert!(engine.status(id).is_none(), "Download should be removed after cancel");
+    assert!(
+        engine.status(id).is_none(),
+        "Download should be removed after cancel"
+    );
 
     // Verify we received Removed event
     let removed = wait_for_event(
@@ -546,7 +592,10 @@ async fn test_pause_download() {
     let mut events = engine.subscribe();
 
     let url = format!("{}/pausable.bin", mock_server.uri());
-    let id = engine.add_http(&url, DownloadOptions::default()).await.expect("Failed to add download");
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
 
     // Wait for download to start
     wait_for_event(
@@ -602,7 +651,10 @@ async fn test_download_404_error() {
     let mut events = engine.subscribe();
 
     let url = format!("{}/not-found.txt", mock_server.uri());
-    let id = engine.add_http(&url, DownloadOptions::default()).await.expect("Failed to add download");
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
 
     // Wait for failure
     let failed = wait_for_event(
@@ -643,7 +695,10 @@ async fn test_download_500_error() {
     let mut events = engine.subscribe();
 
     let url = format!("{}/server-error.txt", mock_server.uri());
-    let id = engine.add_http(&url, DownloadOptions::default()).await.expect("Failed to add download");
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
 
     // Wait for failure (may take longer due to retries)
     let failed = wait_for_event(
@@ -664,11 +719,15 @@ async fn test_invalid_url() {
     let engine = create_test_engine(&temp_dir).await;
 
     // Test with invalid URL
-    let result = engine.add_http("not-a-valid-url", DownloadOptions::default()).await;
+    let result = engine
+        .add_http("not-a-valid-url", DownloadOptions::default())
+        .await;
     assert!(result.is_err(), "Should reject invalid URL");
 
     // Test with unsupported scheme
-    let result = engine.add_http("ftp://example.com/file.txt", DownloadOptions::default()).await;
+    let result = engine
+        .add_http("ftp://example.com/file.txt", DownloadOptions::default())
+        .await;
     assert!(result.is_err(), "Should reject unsupported scheme");
 
     engine.shutdown().await.ok();
@@ -709,7 +768,10 @@ async fn test_engine_shutdown() {
     let engine = create_test_engine(&temp_dir).await;
 
     let url = format!("{}/shutdown-test.bin", mock_server.uri());
-    engine.add_http(&url, DownloadOptions::default()).await.expect("Failed to add download");
+    engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
 
     // Give download time to start
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -734,7 +796,9 @@ async fn test_config_update() {
         ..original_config
     };
 
-    engine.set_config(new_config.clone()).expect("Failed to update config");
+    engine
+        .set_config(new_config.clone())
+        .expect("Failed to update config");
 
     // Verify update
     let updated_config = engine.get_config();
@@ -779,7 +843,10 @@ async fn test_list_downloads() {
     // Add downloads
     for i in 0..3 {
         let url = format!("{}/list{}.txt", mock_server.uri(), i);
-        engine.add_http(&url, DownloadOptions::default()).await.expect("Failed to add download");
+        engine
+            .add_http(&url, DownloadOptions::default())
+            .await
+            .expect("Failed to add download");
     }
 
     // Give downloads time to start
@@ -839,7 +906,10 @@ async fn test_custom_user_agent() {
     };
 
     let url = format!("{}/ua-test.txt", mock_server.uri());
-    let id = engine.add_http(&url, options).await.expect("Failed to add download");
+    let id = engine
+        .add_http(&url, options)
+        .await
+        .expect("Failed to add download");
 
     let completed = wait_for_event(
         &mut events,
@@ -848,7 +918,10 @@ async fn test_custom_user_agent() {
     )
     .await;
 
-    assert!(completed.is_some(), "Download should complete with custom UA");
+    assert!(
+        completed.is_some(),
+        "Download should complete with custom UA"
+    );
 
     engine.shutdown().await.ok();
 }
@@ -894,7 +967,10 @@ async fn test_custom_referer() {
     };
 
     let url = format!("{}/referer-test.txt", mock_server.uri());
-    let id = engine.add_http(&url, options).await.expect("Failed to add download");
+    let id = engine
+        .add_http(&url, options)
+        .await
+        .expect("Failed to add download");
 
     let completed = wait_for_event(
         &mut events,
@@ -903,7 +979,10 @@ async fn test_custom_referer() {
     )
     .await;
 
-    assert!(completed.is_some(), "Download should complete with custom Referer");
+    assert!(
+        completed.is_some(),
+        "Download should complete with custom Referer"
+    );
 
     // Verify the download completed successfully
     let status = engine.status(id).expect("Should have status");
@@ -948,7 +1027,10 @@ async fn test_progress_updates() {
     let mut events = engine.subscribe();
 
     let url = format!("{}/progress-test.bin", mock_server.uri());
-    let id = engine.add_http(&url, DownloadOptions::default()).await.expect("Failed to add download");
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
 
     let mut progress_events = Vec::new();
     let start = std::time::Instant::now();
@@ -962,7 +1044,10 @@ async fn test_progress_updates() {
                         progress_events.push(progress.clone());
                     }
                 }
-                if matches!(event, DownloadEvent::Completed { .. } | DownloadEvent::Failed { .. }) {
+                if matches!(
+                    event,
+                    DownloadEvent::Completed { .. } | DownloadEvent::Failed { .. }
+                ) {
                     break;
                 }
             }
@@ -971,7 +1056,10 @@ async fn test_progress_updates() {
     }
 
     // Verify we got some progress updates
-    assert!(!progress_events.is_empty(), "Should receive progress updates");
+    assert!(
+        !progress_events.is_empty(),
+        "Should receive progress updates"
+    );
 
     // Verify final progress shows correct total
     if let Some(last_progress) = progress_events.last() {

@@ -530,10 +530,7 @@ impl TrackerClient {
     ) -> Result<AnnounceResponse> {
         // Parse UDP URL
         let url = tracker_url.strip_prefix("udp://").ok_or_else(|| {
-            EngineError::protocol(
-                ProtocolErrorKind::TrackerError,
-                "Invalid UDP tracker URL",
-            )
+            EngineError::protocol(ProtocolErrorKind::TrackerError, "Invalid UDP tracker URL")
         })?;
 
         // Remove any path component
@@ -580,7 +577,7 @@ impl TrackerClient {
 
     /// UDP connect request
     async fn udp_connect(&self, socket: &UdpSocket) -> Result<i64> {
-        let transaction_id: i32 = rand::thread_rng().gen();
+        let transaction_id: i32 = rand::rng().random();
 
         // Build connect request
         // 64-bit protocol ID, 32-bit action (0 = connect), 32-bit transaction ID
@@ -591,10 +588,7 @@ impl TrackerClient {
 
         // Send and receive with timeout
         socket.send(&request).await.map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::Other,
-                format!("UDP send failed: {}", e),
-            )
+            EngineError::network(NetworkErrorKind::Other, format!("UDP send failed: {}", e))
         })?;
 
         let mut response = [0u8; 16];
@@ -604,10 +598,7 @@ impl TrackerClient {
                 EngineError::network(NetworkErrorKind::Timeout, "UDP tracker connect timeout")
             })?
             .map_err(|e| {
-                EngineError::network(
-                    NetworkErrorKind::Other,
-                    format!("UDP recv failed: {}", e),
-                )
+                EngineError::network(NetworkErrorKind::Other, format!("UDP recv failed: {}", e))
             })?;
 
         if len < 16 {
@@ -656,7 +647,7 @@ impl TrackerClient {
         connection_id: i64,
         request: &AnnounceRequest,
     ) -> Result<AnnounceResponse> {
-        let transaction_id: i32 = rand::thread_rng().gen();
+        let transaction_id: i32 = rand::rng().random();
 
         // Build announce request (98 bytes)
         let mut req = Vec::with_capacity(98);
@@ -690,10 +681,7 @@ impl TrackerClient {
                 EngineError::network(NetworkErrorKind::Timeout, "UDP tracker announce timeout")
             })?
             .map_err(|e| {
-                EngineError::network(
-                    NetworkErrorKind::Other,
-                    format!("UDP recv failed: {}", e),
-                )
+                EngineError::network(NetworkErrorKind::Other, format!("UDP recv failed: {}", e))
             })?;
 
         // Minimum response is 8 bytes (action + transaction_id) for error responses
@@ -751,8 +739,7 @@ impl TrackerClient {
         let interval = raw_interval.clamp(MIN_ANNOUNCE_INTERVAL, MAX_ANNOUNCE_INTERVAL);
         let incomplete =
             u32::from_be_bytes([response[12], response[13], response[14], response[15]]);
-        let complete =
-            u32::from_be_bytes([response[16], response[17], response[18], response[19]]);
+        let complete = u32::from_be_bytes([response[16], response[17], response[18], response[19]]);
 
         // Parse peers (6 bytes each: 4 IP + 2 port)
         let peers_data = &response[20..len];
@@ -829,12 +816,15 @@ impl TrackerClient {
             )
         })?;
 
-        ws_stream.send(Message::Text(json)).await.map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::Other,
-                format!("WebSocket send failed: {}", e),
-            )
-        })?;
+        ws_stream
+            .send(Message::Text(json.into()))
+            .await
+            .map_err(|e| {
+                EngineError::network(
+                    NetworkErrorKind::Other,
+                    format!("WebSocket send failed: {}", e),
+                )
+            })?;
 
         // Receive response with timeout
         let response = timeout(self.timeout, ws_stream.next())
@@ -854,7 +844,7 @@ impl TrackerClient {
 
         // Parse response
         let text = match response {
-            Message::Text(t) => t,
+            Message::Text(t) => t.to_string(),
             Message::Close(_) => {
                 return Err(EngineError::network(
                     NetworkErrorKind::ConnectionReset,
@@ -1088,10 +1078,7 @@ impl TrackerClient {
     ) -> Result<ScrapeResponse> {
         // Parse UDP URL
         let url = tracker_url.strip_prefix("udp://").ok_or_else(|| {
-            EngineError::protocol(
-                ProtocolErrorKind::TrackerError,
-                "Invalid UDP tracker URL",
-            )
+            EngineError::protocol(ProtocolErrorKind::TrackerError, "Invalid UDP tracker URL")
         })?;
 
         let host_port = url.split('/').next().unwrap_or(url);
@@ -1131,7 +1118,7 @@ impl TrackerClient {
         let connection_id = self.udp_connect(&socket).await?;
 
         // Scrape request
-        let transaction_id: i32 = rand::thread_rng().gen();
+        let transaction_id: i32 = rand::rng().random();
 
         let mut req = Vec::with_capacity(16 + 20 * info_hashes.len());
         req.extend_from_slice(&connection_id.to_be_bytes());
@@ -1155,10 +1142,7 @@ impl TrackerClient {
             .await
             .map_err(|_| EngineError::network(NetworkErrorKind::Timeout, "UDP scrape timeout"))?
             .map_err(|e| {
-                EngineError::network(
-                    NetworkErrorKind::Other,
-                    format!("UDP recv failed: {}", e),
-                )
+                EngineError::network(NetworkErrorKind::Other, format!("UDP recv failed: {}", e))
             })?;
 
         if len < 8 {
@@ -1239,7 +1223,7 @@ pub fn generate_peer_id() -> [u8; 20] {
     peer_id[7] = b'-';
 
     // Random bytes for uniqueness
-    rand::thread_rng().fill(&mut peer_id[8..]);
+    rand::rng().fill(&mut peer_id[8..]);
 
     peer_id
 }

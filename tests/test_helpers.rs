@@ -98,7 +98,10 @@ impl TestTorrentBuilder {
         );
 
         // Concatenate all piece hashes
-        let pieces: Vec<u8> = piece_hashes.iter().flat_map(|h| h.iter().copied()).collect();
+        let pieces: Vec<u8> = piece_hashes
+            .iter()
+            .flat_map(|h| h.iter().copied())
+            .collect();
         info.insert("pieces".to_string(), BencodeValue::Bytes(pieces));
 
         if is_single_file {
@@ -314,7 +317,8 @@ mod tests {
 
     #[test]
     fn test_single_file_torrent() {
-        let (torrent_data, piece_hashes) = TestTorrentBuilder::single_file("test.txt", 32768).build();
+        let (torrent_data, piece_hashes) =
+            TestTorrentBuilder::single_file("test.txt", 32768).build();
 
         // Should have 2 pieces (32KB / 16KB)
         assert_eq!(piece_hashes.len(), 2);

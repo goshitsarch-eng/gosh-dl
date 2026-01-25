@@ -365,7 +365,10 @@ mod tests {
         let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
         let magnet = MagnetUri::parse(uri).unwrap();
 
-        assert_eq!(magnet.info_hash_hex(), "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(
+            magnet.info_hash_hex(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
         assert!(magnet.display_name.is_none());
         assert!(magnet.trackers.is_empty());
     }
@@ -381,14 +384,8 @@ mod tests {
 
         assert_eq!(magnet.display_name, Some("Test File".to_string()));
         assert_eq!(magnet.trackers.len(), 2);
-        assert_eq!(
-            magnet.trackers[0],
-            "http://tracker.example.com/announce"
-        );
-        assert_eq!(
-            magnet.trackers[1],
-            "udp://tracker2.example.com:6969"
-        );
+        assert_eq!(magnet.trackers[0], "http://tracker.example.com/announce");
+        assert_eq!(magnet.trackers[1], "udp://tracker2.example.com:6969");
     }
 
     #[test]

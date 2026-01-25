@@ -316,7 +316,8 @@ impl Packet {
 
             match ext {
                 ExtensionType::SelectiveAck => {
-                    selective_ack = Some(SelectiveAck::new(data[offset..offset + ext_len].to_vec()));
+                    selective_ack =
+                        Some(SelectiveAck::new(data[offset..offset + ext_len].to_vec()));
                 }
                 ExtensionType::None => break,
             }

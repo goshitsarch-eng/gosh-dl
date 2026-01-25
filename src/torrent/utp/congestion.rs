@@ -120,7 +120,10 @@ impl LedbatController {
         Self {
             cwnd: INITIAL_CWND,
             ssthresh: MAX_CWND,
-            base_delay_history: DelayHistory::new(BASE_DELAY_HISTORY_SIZE, BASE_DELAY_HISTORY_DURATION),
+            base_delay_history: DelayHistory::new(
+                BASE_DELAY_HISTORY_SIZE,
+                BASE_DELAY_HISTORY_DURATION,
+            ),
             current_delay_filter: VecDeque::with_capacity(8),
             bytes_in_flight: 0,
             rtt_us: 1_000_000, // Initial 1 second
@@ -232,7 +235,8 @@ impl LedbatController {
                 -((queuing_delay_us - TARGET_DELAY_US) as f64 / TARGET_DELAY_US as f64)
             };
 
-            let cwnd_delta = (GAIN * off_target * bytes_acked as f64 * MSS as f64 / self.cwnd as f64) as i32;
+            let cwnd_delta =
+                (GAIN * off_target * bytes_acked as f64 * MSS as f64 / self.cwnd as f64) as i32;
 
             if cwnd_delta >= 0 {
                 self.cwnd = self.cwnd.saturating_add(cwnd_delta as u32);
@@ -356,7 +360,7 @@ mod tests {
         assert_eq!(ctrl.rtt_us, 100_000);
 
         ctrl.update_rtt(120_000); // Second sample 120ms
-        // Should be somewhere between 100 and 120ms
+                                  // Should be somewhere between 100 and 120ms
         assert!(ctrl.rtt_us > 100_000 && ctrl.rtt_us < 120_000);
     }
 }

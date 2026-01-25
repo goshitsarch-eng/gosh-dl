@@ -91,15 +91,11 @@ impl ConnectionPool {
         let mut pool = Self::new(config)?;
 
         pool.download_limiter = download_limit.and_then(|limit| {
-            NonZeroU32::new(limit as u32).map(|n| {
-                RateLimiter::direct(Quota::per_second(n))
-            })
+            NonZeroU32::new(limit as u32).map(|n| RateLimiter::direct(Quota::per_second(n)))
         });
 
         pool.upload_limiter = upload_limit.and_then(|limit| {
-            NonZeroU32::new(limit as u32).map(|n| {
-                RateLimiter::direct(Quota::per_second(n))
-            })
+            NonZeroU32::new(limit as u32).map(|n| RateLimiter::direct(Quota::per_second(n)))
         });
 
         Ok(pool)
@@ -113,18 +109,14 @@ impl ConnectionPool {
     /// Update download speed limit
     pub fn set_download_limit(&mut self, limit: Option<u64>) {
         self.download_limiter = limit.and_then(|l| {
-            NonZeroU32::new(l as u32).map(|n| {
-                RateLimiter::direct(Quota::per_second(n))
-            })
+            NonZeroU32::new(l as u32).map(|n| RateLimiter::direct(Quota::per_second(n)))
         });
     }
 
     /// Update upload speed limit
     pub fn set_upload_limit(&mut self, limit: Option<u64>) {
         self.upload_limiter = limit.and_then(|l| {
-            NonZeroU32::new(l as u32).map(|n| {
-                RateLimiter::direct(Quota::per_second(n))
-            })
+            NonZeroU32::new(l as u32).map(|n| RateLimiter::direct(Quota::per_second(n)))
         });
     }
 
@@ -321,9 +313,8 @@ where
         }
     }
 
-    Err(last_error.unwrap_or_else(|| {
-        EngineError::network(NetworkErrorKind::Other, "Max retries exceeded")
-    }))
+    Err(last_error
+        .unwrap_or_else(|| EngineError::network(NetworkErrorKind::Other, "Max retries exceeded")))
 }
 
 /// Speed calculator for tracking download/upload rates

@@ -32,10 +32,7 @@ impl BandwidthScheduler {
 
     /// Create a scheduler with no rules (always use default limits)
     pub fn with_defaults(download: Option<u64>, upload: Option<u64>) -> Self {
-        Self::new(Vec::new(), BandwidthLimits {
-            download,
-            upload,
-        })
+        Self::new(Vec::new(), BandwidthLimits { download, upload })
     }
 
     /// Get the current bandwidth limits

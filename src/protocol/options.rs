@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Priority levels for downloads
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 #[repr(i8)]
 pub enum DownloadPriority {
