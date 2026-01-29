@@ -1375,10 +1375,34 @@ impl TorrentDownloader {
                                                         metainfo.clone(),
                                                         downloader.save_dir.clone(),
                                                     ));
+
+                                                    // Verify existing files (same as start() does for torrent files)
+                                                    *downloader.state.write() = TorrentState::Checking;
+                                                    match pm.verify_existing().await {
+                                                        Ok(valid) => {
+                                                            tracing::info!(
+                                                                "Verified {} existing pieces for {}",
+                                                                valid,
+                                                                downloader.name()
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "Failed to verify existing pieces: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+
                                                     *downloader.metainfo.write() = Some(metainfo);
-                                                    *downloader.piece_manager.write() = Some(pm);
-                                                    *downloader.state.write() =
-                                                        TorrentState::Downloading;
+                                                    *downloader.piece_manager.write() = Some(pm.clone());
+
+                                                    // Set final state based on completion
+                                                    if pm.is_complete() {
+                                                        *downloader.state.write() = TorrentState::Seeding;
+                                                    } else {
+                                                        *downloader.state.write() = TorrentState::Downloading;
+                                                    }
                                                 }
                                             } else {
                                                 // Not complete yet - request more pieces
