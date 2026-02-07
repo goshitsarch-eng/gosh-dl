@@ -329,7 +329,7 @@ A standalone `gosh-dl` CLI application is now available and can be found here: [
 
 ### What Rust version is required?
 
-gosh-dl requires Rust 1.75+ for async trait support.
+gosh-dl requires Rust 1.85+ for async trait support.
 
 ### Does gosh-dl work on Windows?
 
