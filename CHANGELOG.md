@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-02-07
+
+### Fixed
+- **CI formatting**: ran `cargo fmt` across all source files to pass format check
+- **MSRV bumped to 1.85**: `curve25519-dalek` v5 (transitive dep from `mainline`) requires Rust edition 2024, which needs Rust 1.85+
+
 ## [0.2.0] - 2026-02-07
 
 This is a major milestone release that significantly improves the BitTorrent stack,
@@ -17,7 +23,7 @@ adds proper infrastructure, and restructures the public API.
 #### Infrastructure
 - **Feature flags**: `http`, `torrent`, `storage`, `full` — compile only what you need
 - **SQLite schema versioning**: `PRAGMA user_version` with automatic migrations
-- **GitHub Actions CI**: test matrix, fmt, clippy, MSRV 1.75 verification
+- **GitHub Actions CI**: test matrix, fmt, clippy, MSRV verification
 - **Fuzz targets**: bencode, metainfo, magnet URI, and content-disposition parsers
 
 #### API & Ergonomics
@@ -149,7 +155,8 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.4...v0.1.5
