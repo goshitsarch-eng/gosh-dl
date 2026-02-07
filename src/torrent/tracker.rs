@@ -1322,7 +1322,7 @@ mod tests {
         // ::1
         data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         data.extend_from_slice(&0x1AE1u16.to_be_bytes()); // port 6881
-        // 2001:db8::1
+                                                          // 2001:db8::1
         data.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         data.extend_from_slice(&0x1F90u16.to_be_bytes()); // port 8080
 

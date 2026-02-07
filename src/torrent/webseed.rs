@@ -649,11 +649,7 @@ impl WebSeedManager {
     }
 
     /// Download a piece that spans multiple files via separate HTTP requests (BEP 19)
-    async fn download_multifile_piece(
-        &self,
-        seed: &WebSeed,
-        piece_index: u32,
-    ) -> Result<Vec<u8>> {
+    async fn download_multifile_piece(&self, seed: &WebSeed, piece_index: u32) -> Result<Vec<u8>> {
         let files = self.metainfo.files_for_piece(piece_index as usize);
         let mut piece_data = Vec::new();
 
@@ -687,7 +683,11 @@ impl WebSeedManager {
             if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
                 return Err(EngineError::network(
                     NetworkErrorKind::HttpStatus(status.as_u16()),
-                    format!("WebSeed HTTP error for file {}: {}", file.path.display(), status),
+                    format!(
+                        "WebSeed HTTP error for file {}: {}",
+                        file.path.display(),
+                        status
+                    ),
                 ));
             }
 
@@ -716,10 +716,7 @@ impl WebSeedManager {
         if actual_hash != *expected_hash {
             return Err(EngineError::protocol(
                 ProtocolErrorKind::HashMismatch,
-                format!(
-                    "WebSeed cross-file piece {} hash mismatch",
-                    piece_index
-                ),
+                format!("WebSeed cross-file piece {} hash mismatch", piece_index),
             ));
         }
 

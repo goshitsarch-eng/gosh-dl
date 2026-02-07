@@ -1020,14 +1020,16 @@ mod tests {
 
         // Verify version is set to CURRENT_SCHEMA_VERSION
         let conn = storage.conn.lock().await;
-        let version: u32 =
-            conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         // Running migrate again should be idempotent (no-op)
         migrate(&conn).unwrap();
-        let version2: u32 =
-            conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let version2: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
         assert_eq!(version2, CURRENT_SCHEMA_VERSION);
     }
 
@@ -1041,8 +1043,9 @@ mod tests {
 
         // migrate should detect existing tables and just bump version
         migrate(&conn).unwrap();
-        let version: u32 =
-            conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
     }
 
@@ -1060,10 +1063,7 @@ mod tests {
 
         // Save torrent data
         let torrent_bytes = b"d4:infod6:lengthi1024e4:name9:test.txte4:name9:test.txte";
-        storage
-            .save_torrent_data(id, torrent_bytes)
-            .await
-            .unwrap();
+        storage.save_torrent_data(id, torrent_bytes).await.unwrap();
 
         // Load it back
         let loaded = storage.load_torrent_data(id).await.unwrap();
@@ -1080,10 +1080,7 @@ mod tests {
 
         // Save torrent data
         let torrent_bytes = vec![1, 2, 3, 4, 5];
-        storage
-            .save_torrent_data(id, &torrent_bytes)
-            .await
-            .unwrap();
+        storage.save_torrent_data(id, &torrent_bytes).await.unwrap();
 
         // Update the download status (upsert)
         status.progress.completed_size = 999;
@@ -1105,8 +1102,9 @@ mod tests {
         // Migrate should add the torrent_data column
         migrate(&conn).unwrap();
 
-        let version: u32 =
-            conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
         assert_eq!(version, 2);
 
         // Verify the column exists by inserting and querying
@@ -1117,7 +1115,8 @@ mod tests {
         conn.execute(
             "UPDATE downloads SET torrent_data = ?1 WHERE id = 'test-id'",
             params![vec![1u8, 2, 3]],
-        ).unwrap();
+        )
+        .unwrap();
         let data: Option<Vec<u8>> = conn
             .query_row(
                 "SELECT torrent_data FROM downloads WHERE id = 'test-id'",

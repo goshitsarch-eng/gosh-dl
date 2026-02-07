@@ -25,9 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Add all downloads
     let mut ids = Vec::new();
     for url in &urls {
-        let id = engine
-            .add_http(url, DownloadOptions::default())
-            .await?;
+        let id = engine.add_http(url, DownloadOptions::default()).await?;
         println!("Added: {id} — {url}");
         ids.push(id);
     }
@@ -47,15 +45,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if total == 0 {
                             "100%".to_string()
                         } else {
-                            format!("{:.0}%", status.progress.completed_size as f64 / total as f64 * 100.0)
+                            format!(
+                                "{:.0}%",
+                                status.progress.completed_size as f64 / total as f64 * 100.0
+                            )
                         }
                     },
                 );
 
-                let eta = status.progress.eta_seconds.map_or_else(
-                    || "--".to_string(),
-                    |s| format!("{s}s"),
-                );
+                let eta = status
+                    .progress
+                    .eta_seconds
+                    .map_or_else(|| "--".to_string(), |s| format!("{s}s"));
 
                 println!(
                     "  {} | {:12} | {} | {}/s | ETA {}",

@@ -16,7 +16,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Usage: torrent_download <path-to-torrent-file>");
 
     let torrent_data = std::fs::read(&torrent_path)?;
-    println!("Loaded torrent: {torrent_path} ({} bytes)", torrent_data.len());
+    println!(
+        "Loaded torrent: {torrent_path} ({} bytes)",
+        torrent_data.len()
+    );
 
     // Create engine
     let config = EngineConfig::default();
@@ -41,29 +44,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events = engine.subscribe();
     loop {
         match events.recv().await {
-            Ok(event) => {
-                match &event {
-                    gosh_dl::DownloadEvent::Progress { id: eid, progress } if *eid == id => {
-                        let pct = progress.total_size.map_or(0.0, |total| {
-                            if total == 0 { 0.0 } else { progress.completed_size as f64 / total as f64 * 100.0 }
-                        });
-                        println!(
-                            "Progress: {pct:.1}% — {}/s down, {} peers",
-                            format_bytes(progress.download_speed),
-                            progress.peers,
-                        );
-                    }
-                    gosh_dl::DownloadEvent::Completed { id: eid, .. } if *eid == id => {
-                        println!("Download complete!");
-                        break;
-                    }
-                    gosh_dl::DownloadEvent::Failed { id: eid, error, .. } if *eid == id => {
-                        eprintln!("Error: {error}");
-                        break;
-                    }
-                    _ => {}
+            Ok(event) => match &event {
+                gosh_dl::DownloadEvent::Progress { id: eid, progress } if *eid == id => {
+                    let pct = progress.total_size.map_or(0.0, |total| {
+                        if total == 0 {
+                            0.0
+                        } else {
+                            progress.completed_size as f64 / total as f64 * 100.0
+                        }
+                    });
+                    println!(
+                        "Progress: {pct:.1}% — {}/s down, {} peers",
+                        format_bytes(progress.download_speed),
+                        progress.peers,
+                    );
                 }
-            }
+                gosh_dl::DownloadEvent::Completed { id: eid, .. } if *eid == id => {
+                    println!("Download complete!");
+                    break;
+                }
+                gosh_dl::DownloadEvent::Failed { id: eid, error, .. } if *eid == id => {
+                    eprintln!("Error: {error}");
+                    break;
+                }
+                _ => {}
+            },
             Err(e) => {
                 eprintln!("Event error: {e}");
                 break;

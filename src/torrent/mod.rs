@@ -507,8 +507,9 @@ impl TorrentDownloader {
 
         // Initialize uTP multiplexer if enabled
         if self.config.enable_utp {
-            let utp_addr: SocketAddr =
-                format!("0.0.0.0:{}", self.config.listen_port_range.0).parse().unwrap();
+            let utp_addr: SocketAddr = format!("0.0.0.0:{}", self.config.listen_port_range.0)
+                .parse()
+                .unwrap();
             match UtpMux::bind(utp_addr).await {
                 Ok(mux) => {
                     tracing::info!("uTP multiplexer bound to {}", mux.local_addr());
@@ -1106,13 +1107,18 @@ impl TorrentDownloader {
         let mut conn = if let Some(ref mux) = utp_mux {
             match mux.connect(addr).await {
                 Ok(socket) => {
-                    match PeerConnection::connect_utp(socket, info_hash, peer_id, num_pieces).await {
+                    match PeerConnection::connect_utp(socket, info_hash, peer_id, num_pieces).await
+                    {
                         Ok(c) => {
                             tracing::info!("Connected to peer {} via uTP", addr);
                             c
                         }
                         Err(e) => {
-                            tracing::debug!("uTP handshake with {} failed: {}, falling back to TCP", addr, e);
+                            tracing::debug!(
+                                "uTP handshake with {} failed: {}, falling back to TCP",
+                                addr,
+                                e
+                            );
                             PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?
                         }
                     }
@@ -1445,7 +1451,8 @@ impl TorrentDownloader {
                                                     ));
 
                                                     // Verify existing files (same as start() does for torrent files)
-                                                    *downloader.state.write() = TorrentState::Checking;
+                                                    *downloader.state.write() =
+                                                        TorrentState::Checking;
                                                     match pm.verify_existing().await {
                                                         Ok(valid) => {
                                                             tracing::info!(
@@ -1463,18 +1470,24 @@ impl TorrentDownloader {
                                                     }
 
                                                     *downloader.metainfo.write() = Some(metainfo);
-                                                    *downloader.piece_manager.write() = Some(pm.clone());
+                                                    *downloader.piece_manager.write() =
+                                                        Some(pm.clone());
 
                                                     // Store raw torrent bytes for crash recovery
-                                                    if let Some(raw_bytes) = fetcher.raw_torrent_bytes().await {
-                                                        *downloader.raw_torrent_data.write() = Some(raw_bytes);
+                                                    if let Some(raw_bytes) =
+                                                        fetcher.raw_torrent_bytes().await
+                                                    {
+                                                        *downloader.raw_torrent_data.write() =
+                                                            Some(raw_bytes);
                                                     }
 
                                                     // Set final state based on completion
                                                     if pm.is_complete() {
-                                                        *downloader.state.write() = TorrentState::Seeding;
+                                                        *downloader.state.write() =
+                                                            TorrentState::Seeding;
                                                     } else {
-                                                        *downloader.state.write() = TorrentState::Downloading;
+                                                        *downloader.state.write() =
+                                                            TorrentState::Downloading;
                                                     }
                                                 }
                                             } else {

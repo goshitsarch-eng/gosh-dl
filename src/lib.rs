@@ -63,9 +63,9 @@ pub use types::{
 };
 
 // Storage exports
-pub use storage::{MemoryStorage, Segment, SegmentState, Storage};
 #[cfg(feature = "storage")]
 pub use storage::SqliteStorage;
+pub use storage::{MemoryStorage, Segment, SegmentState, Storage};
 
 // Priority queue exports
 pub use priority_queue::{DownloadPriority, PriorityQueue, PriorityQueueStats};

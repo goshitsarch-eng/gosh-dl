@@ -541,7 +541,9 @@ impl PeerConnection {
     ) -> Result<Self> {
         let tcp_stream = timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
-            .map_err(|_| EngineError::network(NetworkErrorKind::Timeout, "Peer connection timeout"))?
+            .map_err(|_| {
+                EngineError::network(NetworkErrorKind::Timeout, "Peer connection timeout")
+            })?
             .map_err(|e| {
                 EngineError::network(
                     NetworkErrorKind::ConnectionRefused,

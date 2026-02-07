@@ -62,7 +62,8 @@ fn build_test_torrent(
         .add_file(name, content.clone())
         .build();
 
-    let metainfo = Metainfo::parse(&torrent_data).expect("TestTorrentBuilder should produce valid torrent data");
+    let metainfo = Metainfo::parse(&torrent_data)
+        .expect("TestTorrentBuilder should produce valid torrent data");
 
     // Slice content into piece data
     let mut pieces = Vec::with_capacity(num_pieces);
@@ -76,10 +77,7 @@ fn build_test_torrent(
 }
 
 /// Create a MockPeer that has all pieces of the given torrent.
-async fn create_seeder(
-    info_hash: [u8; 20],
-    piece_data: &[Vec<u8>],
-) -> Arc<MockPeer> {
+async fn create_seeder(info_hash: [u8; 20], piece_data: &[Vec<u8>]) -> Arc<MockPeer> {
     let num_pieces = piece_data.len();
     let mut config = MockPeerConfig::new(info_hash, num_pieces);
     config.auto_unchoke = true;
@@ -158,7 +156,8 @@ async fn run_torrent_download(
 fn test_metainfo_parse_from_builder() {
     let piece_length = 16384;
     let num_pieces = 2;
-    let (_torrent_data, metainfo, piece_data) = build_test_torrent("parse-test", piece_length, num_pieces);
+    let (_torrent_data, metainfo, piece_data) =
+        build_test_torrent("parse-test", piece_length, num_pieces);
 
     // Verify basic metainfo fields
     assert_eq!(metainfo.info.name, "parse-test");
@@ -188,7 +187,10 @@ fn test_metainfo_parse_multi_file() {
 
     assert_eq!(metainfo.info.name, "multi-test");
     assert!(!metainfo.info.is_single_file);
-    assert!(metainfo.info.files.len() >= 3, "Should have at least 3 files");
+    assert!(
+        metainfo.info.files.len() >= 3,
+        "Should have at least 3 files"
+    );
     assert!(metainfo.info.total_size > 0);
 }
 
@@ -230,7 +232,8 @@ fn test_engine_rejects_invalid_torrent_data() {
 #[tokio::test]
 async fn test_peer_handshake_with_mock_peer() {
     let piece_length = 16384;
-    let (_torrent_data, metainfo, piece_data) = build_test_torrent("handshake-test", piece_length, 1);
+    let (_torrent_data, metainfo, piece_data) =
+        build_test_torrent("handshake-test", piece_length, 1);
     let info_hash = metainfo.info_hash;
 
     // Create and start the mock peer
@@ -245,13 +248,17 @@ async fn test_peer_handshake_with_mock_peer() {
 
     let conn = conn.unwrap();
     assert_eq!(conn.addr(), peer_addr);
-    assert!(conn.peer_id().is_some(), "Should have peer ID after handshake");
+    assert!(
+        conn.peer_id().is_some(),
+        "Should have peer ID after handshake"
+    );
 }
 
 #[tokio::test]
 async fn test_peer_handshake_wrong_info_hash() {
     let piece_length = 16384;
-    let (_torrent_data, metainfo, piece_data) = build_test_torrent("wrong-hash-test", piece_length, 1);
+    let (_torrent_data, metainfo, piece_data) =
+        build_test_torrent("wrong-hash-test", piece_length, 1);
     let info_hash = metainfo.info_hash;
 
     let mock_peer = create_seeder(info_hash, &piece_data).await;
@@ -272,15 +279,13 @@ async fn test_peer_handshake_wrong_info_hash() {
 #[tokio::test]
 async fn test_single_piece_download() {
     let piece_length = 16384; // Exactly one block
-    let (_torrent_data, metainfo, piece_data) =
-        build_test_torrent("single-piece", piece_length, 1);
+    let (_torrent_data, metainfo, piece_data) = build_test_torrent("single-piece", piece_length, 1);
     let info_hash = metainfo.info_hash;
 
     let temp_dir = TempDir::new().unwrap();
     let mock_peer = create_seeder(info_hash, &piece_data).await;
 
-    let downloader =
-        run_torrent_download(metainfo, &[mock_peer.addr()], temp_dir.path(), 30).await;
+    let downloader = run_torrent_download(metainfo, &[mock_peer.addr()], temp_dir.path(), 30).await;
 
     assert!(
         downloader.is_complete(),
@@ -292,7 +297,10 @@ async fn test_single_piece_download() {
     assert!(file_path.exists(), "Downloaded file should exist");
 
     let content = tokio::fs::read(&file_path).await.unwrap();
-    assert_eq!(content, piece_data[0], "File content should match piece data");
+    assert_eq!(
+        content, piece_data[0],
+        "File content should match piece data"
+    );
 }
 
 #[tokio::test]
@@ -306,8 +314,7 @@ async fn test_multi_piece_download() {
     let temp_dir = TempDir::new().unwrap();
     let mock_peer = create_seeder(info_hash, &piece_data).await;
 
-    let downloader =
-        run_torrent_download(metainfo, &[mock_peer.addr()], temp_dir.path(), 30).await;
+    let downloader = run_torrent_download(metainfo, &[mock_peer.addr()], temp_dir.path(), 30).await;
 
     assert!(
         downloader.is_complete(),
@@ -349,8 +356,7 @@ async fn test_download_from_multiple_peers() {
 
     let peer_addrs = vec![peer1.addr(), peer2.addr(), peer3.addr()];
 
-    let downloader =
-        run_torrent_download(metainfo, &peer_addrs, temp_dir.path(), 30).await;
+    let downloader = run_torrent_download(metainfo, &peer_addrs, temp_dir.path(), 30).await;
 
     assert!(
         downloader.is_complete(),
@@ -371,8 +377,7 @@ async fn test_download_from_multiple_peers() {
 #[tokio::test]
 async fn test_torrent_state_transitions() {
     let piece_length = 16384;
-    let (_torrent_data, metainfo, piece_data) =
-        build_test_torrent("state-test", piece_length, 2);
+    let (_torrent_data, metainfo, piece_data) = build_test_torrent("state-test", piece_length, 2);
     let info_hash = metainfo.info_hash;
 
     let temp_dir = TempDir::new().unwrap();
@@ -535,8 +540,15 @@ async fn test_piece_manager_verify_existing() {
     let pm = PieceManager::new(metainfo, temp_dir.path().to_path_buf());
 
     let valid_count = pm.verify_existing().await.unwrap();
-    assert_eq!(valid_count, num_pieces, "Should verify all {} pieces", num_pieces);
-    assert!(pm.is_complete(), "Should be complete after verifying all pieces");
+    assert_eq!(
+        valid_count, num_pieces,
+        "Should verify all {} pieces",
+        num_pieces
+    );
+    assert!(
+        pm.is_complete(),
+        "Should be complete after verifying all pieces"
+    );
 }
 
 #[tokio::test]
@@ -554,7 +566,9 @@ async fn test_piece_manager_detects_corrupt_data() {
     corrupt_content[midpoint] ^= 0xFF; // Flip a byte in piece 1
 
     let file_path = temp_dir.path().join(&metainfo.info.name);
-    tokio::fs::write(&file_path, &corrupt_content).await.unwrap();
+    tokio::fs::write(&file_path, &corrupt_content)
+        .await
+        .unwrap();
 
     let metainfo = Arc::new(metainfo);
     let pm = PieceManager::new(metainfo, temp_dir.path().to_path_buf());
@@ -577,8 +591,7 @@ async fn test_piece_manager_detects_corrupt_data() {
 #[tokio::test]
 async fn test_torrent_events() {
     let piece_length = 16384;
-    let (_torrent_data, metainfo, piece_data) =
-        build_test_torrent("events-test", piece_length, 1);
+    let (_torrent_data, metainfo, piece_data) = build_test_torrent("events-test", piece_length, 1);
     let info_hash = metainfo.info_hash;
 
     let temp_dir = TempDir::new().unwrap();
@@ -644,8 +657,7 @@ async fn test_torrent_events() {
 async fn test_engine_add_torrent_creates_status() {
     let temp_dir = TempDir::new().unwrap();
     let piece_length = 16384;
-    let (torrent_data, _metainfo, _piece_data) =
-        build_test_torrent("engine-test", piece_length, 2);
+    let (torrent_data, _metainfo, _piece_data) = build_test_torrent("engine-test", piece_length, 2);
 
     let config = EngineConfig {
         download_dir: temp_dir.path().to_path_buf(),
@@ -804,8 +816,7 @@ async fn test_download_multi_block_pieces() {
     let temp_dir = TempDir::new().unwrap();
     let mock_peer = create_seeder(info_hash, &piece_data).await;
 
-    let downloader =
-        run_torrent_download(metainfo, &[mock_peer.addr()], temp_dir.path(), 30).await;
+    let downloader = run_torrent_download(metainfo, &[mock_peer.addr()], temp_dir.path(), 30).await;
 
     assert!(
         downloader.is_complete(),
@@ -838,7 +849,9 @@ async fn test_resume_partial_download() {
     partial_content.extend_from_slice(&piece_data[1]);
     // Pad to full size so piece manager can verify piece boundaries
     partial_content.resize(piece_length * num_pieces, 0);
-    tokio::fs::write(&file_path, &partial_content).await.unwrap();
+    tokio::fs::write(&file_path, &partial_content)
+        .await
+        .unwrap();
 
     // Create PieceManager and verify — should find 2 valid pieces
     let metainfo_arc = Arc::new(metainfo.clone());

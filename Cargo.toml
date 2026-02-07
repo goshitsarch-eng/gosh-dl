@@ -2,7 +2,7 @@
 name = "gosh-dl"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 description = "A fast, embeddable download engine for Rust. HTTP/HTTPS with multi-connection acceleration and full BitTorrent protocol support."
 license = "MIT"
 repository = "https://github.com/goshitsarch-eng/gosh-dl"

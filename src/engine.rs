@@ -346,11 +346,7 @@ impl DownloadEngine {
 
     /// Add an HTTP/HTTPS download
     #[cfg(feature = "http")]
-    pub async fn add_http(
-        &self,
-        url: &str,
-        options: DownloadOptions,
-    ) -> Result<DownloadId> {
+    pub async fn add_http(&self, url: &str, options: DownloadOptions) -> Result<DownloadId> {
         // Validate URL
         let parsed_url = Url::parse(url)
             .map_err(|e| EngineError::invalid_input("url", format!("Invalid URL: {}", e)))?;
@@ -873,7 +869,11 @@ impl DownloadEngine {
                     if let Some(ref storage) = engine.storage {
                         if let Some(raw_data) = downloader.raw_torrent_data() {
                             if let Err(e) = storage.save_torrent_data(id, &raw_data).await {
-                                tracing::warn!("Failed to persist magnet torrent data for {}: {}", id, e);
+                                tracing::warn!(
+                                    "Failed to persist magnet torrent data for {}: {}",
+                                    id,
+                                    e
+                                );
                             }
                         }
                     }
@@ -1248,27 +1248,32 @@ impl DownloadEngine {
                             let metainfo = Metainfo::parse(&data)?;
                             let save_dir = {
                                 let downloads = self.downloads.read();
-                                downloads.get(&id)
+                                downloads
+                                    .get(&id)
                                     .map(|d| d.status.metadata.save_dir.clone())
                                     .unwrap_or_else(|| self.config.read().download_dir.clone())
                             };
                             self.start_torrent(id, metainfo, save_dir, options).await?;
                         } else if let Some(ref magnet_uri) = {
                             let downloads = self.downloads.read();
-                            downloads.get(&id).and_then(|d| d.status.metadata.magnet_uri.clone())
+                            downloads
+                                .get(&id)
+                                .and_then(|d| d.status.metadata.magnet_uri.clone())
                         } {
                             // Fall back to magnet URI (will re-fetch metadata from peers)
                             let magnet = MagnetUri::parse(magnet_uri)?;
                             let save_dir = {
                                 let downloads = self.downloads.read();
-                                downloads.get(&id)
+                                downloads
+                                    .get(&id)
                                     .map(|d| d.status.metadata.save_dir.clone())
                                     .unwrap_or_else(|| self.config.read().download_dir.clone())
                             };
                             self.start_magnet(id, magnet, save_dir, options).await?;
                         } else {
                             return Err(EngineError::Internal(
-                                "Torrent download has no handle and no stored data for recovery".to_string(),
+                                "Torrent download has no handle and no stored data for recovery"
+                                    .to_string(),
                             ));
                         }
                     }

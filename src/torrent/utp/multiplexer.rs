@@ -361,16 +361,16 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // accept() should return a socket with the correct remote address
-        let accept_result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            mux.accept(),
-        )
-        .await;
+        let accept_result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), mux.accept()).await;
 
         match accept_result {
             Ok(Ok(socket)) => {
                 let peer = socket.peer_addr().unwrap();
-                assert_eq!(peer, sender_addr, "accept() should preserve the remote address");
+                assert_eq!(
+                    peer, sender_addr,
+                    "accept() should preserve the remote address"
+                );
             }
             Ok(Err(_)) => {
                 // Connection handshake may fail (no SYN-ACK exchange),
