@@ -20,9 +20,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Sanitize cache key
+        id: cache-key
+        shell: bash
+        run: echo "features=${FEATURES//,/-}" >> "$GITHUB_OUTPUT"
+        env:
+          FEATURES: ${{ matrix.features }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.features }}
+          key: ${{ steps.cache-key.outputs.features }}
       - run: cargo check --no-default-features --features "${{ matrix.features }}"
       - run: cargo test --no-default-features --features "${{ matrix.features }}"
 
