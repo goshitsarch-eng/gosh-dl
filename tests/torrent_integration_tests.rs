@@ -850,13 +850,9 @@ async fn test_resume_partial_download() {
     let info_hash = metainfo.info_hash;
     let mock_peer = create_seeder(info_hash, &piece_data).await;
 
-    let downloader =
-        run_torrent_download(metainfo, &[mock_peer.addr()], temp_dir.path(), 30).await;
+    let downloader = run_torrent_download(metainfo, &[mock_peer.addr()], temp_dir.path(), 30).await;
 
-    assert!(
-        downloader.is_complete(),
-        "Resumed download should complete"
-    );
+    assert!(downloader.is_complete(), "Resumed download should complete");
 
     // Verify complete file
     let content = tokio::fs::read(&file_path).await.unwrap();

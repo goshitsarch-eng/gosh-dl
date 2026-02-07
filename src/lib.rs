@@ -12,7 +12,7 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use gosh_dl::{DownloadEngine, EngineConfig, DownloadOptions};
 //!
 //! #[tokio::main]

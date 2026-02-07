@@ -184,7 +184,7 @@ mod hex {
     }
 
     pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
-        if !s.len().is_multiple_of(2) {
+        if s.len() % 2 != 0 {
             return Err(());
         }
         (0..s.len())

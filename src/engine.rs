@@ -1258,7 +1258,7 @@ impl DownloadEngine {
                             downloads.get(&id).and_then(|d| d.status.metadata.magnet_uri.clone())
                         } {
                             // Fall back to magnet URI (will re-fetch metadata from peers)
-                            let magnet = MagnetUri::parse(&magnet_uri)?;
+                            let magnet = MagnetUri::parse(magnet_uri)?;
                             let save_dir = {
                                 let downloads = self.downloads.read();
                                 downloads.get(&id)

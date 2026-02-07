@@ -100,6 +100,22 @@ storage = ["dep:rusqlite"]
 full = ["http", "torrent", "storage"]
 io-uring = []  # Linux high-performance I/O (future)
 
+[[test]]
+name = "mock_peer"
+required-features = ["torrent"]
+
+[[test]]
+name = "test_helpers"
+required-features = ["torrent"]
+
+[[test]]
+name = "torrent_integration_tests"
+required-features = ["torrent"]
+
+[[test]]
+name = "integration_tests"
+required-features = ["http"]
+
 [[example]]
 name = "magnet_smoke"
 required-features = ["torrent"]

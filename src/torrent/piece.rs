@@ -98,7 +98,7 @@ impl PendingPiece {
         }
 
         // Validate offset is aligned to block size
-        if !offset.is_multiple_of(self.block_size) {
+        if offset % self.block_size != 0 {
             tracing::warn!(
                 "Block offset {} is not aligned to block size {}",
                 offset,
