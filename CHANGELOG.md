@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-07
+
+This is a major milestone release that significantly improves the BitTorrent stack,
+adds proper infrastructure, and restructures the public API.
+
+### Added
+
+#### Infrastructure
+- **Feature flags**: `http`, `torrent`, `storage`, `full` — compile only what you need
+- **SQLite schema versioning**: `PRAGMA user_version` with automatic migrations
+- **GitHub Actions CI**: test matrix, fmt, clippy, MSRV 1.75 verification
+- **Fuzz targets**: bencode, metainfo, magnet URI, and content-disposition parsers
+
+#### API & Ergonomics
+- **`DownloadOptions` builder**: 16 chainable builder methods (`new`, `priority`, `save_dir`, `filename`, etc.)
+- **Error helpers**: `is_not_found()`, `is_network()`, `is_shutdown()` on `EngineError`
+- **Examples**: `http_download.rs`, `torrent_download.rs`, `progress_display.rs`
+
+#### BitTorrent Protocol
+- **uTP transport** (BEP 29): fully wired into peer connections with `TorrentConfig.enable_utp` opt-in flag; uTP-first with TCP fallback
+- **IPv6 compact peers** (BEP 7): `peers6` key parsing in HTTP tracker responses (18-byte compact format)
+- **Cross-file WebSeed pieces** (BEP 19): separate HTTP Range requests per file segment for pieces spanning multiple files
+- **Torrent crash recovery**: resume downloads from SQLite-stored torrent data (schema v2 migration)
+- **24 torrent integration tests** using MockPeer for handshake, bitfield, and piece serving
+
+### Fixed
+- **MSE cipher state sync**: RC4 cipher instances are now correctly reused across handshake phases instead of being re-derived
+- **`DownloadId::from_gid()` round-trip**: documented lossy behavior (8/16 UUID bytes); added `matches_gid()` for safe comparison
+- **Tracker panic on TLS failure**: `TrackerClient::new()` now returns `Result` instead of panicking
+- **Peer connection timeout**: dedicated 10s constant (`PEER_CONNECT_TIMEOUT`) prevents indefinite hangs
+- **DHT blocking**: `get_peers()` wrapped in `spawn_blocking` to avoid starving the Tokio runtime
+- **uTP accept() remote address**: `PendingConnection` now stores the actual remote address instead of `0.0.0.0:0`
+- **Magnet link resume**: verify existing files when metadata is received, so partial downloads resume instead of restarting from scratch (thanks to [@fentas](https://github.com/fentas) for [reporting and fixing this](https://github.com/goshitsarch-eng/gosh-dl/pull/9))
+
+### Changed
+- **Unified `&self` API**: all public methods now take `&self` via `Arc::new_cyclic` + `Weak<Self>` pattern (previously mixed `&self` and `&Arc<Self>`)
+- **Internal visibility**: restricted sub-module exports with `pub(crate)` across http, torrent, storage, and lib modules
+- **README**: restructured feature list into honest maturity tiers (Tested / Lightly Tested / Planned)
+
 ## [0.1.6] - 2026-01-24
 
 ### Changed
@@ -110,7 +149,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.3...v0.1.4
