@@ -1,0 +1,38 @@
+[package]
+name = "gosh-dl-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.gosh-dl]
+path = ".."
+features = ["http", "torrent"]
+
+[[bin]]
+name = "fuzz_bencode"
+path = "fuzz_targets/fuzz_bencode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_metainfo"
+path = "fuzz_targets/fuzz_metainfo.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_magnet"
+path = "fuzz_targets/fuzz_magnet.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_content_disposition"
+path = "fuzz_targets/fuzz_content_disposition.rs"
+doc = false
+
+[workspace]
+members = ["."]

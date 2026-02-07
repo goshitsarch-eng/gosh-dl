@@ -18,40 +18,56 @@ A standalone CLI application is coming soon for those who need command-line acce
 
 ## Features
 
-### HTTP/HTTPS Downloads
-- Multi-connection segmented downloads (up to 16 parallel connections)
-- Automatic resume with ETag/Last-Modified validation
-- Connection pooling with token bucket rate limiting
-- Custom headers (User-Agent, Referer, cookies)
-- Mirror/fallback URL support with automatic failover
-- Checksum verification (MD5, SHA256)
-- Proxy support (HTTP, HTTPS, SOCKS5)
+### Tested & Production-Ready
 
-### BitTorrent Protocol
-- Full protocol support (BEP 3)
-- Magnet URI parsing and metadata fetching (BEP 9)
-- DHT for trackerless downloads (BEP 5)
-- Peer Exchange (BEP 11)
-- Local Peer Discovery (BEP 14)
-- HTTP and UDP tracker support (BEP 3, BEP 15)
-- WebSocket tracker support (wss://, ws://) for WebTorrent compatibility
-- WebSeeds (BEP 17 Hoffman-style, BEP 19 GetRight-style)
-- Message Stream Encryption (MSE/PE)
-- uTP transport protocol (BEP 29) with LEDBAT congestion control
-- Private torrent handling (BEP 27)
+| Feature | Details |
+|---------|---------|
+| Multi-connection HTTP/HTTPS | Up to 16 parallel connections per download |
+| Content-Disposition detection | Automatic filename from server headers |
+| Custom headers | User-Agent, Referer, cookies, arbitrary headers |
+| Checksum verification | MD5, SHA-1, SHA-256 |
+| Concurrent download management | Priority queue (Critical/High/Normal/Low) |
+| Pause / resume / cancel | Full lifecycle control |
+| Event system | Broadcast channels for progress, state changes |
+| Global statistics | Active count, aggregate speeds |
+| SQLite persistence | WAL mode, schema versioning, crash recovery |
 
-### Download Management
-- Priority queue (Critical, High, Normal, Low)
-- Bandwidth scheduling with time-based rules
-- Partial torrent downloads (file selection)
-- Sequential download mode for streaming
-- File preallocation (none, sparse, full)
+### Tested BitTorrent Core
 
-### Reliability
-- SQLite-based state persistence with WAL mode
-- Automatic retry with exponential backoff and jitter
-- Crash recovery and resume
-- Segment-level progress tracking for HTTP downloads
+| Feature | BEP | Details |
+|---------|-----|---------|
+| .torrent parsing | 3 | Single-file and multi-file |
+| Magnet URI | 9 | Metadata fetching from peers |
+| Multi-peer downloading | 3 | Piece selection, block pipelining |
+| Piece hash verification | 3 | SHA-1 per piece |
+| HTTP & UDP trackers | 3, 15 | Announce, scrape |
+| Sequential download | — | For streaming playback |
+| Torrent crash recovery | — | Resume from SQLite-stored torrent data |
+| IPv6 tracker peers | 7 | Compact `peers6` parsing |
+
+### Implemented, Lightly Tested
+
+| Feature | BEP | Notes |
+|---------|-----|-------|
+| DHT peer discovery | 5 | Works, disabled in CI tests |
+| Peer Exchange (PEX) | 11 | Implemented, disabled in CI tests |
+| Local Peer Discovery | 14 | Implemented, disabled in CI tests |
+| Message Stream Encryption | MSE/PE | RC4 + DH key exchange, unit tests only |
+| WebSeeds | 17, 19 | Hoffman + GetRight, including cross-file pieces |
+| uTP transport | 29 | LEDBAT congestion control, wired into peer connections (opt-in) |
+| HTTP resume | — | ETag/Last-Modified validation |
+| Mirror/failover | — | Automatic failover to alternate URLs |
+| Private torrent handling | 27 | Disables DHT/PEX/LPD |
+| Choking algorithm | — | Unchoke rotation, optimistic unchoking |
+
+### Planned / Stub
+
+| Feature | Notes |
+|---------|-------|
+| DHT IPv6 | Depends on upstream `mainline` crate |
+| Proxy support | Config field exists, not tested |
+| Bandwidth scheduling | Code exists, not tested |
+| File preallocation | Config field exists, not tested |
 
 ## Quick Start
 

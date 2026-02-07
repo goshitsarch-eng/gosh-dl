@@ -6,22 +6,32 @@
 
 use crate::config::EngineConfig;
 use crate::error::{EngineError, Result};
+#[cfg(feature = "http")]
 use crate::http::{HttpDownloader, SegmentedDownload};
 use crate::priority_queue::{DownloadPriority, PriorityQueue};
 use crate::scheduler::{BandwidthLimits, BandwidthScheduler};
-use crate::storage::{SqliteStorage, Storage};
+#[cfg(feature = "storage")]
+use crate::storage::SqliteStorage;
+use crate::storage::{Segment, Storage};
+#[cfg(feature = "torrent")]
 use crate::torrent::{MagnetUri, Metainfo, TorrentConfig, TorrentDownloader};
 use crate::types::{
-    DownloadEvent, DownloadId, DownloadKind, DownloadMetadata, DownloadOptions, DownloadProgress,
-    DownloadState, DownloadStatus, GlobalStats, TorrentFile, TorrentStatusInfo,
+    DownloadEvent, DownloadId, DownloadOptions, DownloadState, DownloadStatus, GlobalStats,
 };
+#[cfg(any(feature = "http", feature = "torrent"))]
+use crate::types::{DownloadKind, DownloadMetadata, DownloadProgress};
+#[cfg(feature = "torrent")]
+use crate::types::{TorrentFile, TorrentStatusInfo};
 
+#[cfg(any(feature = "http", feature = "torrent"))]
 use chrono::Utc;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+#[cfg(feature = "torrent")]
 use std::time::Duration;
 use tokio::sync::broadcast;
+#[cfg(feature = "http")]
 use url::Url;
 
 /// Maximum number of events to buffer
@@ -34,12 +44,16 @@ struct ManagedDownload {
 }
 
 /// Handle to control a running download
+#[allow(dead_code)]
 enum DownloadHandle {
+    #[cfg(feature = "http")]
     Http(HttpDownloadHandle),
+    #[cfg(feature = "torrent")]
     Torrent(TorrentDownloadHandle),
 }
 
 /// Handle for an HTTP download task
+#[cfg(feature = "http")]
 struct HttpDownloadHandle {
     cancel_token: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<Result<()>>,
@@ -49,6 +63,7 @@ struct HttpDownloadHandle {
 }
 
 /// Handle for a torrent download
+#[cfg(feature = "torrent")]
 struct TorrentDownloadHandle {
     downloader: Arc<TorrentDownloader>,
     task: tokio::task::JoinHandle<Result<()>>,
@@ -57,6 +72,9 @@ struct TorrentDownloadHandle {
 
 /// The main download engine
 pub struct DownloadEngine {
+    /// Weak self-reference for spawning background tasks from `&self` methods
+    self_ref: Weak<Self>,
+
     /// Configuration
     config: RwLock<EngineConfig>,
 
@@ -64,6 +82,7 @@ pub struct DownloadEngine {
     downloads: RwLock<HashMap<DownloadId, ManagedDownload>>,
 
     /// HTTP downloader
+    #[cfg(feature = "http")]
     http: Arc<HttpDownloader>,
 
     /// Event broadcaster
@@ -83,6 +102,11 @@ pub struct DownloadEngine {
 }
 
 impl DownloadEngine {
+    /// Obtain a strong `Arc<Self>` reference for spawning background tasks.
+    fn arc(&self) -> Result<Arc<Self>> {
+        self.self_ref.upgrade().ok_or(EngineError::Shutdown)
+    }
+
     /// Create a new download engine with the given configuration
     pub async fn new(config: EngineConfig) -> Result<Arc<Self>> {
         // Validate configuration
@@ -92,6 +116,7 @@ impl DownloadEngine {
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         // Create HTTP downloader
+        #[cfg(feature = "http")]
         let http = Arc::new(HttpDownloader::new(&config)?);
 
         // Create priority queue for concurrent download limiting
@@ -107,6 +132,7 @@ impl DownloadEngine {
         )));
 
         // Initialize persistent storage
+        #[cfg(feature = "storage")]
         let storage: Option<Arc<dyn Storage>> = if let Some(ref db_path) = config.database_path {
             match SqliteStorage::new(db_path).await {
                 Ok(s) => Some(Arc::new(s)),
@@ -118,10 +144,14 @@ impl DownloadEngine {
         } else {
             None
         };
+        #[cfg(not(feature = "storage"))]
+        let storage: Option<Arc<dyn Storage>> = None;
 
-        let engine = Arc::new(Self {
+        let engine = Arc::new_cyclic(|weak| Self {
+            self_ref: weak.clone(),
             config: RwLock::new(config),
             downloads: RwLock::new(HashMap::new()),
+            #[cfg(feature = "http")]
             http,
             event_tx,
             priority_queue,
@@ -213,6 +243,7 @@ impl DownloadEngine {
                 .filter(|d| d.status.state.is_active())
                 .map(|d| {
                     let segments = match &d.handle {
+                        #[cfg(feature = "http")]
                         Some(DownloadHandle::Http(h)) => h
                             .segmented_download
                             .read()
@@ -243,7 +274,7 @@ impl DownloadEngine {
     }
 
     /// Load persisted downloads from database on startup
-    async fn load_persisted_downloads(self: &Arc<Self>) -> Result<()> {
+    async fn load_persisted_downloads(&self) -> Result<()> {
         let storage = match &self.storage {
             Some(s) => s,
             None => return Ok(()), // No storage configured
@@ -291,6 +322,7 @@ impl DownloadEngine {
         Ok(())
     }
 
+    #[cfg(feature = "torrent")]
     fn build_torrent_status_info(metainfo: &Metainfo) -> TorrentStatusInfo {
         TorrentStatusInfo {
             files: metainfo
@@ -313,8 +345,9 @@ impl DownloadEngine {
     }
 
     /// Add an HTTP/HTTPS download
+    #[cfg(feature = "http")]
     pub async fn add_http(
-        self: &Arc<Self>,
+        &self,
         url: &str,
         options: DownloadOptions,
     ) -> Result<DownloadId> {
@@ -412,8 +445,9 @@ impl DownloadEngine {
     }
 
     /// Add a BitTorrent download from torrent file data
+    #[cfg(feature = "torrent")]
     pub async fn add_torrent(
-        self: &Arc<Self>,
+        &self,
         torrent_data: &[u8],
         options: DownloadOptions,
     ) -> Result<DownloadId> {
@@ -475,6 +509,10 @@ impl DownloadEngine {
             if let Err(e) = storage.save_download(&status).await {
                 tracing::warn!("Failed to persist new torrent download {}: {}", id, e);
             }
+            // Save raw torrent data for crash recovery
+            if let Err(e) = storage.save_torrent_data(id, torrent_data).await {
+                tracing::warn!("Failed to persist torrent data for {}: {}", id, e);
+            }
         }
 
         // Emit event
@@ -487,8 +525,9 @@ impl DownloadEngine {
     }
 
     /// Add a BitTorrent download from a magnet URI
+    #[cfg(feature = "torrent")]
     pub async fn add_magnet(
-        self: &Arc<Self>,
+        &self,
         magnet_uri: &str,
         options: DownloadOptions,
     ) -> Result<DownloadId> {
@@ -562,8 +601,9 @@ impl DownloadEngine {
     }
 
     /// Start a torrent download task
+    #[cfg(feature = "torrent")]
     async fn start_torrent(
-        self: &Arc<Self>,
+        &self,
         id: DownloadId,
         metainfo: Metainfo,
         save_dir: std::path::PathBuf,
@@ -601,7 +641,7 @@ impl DownloadEngine {
         }
 
         let downloader_clone = Arc::clone(&downloader);
-        let engine = Arc::clone(self);
+        let engine = self.arc()?;
 
         // Update state
         self.update_state(id, DownloadState::Connecting)?;
@@ -652,7 +692,7 @@ impl DownloadEngine {
         });
 
         let progress_task =
-            Self::spawn_torrent_progress_task(Arc::clone(self), id, Arc::clone(&downloader));
+            Self::spawn_torrent_progress_task(self.arc()?, id, Arc::clone(&downloader));
 
         // Store the handle
         {
@@ -670,8 +710,9 @@ impl DownloadEngine {
     }
 
     /// Start a magnet download task
+    #[cfg(feature = "torrent")]
     async fn start_magnet(
-        self: &Arc<Self>,
+        &self,
         id: DownloadId,
         magnet: MagnetUri,
         save_dir: std::path::PathBuf,
@@ -704,7 +745,7 @@ impl DownloadEngine {
         }
 
         let downloader_clone = Arc::clone(&downloader);
-        let engine = Arc::clone(self);
+        let engine = self.arc()?;
 
         // Update state
         self.update_state(id, DownloadState::Connecting)?;
@@ -755,7 +796,7 @@ impl DownloadEngine {
         });
 
         let progress_task =
-            Self::spawn_torrent_progress_task(Arc::clone(self), id, Arc::clone(&downloader));
+            Self::spawn_torrent_progress_task(self.arc()?, id, Arc::clone(&downloader));
 
         // Store the handle
         {
@@ -772,6 +813,7 @@ impl DownloadEngine {
         Ok(())
     }
 
+    #[cfg(feature = "torrent")]
     fn spawn_torrent_progress_task(
         engine: Arc<Self>,
         id: DownloadId,
@@ -788,7 +830,7 @@ impl DownloadEngine {
 
                 let progress = downloader.progress();
                 let metainfo = downloader.metainfo();
-                let send_progress = {
+                let (send_progress, persist_torrent_data) = {
                     let mut downloads = engine.downloads.write();
                     let download = match downloads.get_mut(&id) {
                         Some(download) => download,
@@ -802,10 +844,15 @@ impl DownloadEngine {
                         break;
                     }
 
+                    let mut needs_persist = false;
                     if let Some(ref metainfo) = metainfo {
                         if download.status.torrent_info.is_none() {
                             download.status.torrent_info =
                                 Some(Self::build_torrent_status_info(metainfo));
+                            // Magnet metadata just arrived — persist torrent data
+                            if download.status.kind == DownloadKind::Magnet {
+                                needs_persist = true;
+                            }
                         }
                         if download.status.metadata.name != metainfo.info.name {
                             download.status.metadata.name = metainfo.info.name.clone();
@@ -818,8 +865,19 @@ impl DownloadEngine {
                     }
 
                     download.status.progress = progress.clone();
-                    download.status.state.is_active()
+                    (download.status.state.is_active(), needs_persist)
                 };
+
+                // Persist torrent data for magnet crash recovery (outside the lock)
+                if persist_torrent_data {
+                    if let Some(ref storage) = engine.storage {
+                        if let Some(raw_data) = downloader.raw_torrent_data() {
+                            if let Err(e) = storage.save_torrent_data(id, &raw_data).await {
+                                tracing::warn!("Failed to persist magnet torrent data for {}: {}", id, e);
+                            }
+                        }
+                    }
+                }
 
                 if send_progress {
                     let _ = engine
@@ -831,14 +889,15 @@ impl DownloadEngine {
     }
 
     /// Start a download task
+    #[cfg(feature = "http")]
     async fn start_download(
-        self: &Arc<Self>,
+        &self,
         id: DownloadId,
         url: String,
         options: DownloadOptions,
         saved_segments: Option<Vec<crate::storage::Segment>>,
     ) -> Result<()> {
-        let engine = Arc::clone(self);
+        let engine = self.arc()?;
         let http = Arc::clone(&self.http);
         let priority_queue = Arc::clone(&self.priority_queue);
         let priority = options.priority;
@@ -966,6 +1025,7 @@ impl DownloadEngine {
                 }
                 Err(e) if cancel_token_clone.is_cancelled() => {
                     // Cancelled, already handled
+                    let _ = e;
                 }
                 Err(e) => {
                     let retryable = e.is_retryable();
@@ -1024,7 +1084,8 @@ impl DownloadEngine {
             }
 
             // Extract segments before taking the handle (for HTTP resume)
-            let segments = match &download.handle {
+            let segments: Option<Vec<Segment>> = match &download.handle {
+                #[cfg(feature = "http")]
                 Some(DownloadHandle::Http(h)) => h
                     .segmented_download
                     .read()
@@ -1036,10 +1097,12 @@ impl DownloadEngine {
             // Cancel the task
             if let Some(handle) = download.handle.take() {
                 match handle {
+                    #[cfg(feature = "http")]
                     DownloadHandle::Http(h) => {
                         h.cancel_token.cancel();
                         // Don't await the task here to avoid blocking
                     }
+                    #[cfg(feature = "torrent")]
                     DownloadHandle::Torrent(h) => {
                         h.downloader.pause();
                         download.handle = Some(DownloadHandle::Torrent(h));
@@ -1084,8 +1147,9 @@ impl DownloadEngine {
     }
 
     /// Resume a paused download
-    pub async fn resume(self: &Arc<Self>, id: DownloadId) -> Result<()> {
+    pub async fn resume(&self, id: DownloadId) -> Result<()> {
         // Get download info and determine type
+        #[allow(unused_variables)]
         let (kind, url, options, has_torrent_handle) = {
             let downloads = self.downloads.read();
             let download = downloads
@@ -1100,7 +1164,10 @@ impl DownloadEngine {
                 });
             }
 
+            #[cfg(feature = "torrent")]
             let has_torrent_handle = matches!(download.handle, Some(DownloadHandle::Torrent(_)));
+            #[cfg(not(feature = "torrent"))]
+            let has_torrent_handle = false;
 
             let options = DownloadOptions {
                 save_dir: Some(download.status.metadata.save_dir.clone()),
@@ -1124,56 +1191,99 @@ impl DownloadEngine {
             )
         };
 
-        match kind {
-            DownloadKind::Http => {
-                // HTTP: restart download with saved segments
-                let url = url.ok_or_else(|| {
-                    EngineError::Internal("HTTP download missing URL".to_string())
-                })?;
+        #[allow(unreachable_code)]
+        {
+            match kind {
+                #[cfg(feature = "http")]
+                DownloadKind::Http => {
+                    // HTTP: restart download with saved segments
+                    let url = url.ok_or_else(|| {
+                        EngineError::Internal("HTTP download missing URL".to_string())
+                    })?;
 
-                // Load saved segments from storage if available
-                let saved_segments = if let Some(ref storage) = self.storage {
-                    match storage.load_segments(id).await {
-                        Ok(segments) if !segments.is_empty() => {
-                            tracing::debug!(
-                                "Loaded {} saved segments for download {}",
-                                segments.len(),
-                                id
-                            );
-                            Some(segments)
+                    // Load saved segments from storage if available
+                    let saved_segments = if let Some(ref storage) = self.storage {
+                        match storage.load_segments(id).await {
+                            Ok(segments) if !segments.is_empty() => {
+                                tracing::debug!(
+                                    "Loaded {} saved segments for download {}",
+                                    segments.len(),
+                                    id
+                                );
+                                Some(segments)
+                            }
+                            Ok(_) => None,
+                            Err(e) => {
+                                tracing::debug!("Failed to load segments for {}: {}", id, e);
+                                None
+                            }
                         }
-                        Ok(_) => None,
-                        Err(e) => {
-                            tracing::debug!("Failed to load segments for {}: {}", id, e);
+                    } else {
+                        None
+                    };
+
+                    self.start_download(id, url, options, saved_segments)
+                        .await?;
+                }
+                #[cfg(feature = "torrent")]
+                DownloadKind::Torrent | DownloadKind::Magnet => {
+                    if has_torrent_handle {
+                        // Live handle exists — just unpause
+                        let mut downloads = self.downloads.write();
+                        if let Some(download) = downloads.get_mut(&id) {
+                            if let Some(DownloadHandle::Torrent(ref h)) = download.handle {
+                                h.downloader.resume();
+                                download.status.state = DownloadState::Downloading;
+                            }
+                        }
+                    } else {
+                        // No live handle (crash recovery) — try reconstructing from stored data
+                        let torrent_data = if let Some(ref storage) = self.storage {
+                            storage.load_torrent_data(id).await.unwrap_or(None)
+                        } else {
                             None
-                        }
-                    }
-                } else {
-                    None
-                };
+                        };
 
-                self.start_download(id, url, options, saved_segments)
-                    .await?;
-            }
-            DownloadKind::Torrent | DownloadKind::Magnet => {
-                // Torrent/Magnet: resume the existing downloader
-                if has_torrent_handle {
-                    let mut downloads = self.downloads.write();
-                    if let Some(download) = downloads.get_mut(&id) {
-                        if let Some(DownloadHandle::Torrent(ref h)) = download.handle {
-                            h.downloader.resume();
-                            download.status.state = DownloadState::Downloading;
+                        if let Some(data) = torrent_data {
+                            let metainfo = Metainfo::parse(&data)?;
+                            let save_dir = {
+                                let downloads = self.downloads.read();
+                                downloads.get(&id)
+                                    .map(|d| d.status.metadata.save_dir.clone())
+                                    .unwrap_or_else(|| self.config.read().download_dir.clone())
+                            };
+                            self.start_torrent(id, metainfo, save_dir, options).await?;
+                        } else if let Some(ref magnet_uri) = {
+                            let downloads = self.downloads.read();
+                            downloads.get(&id).and_then(|d| d.status.metadata.magnet_uri.clone())
+                        } {
+                            // Fall back to magnet URI (will re-fetch metadata from peers)
+                            let magnet = MagnetUri::parse(&magnet_uri)?;
+                            let save_dir = {
+                                let downloads = self.downloads.read();
+                                downloads.get(&id)
+                                    .map(|d| d.status.metadata.save_dir.clone())
+                                    .unwrap_or_else(|| self.config.read().download_dir.clone())
+                            };
+                            self.start_magnet(id, magnet, save_dir, options).await?;
+                        } else {
+                            return Err(EngineError::Internal(
+                                "Torrent download has no handle and no stored data for recovery".to_string(),
+                            ));
                         }
                     }
-                } else {
-                    return Err(EngineError::Internal(
-                        "Torrent download has no active handle to resume".to_string(),
-                    ));
+                }
+                #[allow(unreachable_patterns)]
+                _ => {
+                    return Err(EngineError::Internal(format!(
+                        "Feature not enabled for download kind {:?}",
+                        kind
+                    )));
                 }
             }
-        }
 
-        let _ = self.event_tx.send(DownloadEvent::Resumed { id });
+            let _ = self.event_tx.send(DownloadEvent::Resumed { id });
+        }
 
         Ok(())
     }
@@ -1207,9 +1317,11 @@ impl DownloadEngine {
         // Cancel the task if running
         if let Some(handle) = handle {
             match handle {
+                #[cfg(feature = "http")]
                 DownloadHandle::Http(h) => {
                     h.cancel_token.cancel();
                 }
+                #[cfg(feature = "torrent")]
                 DownloadHandle::Torrent(h) => {
                     drop(h.downloader.stop());
                     h.progress_task.abort();
@@ -1420,11 +1532,13 @@ impl DownloadEngine {
 
         for handle in handles {
             match handle {
+                #[cfg(feature = "http")]
                 DownloadHandle::Http(h) => {
                     h.cancel_token.cancel();
                     // Wait for task to finish (with timeout)
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h.task).await;
                 }
+                #[cfg(feature = "torrent")]
                 DownloadHandle::Torrent(h) => {
                     drop(h.downloader.stop());
                     h.progress_task.abort();

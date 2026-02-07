@@ -1,8 +1,13 @@
-//! Protocol-level errors
+//! Serializable error type for IPC / RPC boundaries
 //!
-//! Simplified error types for the engine boundary.
-//! These hide internal implementation details while providing
-//! enough information for consumers to handle errors appropriately.
+//! [`ProtocolError`] is a simplified, `Serialize`/`Deserialize` error type
+//! designed for use across process boundaries (JSON-RPC, gRPC, WebSocket APIs).
+//! It carries only string messages and hides internal implementation details.
+//!
+//! For direct Rust usage, prefer [`crate::EngineError`] which provides richer
+//! context (error kind enums, retryability flags) for pattern matching.
+//!
+//! Convert with: `let proto_err: ProtocolError = engine_err.into();`
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

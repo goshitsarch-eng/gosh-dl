@@ -41,13 +41,15 @@
 pub mod config;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "http")]
 pub mod http;
-pub mod priority_queue;
+pub(crate) mod priority_queue;
 pub mod protocol;
-pub mod scheduler;
+pub(crate) mod scheduler;
 pub mod storage;
+#[cfg(feature = "torrent")]
 pub mod torrent;
-pub mod types;
+pub(crate) mod types;
 
 // Re-exports for convenience
 pub use config::{AllocationMode, EngineConfig, HttpConfig, TorrentConfig};
@@ -61,7 +63,9 @@ pub use types::{
 };
 
 // Storage exports
-pub use storage::{MemoryStorage, Segment, SegmentState, SqliteStorage, Storage};
+pub use storage::{MemoryStorage, Segment, SegmentState, Storage};
+#[cfg(feature = "storage")]
+pub use storage::SqliteStorage;
 
 // Priority queue exports
 pub use priority_queue::{DownloadPriority, PriorityQueue, PriorityQueueStats};
@@ -70,6 +74,7 @@ pub use priority_queue::{DownloadPriority, PriorityQueue, PriorityQueueStats};
 pub use scheduler::{BandwidthLimits, BandwidthScheduler, ScheduleRule};
 
 // HTTP module exports
+#[cfg(feature = "http")]
 pub use http::{
     ConnectionPool, HttpDownloader, ResumeInfo, RetryPolicy, SegmentedDownload, ServerCapabilities,
     SpeedCalculator,

@@ -116,15 +116,20 @@ impl DhtClient {
             }
         };
 
-        // Collect peers from the DHT lookup
-        // In mainline v6, get_peers returns an iterator directly (no Result wrapping)
-        // and yields Vec<SocketAddrV4> items
-        let peers: Vec<SocketAddr> = self
-            .dht
-            .get_peers(id)
-            .flatten()
-            .map(SocketAddr::V4)
-            .collect();
+        // Collect peers from the DHT lookup.
+        // The get_peers() call performs blocking network I/O, so we run it on a
+        // blocking thread to avoid starving the Tokio runtime.
+        // Note: The `mainline` crate only returns IPv4 peers (SocketAddrV4).
+        // DHT IPv6 support depends on the upstream crate adding it.
+        let dht = self.dht.clone();
+        let peers: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
+            dht.get_peers(id)
+                .flatten()
+                .map(SocketAddr::V4)
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
 
         // Update cache
         if !peers.is_empty() {

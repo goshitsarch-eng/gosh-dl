@@ -26,6 +26,9 @@ const HANDSHAKE_SIZE: usize = 68; // 1 + 19 + 8 + 20 + 20
 /// Default timeout for operations
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Timeout for initial TCP connection to a peer
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Maximum message size (16KB block + overhead)
 const MAX_MESSAGE_SIZE: usize = 32 * 1024;
 
@@ -536,9 +539,9 @@ impl PeerConnection {
         num_pieces: usize,
         mse_config: Option<&MseConfig>,
     ) -> Result<Self> {
-        let tcp_stream = timeout(DEFAULT_TIMEOUT, TcpStream::connect(addr))
+        let tcp_stream = timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
-            .map_err(|_| EngineError::network(NetworkErrorKind::Timeout, "Connection timeout"))?
+            .map_err(|_| EngineError::network(NetworkErrorKind::Timeout, "Peer connection timeout"))?
             .map_err(|e| {
                 EngineError::network(
                     NetworkErrorKind::ConnectionRefused,
@@ -584,6 +587,53 @@ impl PeerConnection {
             peer_client: None,
             peer_listen_port: None,
             encrypted,
+        };
+
+        conn.handshake().await?;
+
+        Ok(conn)
+    }
+
+    /// Connect to a peer via uTP and perform handshake
+    pub async fn connect_utp(
+        socket: super::utp::UtpSocket,
+        info_hash: Sha1Hash,
+        peer_id: [u8; 20],
+        num_pieces: usize,
+    ) -> Result<Self> {
+        let addr = socket
+            .peer_addr()
+            .map_err(|e| EngineError::network(NetworkErrorKind::Other, e.to_string()))?;
+
+        let mut conn = Self {
+            stream: PeerStream::Utp(socket),
+            addr,
+            info_hash,
+            our_peer_id: peer_id,
+            peer_id: None,
+            reserved: ReservedBytes::with_extensions(),
+            peer_reserved: ReservedBytes::default(),
+            state: ConnectionState::Connecting,
+
+            am_choking: true,
+            am_interested: false,
+            peer_choking: true,
+            peer_interested: false,
+
+            peer_pieces: bitvec![u8, Msb0; 0; num_pieces],
+            num_pieces,
+
+            uploaded: 0,
+            downloaded: 0,
+            last_activity: Instant::now(),
+
+            read_buffer: BytesMut::with_capacity(MAX_MESSAGE_SIZE),
+
+            extension_handshake_done: false,
+            peer_extensions: HashMap::new(),
+            peer_client: None,
+            peer_listen_port: None,
+            encrypted: false,
         };
 
         conn.handshake().await?;

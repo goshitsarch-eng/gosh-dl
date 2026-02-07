@@ -9,11 +9,11 @@
 //! - Retry logic with exponential backoff
 //! - Checksum verification (MD5/SHA256)
 
-pub mod checksum;
-pub mod connection;
-pub mod mirror;
-pub mod resume;
-pub mod segment;
+pub(crate) mod checksum;
+pub(crate) mod connection;
+pub(crate) mod mirror;
+pub(crate) mod resume;
+pub(crate) mod segment;
 
 pub use checksum::{compute_checksum, verify_checksum, ChecksumAlgorithm, ExpectedChecksum};
 pub use connection::{ConnectionPool, RetryPolicy, SpeedCalculator};
@@ -611,7 +611,7 @@ impl HttpDownloader {
 }
 
 /// Parse filename from Content-Disposition header
-fn parse_content_disposition(header: &str) -> Option<String> {
+pub fn parse_content_disposition(header: &str) -> Option<String> {
     // Look for filename="..." or filename*=UTF-8''...
     if let Some(start) = header.find("filename=") {
         let rest = &header[start + 9..];

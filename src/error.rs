@@ -1,7 +1,31 @@
 //! Typed error hierarchy for gosh-dl
 //!
-//! Every error type includes context about what went wrong and whether
-//! the operation can be retried.
+//! [`EngineError`] is the primary error type returned by all public API methods.
+//! It includes rich context (error kinds, retryability) for Rust consumers to
+//! pattern-match on.
+//!
+//! For serialization boundaries (JSON-RPC, gRPC, IPC), convert to
+//! [`crate::ProtocolError`] via the `From` impl — it carries only
+//! string messages and is `Serialize`/`Deserialize`.
+//!
+//! # Error handling example
+//!
+//! ```rust,no_run
+//! use gosh_dl::{EngineError, NetworkErrorKind};
+//!
+//! fn handle_error(err: EngineError) {
+//!     if err.is_retryable() {
+//!         eprintln!("Retryable error: {err}");
+//!     } else if err.is_not_found() {
+//!         eprintln!("Download not found");
+//!     } else if let EngineError::Network { kind, .. } = &err {
+//!         match kind {
+//!             NetworkErrorKind::Timeout => eprintln!("Timed out"),
+//!             _ => eprintln!("Network error: {err}"),
+//!         }
+//!     }
+//! }
+//! ```
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -204,6 +228,21 @@ impl EngineError {
             message: message.into(),
         }
     }
+
+    /// Check if this is a "not found" error
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound(_))
+    }
+
+    /// Check if this is a network error
+    pub fn is_network(&self) -> bool {
+        matches!(self, Self::Network { .. })
+    }
+
+    /// Check if this is a shutdown error
+    pub fn is_shutdown(&self) -> bool {
+        matches!(self, Self::Shutdown)
+    }
 }
 
 /// Result type alias for engine operations
@@ -228,6 +267,7 @@ impl From<std::io::Error> for EngineError {
     }
 }
 
+#[cfg(any(feature = "http", feature = "torrent"))]
 impl From<reqwest::Error> for EngineError {
     fn from(err: reqwest::Error) -> Self {
         let kind = if err.is_timeout() {
@@ -264,6 +304,7 @@ impl From<url::ParseError> for EngineError {
     }
 }
 
+#[cfg(feature = "storage")]
 impl From<rusqlite::Error> for EngineError {
     fn from(err: rusqlite::Error) -> Self {
         Self::Database(err.to_string())

@@ -11,21 +11,22 @@
 //! - Local Peer Discovery (BEP 14)
 //! - Choking algorithm
 
-pub mod bencode;
-pub mod choking;
-pub mod dht;
-pub mod lpd;
-pub mod magnet;
-pub mod metadata;
-pub mod metainfo;
-pub mod mse;
-pub mod peer;
-pub mod pex;
-pub mod piece;
-pub mod tracker;
-pub mod transport;
-pub mod utp;
-pub mod webseed;
+pub(crate) mod bencode;
+pub(crate) mod choking;
+pub(crate) mod dht;
+pub(crate) mod lpd;
+pub(crate) mod magnet;
+pub(crate) mod metadata;
+pub(crate) mod metainfo;
+pub(crate) mod mse;
+pub(crate) mod peer;
+pub(crate) mod pex;
+pub(crate) mod piece;
+pub(crate) mod tracker;
+pub(crate) mod transport;
+pub(crate) mod utp;
+#[cfg(feature = "http")]
+pub(crate) mod webseed;
 
 // Re-export commonly used types
 pub use bencode::BencodeValue;
@@ -46,8 +47,9 @@ pub use tracker::{
     AnnounceEvent, AnnounceRequest, AnnounceResponse, PeerAddr, ScrapeInfo, ScrapeRequest,
     ScrapeResponse, TrackerClient,
 };
-pub use transport::{PeerTransport, TcpTransport, TransportType};
+pub use transport::{PeerTransport, TcpTransport, TransportType, UtpTransport};
 pub use utp::{UtpConfig, UtpMux, UtpSocket};
+#[cfg(feature = "http")]
 pub use webseed::{
     WebSeed, WebSeedConfig, WebSeedEvent, WebSeedManager, WebSeedState, WebSeedType,
 };
@@ -104,6 +106,9 @@ pub struct TorrentConfig {
     /// Choking algorithm update interval in seconds.
     /// Controls how frequently we recalculate which peers to unchoke.
     pub choking_interval_secs: u64,
+    /// Enable uTP (Micro Transport Protocol) transport for peer connections.
+    /// When enabled, peers are tried via uTP first, falling back to TCP.
+    pub enable_utp: bool,
 }
 
 impl Default for TorrentConfig {
@@ -130,6 +135,7 @@ impl Default for TorrentConfig {
             tick_interval_ms: 100,
             connect_interval_secs: 5,
             choking_interval_secs: 10,
+            enable_utp: false,
         }
     }
 }
@@ -197,9 +203,18 @@ pub struct TorrentDownloader {
     /// Choking decisions (addr -> should_be_unchoked)
     choking_decisions: Arc<RwLock<HashMap<SocketAddr, bool>>>,
     /// WebSeed manager (initialized when metainfo available and webseeds exist)
+    #[cfg(feature = "http")]
     webseed_manager: RwLock<Option<Arc<WebSeedManager>>>,
     /// WebSeed event receiver task handle
+    #[cfg(feature = "http")]
     webseed_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    /// Raw bencoded torrent data for crash recovery persistence.
+    /// Set at construction for .torrent files, or when metadata is
+    /// fetched for magnet links.
+    raw_torrent_data: RwLock<Option<Vec<u8>>>,
+    /// uTP multiplexer for UDP-based peer connections (BEP 29).
+    /// Initialized in `start()` when `config.enable_utp` is true.
+    utp_mux: RwLock<Option<Arc<UtpMux>>>,
 }
 
 /// Information about a connected peer
@@ -275,7 +290,7 @@ impl TorrentDownloader {
             save_dir,
             config: config.clone(),
             piece_manager: RwLock::new(Some(piece_manager)),
-            tracker_client: TrackerClient::new(),
+            tracker_client: TrackerClient::new()?,
             state: RwLock::new(TorrentState::Checking),
             peers: RwLock::new(HashMap::new()),
             known_peers: RwLock::new(HashSet::new()),
@@ -288,8 +303,12 @@ impl TorrentDownloader {
             choking_manager: RwLock::new(ChokingManager::new(ChokingConfig::default())),
             shared_peer_stats: Arc::new(RwLock::new(HashMap::new())),
             choking_decisions: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "http")]
             webseed_manager: RwLock::new(None),
+            #[cfg(feature = "http")]
             webseed_task: RwLock::new(None),
+            raw_torrent_data: RwLock::new(None),
+            utp_mux: RwLock::new(None),
         })
     }
 
@@ -311,7 +330,7 @@ impl TorrentDownloader {
             save_dir,
             config: config.clone(),
             piece_manager: RwLock::new(None),
-            tracker_client: TrackerClient::new(),
+            tracker_client: TrackerClient::new()?,
             state: RwLock::new(TorrentState::Metadata),
             peers: RwLock::new(HashMap::new()),
             known_peers: RwLock::new(HashSet::new()),
@@ -324,8 +343,12 @@ impl TorrentDownloader {
             choking_manager: RwLock::new(ChokingManager::new(ChokingConfig::default())),
             shared_peer_stats: Arc::new(RwLock::new(HashMap::new())),
             choking_decisions: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "http")]
             webseed_manager: RwLock::new(None),
+            #[cfg(feature = "http")]
             webseed_task: RwLock::new(None),
+            raw_torrent_data: RwLock::new(None),
+            utp_mux: RwLock::new(None),
         })
     }
 
@@ -384,6 +407,12 @@ impl TorrentDownloader {
     /// Get metainfo if available.
     pub fn metainfo(&self) -> Option<Arc<Metainfo>> {
         self.metainfo.read().clone()
+    }
+
+    /// Get raw bencoded torrent data for persistence.
+    /// Returns `None` for magnet links that haven't received metadata yet.
+    pub fn raw_torrent_data(&self) -> Option<Vec<u8>> {
+        self.raw_torrent_data.read().clone()
     }
 
     /// Get progress information
@@ -476,6 +505,21 @@ impl TorrentDownloader {
             }
         }
 
+        // Initialize uTP multiplexer if enabled
+        if self.config.enable_utp {
+            let utp_addr: SocketAddr =
+                format!("0.0.0.0:{}", self.config.listen_port_range.0).parse().unwrap();
+            match UtpMux::bind(utp_addr).await {
+                Ok(mux) => {
+                    tracing::info!("uTP multiplexer bound to {}", mux.local_addr());
+                    *self.utp_mux.write() = Some(Arc::new(mux));
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to bind uTP multiplexer: {}", e);
+                }
+            }
+        }
+
         // Announce to trackers
         self.announce_to_trackers(AnnounceEvent::Started).await?;
 
@@ -502,12 +546,14 @@ impl TorrentDownloader {
         }
 
         // Start webseed downloads if available
+        #[cfg(feature = "http")]
         self.start_webseeds().await;
 
         Ok(())
     }
 
     /// Initialize and start webseed downloads if metainfo has webseeds
+    #[cfg(feature = "http")]
     async fn start_webseeds(&self) {
         // Get metainfo and piece manager (both needed for webseeds)
         let metainfo = self.metainfo.read().clone();
@@ -1054,9 +1100,31 @@ impl TorrentDownloader {
         shared_stats: Arc<RwLock<HashMap<SocketAddr, PeerStats>>>,
         choking_decisions: Arc<RwLock<HashMap<SocketAddr, bool>>>,
     ) -> Result<()> {
-        // Connect to peer
+        // Connect to peer — try uTP first if available, fall back to TCP
         let metadata_only = downloader.metadata_fetcher.is_some() && num_pieces == 0;
-        let mut conn = PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?;
+        let utp_mux = downloader.utp_mux.read().clone();
+        let mut conn = if let Some(ref mux) = utp_mux {
+            match mux.connect(addr).await {
+                Ok(socket) => {
+                    match PeerConnection::connect_utp(socket, info_hash, peer_id, num_pieces).await {
+                        Ok(c) => {
+                            tracing::info!("Connected to peer {} via uTP", addr);
+                            c
+                        }
+                        Err(e) => {
+                            tracing::debug!("uTP handshake with {} failed: {}, falling back to TCP", addr, e);
+                            PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("uTP connect to {} failed: {}, falling back to TCP", addr, e);
+                    PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?
+                }
+            }
+        } else {
+            PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?
+        };
         tracing::info!("Connected to peer {}", addr);
 
         downloader
@@ -1396,6 +1464,11 @@ impl TorrentDownloader {
 
                                                     *downloader.metainfo.write() = Some(metainfo);
                                                     *downloader.piece_manager.write() = Some(pm.clone());
+
+                                                    // Store raw torrent bytes for crash recovery
+                                                    if let Some(raw_bytes) = fetcher.raw_torrent_bytes().await {
+                                                        *downloader.raw_torrent_data.write() = Some(raw_bytes);
+                                                    }
 
                                                     // Set final state based on completion
                                                     if pm.is_complete() {

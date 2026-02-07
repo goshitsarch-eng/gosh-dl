@@ -42,8 +42,8 @@ impl SqliteStorage {
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
 
-            // Create tables
-            conn.execute_batch(SCHEMA)?;
+            // Run schema migrations
+            migrate(&conn)?;
 
             Ok(conn)
         })
@@ -60,7 +60,7 @@ impl SqliteStorage {
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection> {
             let conn = Connection::open_in_memory()?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
-            conn.execute_batch(SCHEMA)?;
+            migrate(&conn)?;
             Ok(conn)
         })
         .await
@@ -74,8 +74,11 @@ impl SqliteStorage {
     }
 }
 
-/// Database schema
-const SCHEMA: &str = r#"
+/// Current schema version — bump when adding migrations
+const CURRENT_SCHEMA_VERSION: u32 = 2;
+
+/// Database schema v1
+const SCHEMA_V1: &str = r#"
 -- Downloads table
 CREATE TABLE IF NOT EXISTS downloads (
     id TEXT PRIMARY KEY,
@@ -141,6 +144,49 @@ CREATE INDEX IF NOT EXISTS idx_downloads_state ON downloads(state);
 CREATE INDEX IF NOT EXISTS idx_downloads_kind ON downloads(kind);
 CREATE INDEX IF NOT EXISTS idx_segments_download ON segments(download_id);
 "#;
+
+/// Run schema migrations to bring the database up to `CURRENT_SCHEMA_VERSION`.
+///
+/// Uses SQLite's `PRAGMA user_version` to track the current version. Each
+/// migration is applied in order, and the version is bumped after each step.
+/// The function is idempotent — calling it on an already-current database is a
+/// no-op.
+fn migrate(conn: &Connection) -> std::result::Result<(), rusqlite::Error> {
+    let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+
+    if version < 1 {
+        // Check whether this is a legacy database (tables already created
+        // before versioning was added) or a fresh database.
+        let table_exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='downloads'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if !table_exists {
+            // Fresh database — create all tables
+            conn.execute_batch(SCHEMA_V1)?;
+        }
+        // Legacy database — tables already exist, skip creation
+
+        conn.pragma_update(None, "user_version", 1)?;
+    }
+
+    if version < 2 {
+        // Add column to store raw torrent/magnet metadata for crash recovery.
+        // On fresh databases v1 already ran, so the table exists but lacks this column.
+        conn.execute_batch("ALTER TABLE downloads ADD COLUMN torrent_data BLOB")?;
+        conn.pragma_update(None, "user_version", 2)?;
+    }
+
+    debug_assert_eq!(
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        CURRENT_SCHEMA_VERSION
+    );
+
+    Ok(())
+}
 
 #[async_trait]
 impl Storage for SqliteStorage {
@@ -486,6 +532,43 @@ impl Storage for SqliteStorage {
         })
         .await
         .map_err(|e| EngineError::Database(format!("Failed to delete segments: {}", e)))?
+    }
+
+    async fn save_torrent_data(&self, id: DownloadId, data: &[u8]) -> Result<()> {
+        let conn = self.conn.clone();
+        let id_str = id.as_uuid().to_string();
+        let data = data.to_vec();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE downloads SET torrent_data = ?1 WHERE id = ?2",
+                params![data, id_str],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| EngineError::Database(format!("Failed to save torrent data: {}", e)))?
+    }
+
+    async fn load_torrent_data(&self, id: DownloadId) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.clone();
+        let id_str = id.as_uuid().to_string();
+
+        tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let conn = conn.blocking_lock();
+            let result: Option<Option<Vec<u8>>> = conn
+                .query_row(
+                    "SELECT torrent_data FROM downloads WHERE id = ?1",
+                    params![id_str],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // Flatten: None (row missing) or Some(None) (NULL column) → None
+            Ok(result.flatten())
+        })
+        .await
+        .map_err(|e| EngineError::Database(format!("Failed to load torrent data: {}", e)))?
     }
 
     async fn health_check(&self) -> Result<()> {
@@ -928,5 +1011,120 @@ mod tests {
         assert_eq!(loaded.metadata.cookies, vec!["auth=token".to_string()]);
         assert!(loaded.metadata.checksum.is_some());
         assert_eq!(loaded.metadata.mirrors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_schema_versioning() {
+        // Create a fresh in-memory database
+        let storage = SqliteStorage::in_memory().await.unwrap();
+
+        // Verify version is set to CURRENT_SCHEMA_VERSION
+        let conn = storage.conn.lock().await;
+        let version: u32 =
+            conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        // Running migrate again should be idempotent (no-op)
+        migrate(&conn).unwrap();
+        let version2: u32 =
+            conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version2, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn test_schema_versioning_legacy_db() {
+        // Simulate a legacy database (tables exist but no user_version set)
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        // user_version defaults to 0 for a fresh SQLite database
+
+        // migrate should detect existing tables and just bump version
+        migrate(&conn).unwrap();
+        let version: u32 =
+            conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn test_torrent_data_persistence() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+
+        let status = create_test_status();
+        let id = status.id;
+        storage.save_download(&status).await.unwrap();
+
+        // No torrent data initially
+        let data = storage.load_torrent_data(id).await.unwrap();
+        assert!(data.is_none());
+
+        // Save torrent data
+        let torrent_bytes = b"d4:infod6:lengthi1024e4:name9:test.txte4:name9:test.txte";
+        storage
+            .save_torrent_data(id, torrent_bytes)
+            .await
+            .unwrap();
+
+        // Load it back
+        let loaded = storage.load_torrent_data(id).await.unwrap();
+        assert_eq!(loaded.unwrap(), torrent_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_torrent_data_survives_status_update() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+
+        let mut status = create_test_status();
+        let id = status.id;
+        storage.save_download(&status).await.unwrap();
+
+        // Save torrent data
+        let torrent_bytes = vec![1, 2, 3, 4, 5];
+        storage
+            .save_torrent_data(id, &torrent_bytes)
+            .await
+            .unwrap();
+
+        // Update the download status (upsert)
+        status.progress.completed_size = 999;
+        storage.save_download(&status).await.unwrap();
+
+        // Torrent data should still be there (save_download doesn't touch it)
+        let loaded = storage.load_torrent_data(id).await.unwrap();
+        assert_eq!(loaded.unwrap(), torrent_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_schema_v1_to_v2_migration() {
+        // Simulate a v1 database (tables exist, version = 1, no torrent_data column)
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+
+        // Migrate should add the torrent_data column
+        migrate(&conn).unwrap();
+
+        let version: u32 =
+            conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, 2);
+
+        // Verify the column exists by inserting and querying
+        conn.execute(
+            "INSERT INTO downloads (id, kind, state, name, save_dir, created_at) VALUES (?1, 'http', 'queued', 'test', '/tmp', '2024-01-01T00:00:00Z')",
+            params!["test-id"],
+        ).unwrap();
+        conn.execute(
+            "UPDATE downloads SET torrent_data = ?1 WHERE id = 'test-id'",
+            params![vec![1u8, 2, 3]],
+        ).unwrap();
+        let data: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT torrent_data FROM downloads WHERE id = 'test-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(data.unwrap(), vec![1u8, 2, 3]);
     }
 }

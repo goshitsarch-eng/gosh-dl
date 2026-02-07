@@ -495,12 +495,16 @@ pub async fn mse_handshake_outgoing(
     }
 
     // Step 5: Receive response
-    // Need to find VC in the stream, then read crypto_select
+    // Need to find VC in the stream, then read crypto_select.
+    // Only derive the decrypt cipher here -- the encrypt cipher from step 4
+    // must be reused so its keystream position reflects the handshake payload
+    // already encrypted above.
     let (_, decrypt_cipher) = derive_rc4_keys(&shared_secret, &info_hash, true);
 
     match receive_crypto_response(&mut stream, decrypt_cipher, config).await {
         Ok((crypto_method, final_decrypt)) => {
-            let (encrypt_cipher, _) = derive_rc4_keys(&shared_secret, &info_hash, true);
+            // Reuse encrypt_cipher from step 4: its state has advanced past
+            // the handshake payload. A fresh cipher would desync with the peer.
             MseHandshakeResult::Encrypted(Box::new(EncryptedStream::new(
                 stream,
                 encrypt_cipher,
@@ -577,6 +581,8 @@ pub enum PeerStream {
     Plain(TcpStream),
     /// Encrypted stream (boxed to reduce enum size)
     Encrypted(Box<EncryptedStream>),
+    /// uTP stream (micro Transport Protocol over UDP)
+    Utp(super::utp::UtpSocket),
 }
 
 impl PeerStream {
@@ -585,6 +591,7 @@ impl PeerStream {
         match self {
             Self::Plain(s) => s.read(buf).await,
             Self::Encrypted(s) => s.as_mut().read(buf).await,
+            Self::Utp(s) => s.read(buf).await,
         }
     }
 
@@ -593,6 +600,7 @@ impl PeerStream {
         match self {
             Self::Plain(s) => s.read_exact(buf).await.map(|_| ()),
             Self::Encrypted(s) => s.as_mut().read_exact(buf).await,
+            Self::Utp(s) => s.read_exact(buf).await,
         }
     }
 
@@ -601,6 +609,7 @@ impl PeerStream {
         match self {
             Self::Plain(s) => s.write_all(buf).await,
             Self::Encrypted(s) => s.as_mut().write_all(buf).await,
+            Self::Utp(s) => s.write_all(buf).await,
         }
     }
 
@@ -609,6 +618,7 @@ impl PeerStream {
         match self {
             Self::Plain(s) => s.flush().await,
             Self::Encrypted(s) => s.as_mut().flush().await,
+            Self::Utp(s) => s.flush().await,
         }
     }
 
@@ -622,6 +632,7 @@ impl PeerStream {
         match self {
             Self::Plain(s) => s.peer_addr(),
             Self::Encrypted(s) => s.as_ref().peer_addr(),
+            Self::Utp(s) => s.peer_addr(),
         }
     }
 
@@ -630,6 +641,7 @@ impl PeerStream {
         match self {
             Self::Plain(s) => s.shutdown().await,
             Self::Encrypted(s) => s.as_mut().shutdown().await,
+            Self::Utp(s) => s.shutdown().await,
         }
     }
 }
@@ -647,7 +659,8 @@ pub async fn connect_with_mse(
     match config.policy {
         EncryptionPolicy::Disabled => Ok(PeerStream::Plain(stream)),
         EncryptionPolicy::Allowed => {
-            // Just use plaintext for simplicity
+            // TODO: Attempt MSE handshake and fall back to plaintext on failure,
+            // rather than always using plaintext. For now, just use plaintext.
             Ok(PeerStream::Plain(stream))
         }
         EncryptionPolicy::Preferred | EncryptionPolicy::Required => {
@@ -667,8 +680,9 @@ pub async fn connect_with_mse(
                     if config.policy == EncryptionPolicy::Required {
                         Err(e)
                     } else {
-                        // Try to reconnect without encryption
-                        Err(e) // For now, just fail - caller can retry
+                        // TODO: Reconnect without encryption instead of failing.
+                        // For now, just fail -- caller can retry with plaintext.
+                        Err(e)
                     }
                 }
             }

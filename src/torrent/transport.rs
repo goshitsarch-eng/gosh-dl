@@ -99,6 +99,7 @@ impl PeerTransport for TcpTransport {
         match &self.stream {
             PeerStream::Plain(s) => s.local_addr(),
             PeerStream::Encrypted(s) => s.local_addr(),
+            PeerStream::Utp(s) => s.peer_addr(), // uTP doesn't go through TcpTransport
         }
     }
 
@@ -128,6 +129,58 @@ impl PeerTransport for TcpTransport {
 
     async fn shutdown(&mut self) -> io::Result<()> {
         self.stream.shutdown().await
+    }
+}
+
+/// uTP transport implementation
+pub struct UtpTransport {
+    socket: super::utp::UtpSocket,
+    local_addr: SocketAddr,
+}
+
+impl UtpTransport {
+    /// Create a new uTP transport from a UtpSocket
+    pub fn new(socket: super::utp::UtpSocket, local_addr: SocketAddr) -> Self {
+        Self { socket, local_addr }
+    }
+}
+
+#[async_trait]
+impl PeerTransport for UtpTransport {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.peer_addr()
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+
+    fn transport_type(&self) -> TransportType {
+        TransportType::Utp
+    }
+
+    fn is_encrypted(&self) -> bool {
+        false
+    }
+
+    async fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.socket.read_exact(buf).await
+    }
+
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.socket.read(buf).await
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.socket.write_all(buf).await
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush().await
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        self.socket.shutdown().await
     }
 }
 

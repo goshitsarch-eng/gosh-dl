@@ -15,7 +15,7 @@ use parking_lot::RwLock;
 use reqwest::Client;
 use tokio::sync::{mpsc, Semaphore};
 
-use super::metainfo::{Metainfo, Sha1Hash};
+use super::metainfo::{FileInfo, Metainfo, Sha1Hash};
 use super::piece::PieceManager;
 use crate::error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result};
 
@@ -463,6 +463,15 @@ impl WebSeedManager {
 
         let piece_length = end - start;
 
+        // For GetRight multi-file torrents, check if the piece spans multiple files.
+        // If so, use the cross-file download path which makes separate HTTP requests per file.
+        if seed.seed_type == WebSeedType::GetRight && !self.metainfo.info.is_single_file {
+            let files = self.metainfo.files_for_piece(piece_index as usize);
+            if files.len() > 1 {
+                return self.download_multifile_piece(seed, piece_index).await;
+            }
+        }
+
         // Build URL based on seed type and torrent structure
         let url = self.build_piece_url(seed, piece_index, start, end)?;
 
@@ -595,7 +604,25 @@ impl WebSeedManager {
         }
     }
 
+    /// Build URL for a single file in a multi-file torrent (BEP 19 GetRight style)
+    fn build_file_url(&self, seed: &WebSeed, file: &FileInfo) -> String {
+        let file_path = file.path.to_string_lossy();
+
+        // URL encode the path components
+        let encoded_path = file_path
+            .split(std::path::MAIN_SEPARATOR)
+            .map(|p| urlencoding::encode(p).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+
+        let base = seed.url.trim_end_matches('/');
+        format!("{}/{}", base, encoded_path)
+    }
+
     /// Build URL for multi-file torrent piece (BEP 19)
+    ///
+    /// Returns the URL for a single-file piece. For cross-file pieces,
+    /// use `download_multifile_piece` which makes separate requests per file.
     fn build_multifile_url(&self, seed: &WebSeed, piece_index: u32) -> Result<String> {
         // Get files that this piece spans
         let files = self.metainfo.files_for_piece(piece_index as usize);
@@ -611,36 +638,92 @@ impl WebSeedManager {
             // Piece is entirely within one file
             let (file_idx, _file_offset, _length) = files[0];
             let file = &self.metainfo.info.files[file_idx];
-            let file_path = file.path.to_string_lossy();
-
-            // URL encode the path components
-            let encoded_path = file_path
-                .split(std::path::MAIN_SEPARATOR)
-                .map(|p| urlencoding::encode(p).into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-
-            let base = seed.url.trim_end_matches('/');
-            Ok(format!("{}/{}", base, encoded_path))
+            Ok(self.build_file_url(seed, file))
         } else {
-            // Piece spans multiple files - BEP 19 requires separate HTTP requests
-            // for each file segment, then concatenating the results. This is complex
-            // because the HTTP Range header applies to a single file, not the logical
-            // piece which may cross file boundaries.
-            //
-            // Rather than silently returning incorrect data (which would fail hash
-            // verification anyway), we return an explicit error so the piece can be
-            // downloaded from BitTorrent peers instead.
+            // Cross-file pieces are handled by download_multifile_piece()
             Err(EngineError::protocol(
                 ProtocolErrorKind::InvalidResponse,
-                format!(
-                    "Piece {} spans {} files - cross-file WebSeed downloads not yet implemented. \
-                     This piece will be downloaded from BitTorrent peers instead.",
-                    piece_index,
-                    files.len()
-                ),
+                format!("Piece {} spans {} files", piece_index, files.len()),
             ))
         }
+    }
+
+    /// Download a piece that spans multiple files via separate HTTP requests (BEP 19)
+    async fn download_multifile_piece(
+        &self,
+        seed: &WebSeed,
+        piece_index: u32,
+    ) -> Result<Vec<u8>> {
+        let files = self.metainfo.files_for_piece(piece_index as usize);
+        let mut piece_data = Vec::new();
+
+        for (file_idx, file_offset, length) in &files {
+            let file = &self.metainfo.info.files[*file_idx];
+            let url = self.build_file_url(seed, file);
+            let end_byte = file_offset + length - 1;
+
+            tracing::debug!(
+                "WebSeed cross-file: piece {} file {} bytes {}-{}",
+                piece_index,
+                file.path.display(),
+                file_offset,
+                end_byte
+            );
+
+            let response = self
+                .client
+                .get(&url)
+                .header("Range", format!("bytes={}-{}", file_offset, end_byte))
+                .send()
+                .await
+                .map_err(|e| {
+                    EngineError::network(
+                        NetworkErrorKind::Other,
+                        format!("WebSeed cross-file request failed: {}", e),
+                    )
+                })?;
+
+            let status = response.status();
+            if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err(EngineError::network(
+                    NetworkErrorKind::HttpStatus(status.as_u16()),
+                    format!("WebSeed HTTP error for file {}: {}", file.path.display(), status),
+                ));
+            }
+
+            let data = response.bytes().await.map_err(|e| {
+                EngineError::network(
+                    NetworkErrorKind::ConnectionReset,
+                    format!("Failed to read cross-file response: {}", e),
+                )
+            })?;
+
+            piece_data.extend_from_slice(&data[..(*length as usize).min(data.len())]);
+        }
+
+        // Verify the piece hash
+        let expected_hash = self
+            .metainfo
+            .piece_hash(piece_index as usize)
+            .ok_or_else(|| {
+                EngineError::protocol(
+                    ProtocolErrorKind::InvalidTorrent,
+                    format!("No hash for piece {}", piece_index),
+                )
+            })?;
+
+        let actual_hash = Self::sha1_hash(&piece_data);
+        if actual_hash != *expected_hash {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::HashMismatch,
+                format!(
+                    "WebSeed cross-file piece {} hash mismatch",
+                    piece_index
+                ),
+            ));
+        }
+
+        Ok(piece_data)
     }
 
     /// Calculate SHA-1 hash

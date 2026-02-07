@@ -26,26 +26,26 @@ dirs = "6"
 # URL encoding/decoding
 urlencoding = "2"
 
-# HTTP client
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli"] }
+# HTTP client (optional — enabled by "http" feature)
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli"], optional = true }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_bencode = "0.2"
+serde_bencode = { version = "0.2", optional = true }
 
 # Crypto
 sha1 = "0.10"
 sha2 = "0.10"
 md-5 = "0.10"
 rand = "0.9"
-num-bigint = "0.4"
-num-traits = "0.2"
-num-integer = "0.1"
+num-bigint = { version = "0.4", optional = true }
+num-traits = { version = "0.2", optional = true }
+num-integer = { version = "0.1", optional = true }
 
 # Data structures
 bytes = "1.11"
-bitvec = "1"
+bitvec = { version = "1", optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 parking_lot = "0.12"
 
@@ -53,22 +53,22 @@ parking_lot = "0.12"
 governor = "0.10"
 
 # DHT (for BitTorrent)
-mainline = "6"
+mainline = { version = "6", optional = true }
 
 # Multicast sockets (for LPD)
-socket2 = { version = "0.6", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"], optional = true }
 
 # WebSocket (for WSS trackers)
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"], optional = true }
 
 # Base64 encoding
-base64 = "0.22"
+base64 = { version = "0.22", optional = true }
 
 # Error handling
 thiserror = "2"
 
 # Storage
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 
 # Logging
 tracing = "0.1"
@@ -87,5 +87,31 @@ tempfile = "3"
 tracing-subscriber = "0.3"
 
 [features]
-default = []
+default = ["http", "torrent", "storage"]
+http = ["dep:reqwest"]
+torrent = [
+    "dep:reqwest",
+    "dep:serde_bencode", "dep:bitvec",
+    "dep:num-bigint", "dep:num-traits", "dep:num-integer",
+    "dep:mainline", "dep:socket2",
+    "dep:tokio-tungstenite", "dep:base64",
+]
+storage = ["dep:rusqlite"]
+full = ["http", "torrent", "storage"]
 io-uring = []  # Linux high-performance I/O (future)
+
+[[example]]
+name = "magnet_smoke"
+required-features = ["torrent"]
+
+[[example]]
+name = "http_download"
+required-features = ["http"]
+
+[[example]]
+name = "torrent_download"
+required-features = ["torrent"]
+
+[[example]]
+name = "progress_display"
+required-features = ["http"]

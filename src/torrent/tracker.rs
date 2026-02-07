@@ -228,22 +228,27 @@ struct WsPeerInfo {
 
 impl TrackerClient {
     /// Create a new tracker client with a random peer ID
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         Self::with_peer_id(generate_peer_id())
     }
 
     /// Create a tracker client with a specific peer ID
-    pub fn with_peer_id(peer_id: [u8; 20]) -> Self {
+    pub fn with_peer_id(peer_id: [u8; 20]) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(DEFAULT_TIMEOUT)
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|e| {
+                EngineError::network(
+                    NetworkErrorKind::Tls,
+                    format!("Failed to create HTTP client: {}", e),
+                )
+            })?;
 
-        Self {
+        Ok(Self {
             http_client,
             peer_id,
             timeout: DEFAULT_TIMEOUT,
-        }
+        })
     }
 
     /// Set the timeout for tracker requests
@@ -419,7 +424,11 @@ impl TrackerClient {
             .map(String::from);
 
         // Parse peers (can be compact or dictionary format)
-        let peers = self.parse_peers(dict.get(b"peers".as_slice()))?;
+        let mut peers = self.parse_peers(dict.get(b"peers".as_slice()))?;
+
+        // Parse IPv6 peers (BEP 7)
+        let peers6 = self.parse_peers_ipv6(dict.get(b"peers6".as_slice()))?;
+        peers.extend(peers6);
 
         Ok(AnnounceResponse {
             interval,
@@ -519,6 +528,44 @@ impl TrackerClient {
                 ProtocolErrorKind::TrackerError,
                 "Invalid peers format",
             )),
+        }
+    }
+
+    /// Parse IPv6 peers from tracker response (BEP 7)
+    ///
+    /// Compact format: 18 bytes per peer (16 bytes IPv6 address + 2 bytes port)
+    fn parse_peers_ipv6(&self, value: Option<&BencodeValue>) -> Result<Vec<PeerAddr>> {
+        let Some(value) = value else {
+            return Ok(Vec::new());
+        };
+
+        match value {
+            BencodeValue::Bytes(data) => {
+                if data.len() % 18 != 0 {
+                    return Err(EngineError::protocol(
+                        ProtocolErrorKind::TrackerError,
+                        "Invalid compact peers6 length",
+                    ));
+                }
+
+                let peers = data
+                    .chunks_exact(18)
+                    .map(|chunk| {
+                        let mut octets = [0u8; 16];
+                        octets.copy_from_slice(&chunk[..16]);
+                        let ip = std::net::Ipv6Addr::from(octets).to_string();
+                        let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+                        PeerAddr {
+                            ip,
+                            port,
+                            peer_id: None,
+                        }
+                    })
+                    .collect();
+
+                Ok(peers)
+            }
+            _ => Ok(Vec::new()), // Ignore non-compact IPv6 peers
         }
     }
 
@@ -674,7 +721,8 @@ impl TrackerClient {
         })?;
 
         // Receive response (20 bytes header + 6 bytes per peer)
-        let mut response = [0u8; 1024];
+        // 4096 bytes supports ~678 peers ((4096 - 20) / 6), preventing silent truncation
+        let mut response = [0u8; 4096];
         let len = timeout(self.timeout, socket.recv(&mut response))
             .await
             .map_err(|_| {
@@ -1198,7 +1246,7 @@ impl TrackerClient {
 
 impl Default for TrackerClient {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("Failed to create default TrackerClient (TLS initialization failed)")
     }
 }
 
@@ -1265,8 +1313,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_compact_peers_ipv6() {
+        let client = TrackerClient::new().unwrap();
+
+        // Compact IPv6 format: 18 bytes per peer (16 IPv6 + 2 port)
+        // ::1 port 6881 and 2001:db8::1 port 8080
+        let mut data = Vec::new();
+        // ::1
+        data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        data.extend_from_slice(&0x1AE1u16.to_be_bytes()); // port 6881
+        // 2001:db8::1
+        data.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        data.extend_from_slice(&0x1F90u16.to_be_bytes()); // port 8080
+
+        let value = BencodeValue::Bytes(data);
+        let peers = client.parse_peers_ipv6(Some(&value)).unwrap();
+
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].ip, "::1");
+        assert_eq!(peers[0].port, 6881);
+        assert_eq!(peers[1].ip, "2001:db8::1");
+        assert_eq!(peers[1].port, 8080);
+    }
+
+    #[test]
     fn test_parse_compact_peers() {
-        let client = TrackerClient::new();
+        let client = TrackerClient::new().unwrap();
 
         // Compact format: 6 bytes per peer
         let data = vec![

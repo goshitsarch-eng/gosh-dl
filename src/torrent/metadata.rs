@@ -387,6 +387,16 @@ impl MetadataFetcher {
         Ok(Some(metainfo))
     }
 
+    /// Get the raw bencoded torrent data (synthetic, built from the info dict).
+    /// Returns `None` if metadata hasn't been fully received yet.
+    pub async fn raw_torrent_bytes(&self) -> Option<Vec<u8>> {
+        let data = self.get_metadata().await?;
+        let info_value = BencodeValue::parse_exact(&data).ok()?;
+        let mut torrent_dict = std::collections::BTreeMap::new();
+        torrent_dict.insert(b"info".to_vec(), info_value);
+        Some(BencodeValue::Dict(torrent_dict).encode())
+    }
+
     /// Get the total metadata size (if known).
     pub async fn total_size(&self) -> Option<usize> {
         *self.total_size.read().await

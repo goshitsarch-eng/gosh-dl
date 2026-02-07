@@ -25,13 +25,29 @@ impl DownloadId {
         &self.0
     }
 
-    /// Generate an aria2-compatible GID (16-char hex string)
-    /// This is for backwards compatibility with existing frontend
+    /// Generate an aria2-compatible GID (16-char hex string).
+    ///
+    /// This is a **lossy** projection: only the first 8 bytes of the 16-byte
+    /// UUID are encoded, so the upper 8 bytes are discarded. Two distinct
+    /// `DownloadId` values that share the same first 8 bytes will produce
+    /// the same GID.
+    ///
+    /// Use [`matches_gid`](Self::matches_gid) to check whether a given GID
+    /// corresponds to this `DownloadId` without assuming a lossless round-trip.
     pub fn to_gid(&self) -> String {
         hex::encode(&self.0.as_bytes()[0..8])
     }
 
-    /// Try to parse from a GID string
+    /// Create a **new** `DownloadId` from an aria2-compatible GID string.
+    ///
+    /// Because a GID only carries 8 bytes of the original 16-byte UUID, the
+    /// returned `DownloadId` is **not** equal to whichever `DownloadId`
+    /// originally produced the GID (the upper 8 bytes are zero-filled).
+    /// In other words, `DownloadId::from_gid(id.to_gid()) != id` in the
+    /// general case.
+    ///
+    /// If you need to test whether an existing `DownloadId` matches a GID,
+    /// use [`matches_gid`](Self::matches_gid) instead.
     pub fn from_gid(gid: &str) -> Option<Self> {
         if gid.len() != 16 {
             return None;
@@ -40,10 +56,20 @@ impl DownloadId {
         if bytes.len() != 8 {
             return None;
         }
-        // Create a UUID with the GID bytes + zeros
+        // Create a UUID with the GID bytes + zeros for the upper half
         let mut uuid_bytes = [0u8; 16];
         uuid_bytes[0..8].copy_from_slice(&bytes);
         Some(Self(Uuid::from_bytes(uuid_bytes)))
+    }
+
+    /// Check whether this `DownloadId`'s first 8 bytes match the given GID.
+    ///
+    /// This is the correct way to look up a `DownloadId` by GID without
+    /// relying on the lossy `from_gid` round-trip. It compares only the
+    /// bytes that `to_gid` encodes, so it works even when the upper 8 bytes
+    /// of two `DownloadId` values differ.
+    pub fn matches_gid(&self, gid: &str) -> bool {
+        self.to_gid() == gid
     }
 }
 
@@ -165,5 +191,62 @@ mod hex {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_gid_returns_16_char_hex_string() {
+        let id = DownloadId::new();
+        let gid = id.to_gid();
+        assert_eq!(gid.len(), 16);
+        assert!(gid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn from_gid_round_trip_is_lossy() {
+        let id = DownloadId::new();
+        let gid = id.to_gid();
+        let reconstructed = DownloadId::from_gid(&gid).expect("valid GID");
+        assert_ne!(
+            id, reconstructed,
+            "round-trip should be lossy (upper 8 bytes zeroed)"
+        );
+        assert_eq!(gid, reconstructed.to_gid());
+    }
+
+    #[test]
+    fn matches_gid_works_without_round_trip() {
+        let id = DownloadId::new();
+        let gid = id.to_gid();
+        assert!(id.matches_gid(&gid));
+        let other = DownloadId::new();
+        assert!(!other.matches_gid(&gid));
+    }
+
+    #[test]
+    fn from_gid_rejects_invalid_input() {
+        assert!(DownloadId::from_gid("").is_none());
+        assert!(DownloadId::from_gid("abc").is_none());
+        assert!(DownloadId::from_gid("0123456789abcde").is_none());
+        assert!(DownloadId::from_gid("0123456789abcdef0").is_none());
+        assert!(DownloadId::from_gid("zzzzzzzzzzzzzzzz").is_none());
+    }
+
+    #[test]
+    fn from_gid_accepts_valid_input() {
+        let id = DownloadId::from_gid("0123456789abcdef");
+        assert!(id.is_some());
+        assert_eq!(id.unwrap().to_gid(), "0123456789abcdef");
+    }
+
+    #[test]
+    fn matches_gid_rejects_wrong_length() {
+        let id = DownloadId::new();
+        assert!(!id.matches_gid("abc"));
+        assert!(!id.matches_gid(""));
     }
 }

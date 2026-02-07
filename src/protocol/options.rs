@@ -84,3 +84,100 @@ pub struct DownloadOptions {
     /// Sequential download mode (torrent only) - downloads pieces in order for streaming
     pub sequential: Option<bool>,
 }
+
+impl DownloadOptions {
+    /// Create new download options with defaults
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set download priority
+    pub fn priority(mut self, priority: DownloadPriority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Set the directory to save files
+    pub fn save_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.save_dir = Some(dir.into());
+        self
+    }
+
+    /// Set the output filename
+    pub fn filename(mut self, name: impl Into<String>) -> Self {
+        self.filename = Some(name.into());
+        self
+    }
+
+    /// Set a custom user agent
+    pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.user_agent = Some(ua.into());
+        self
+    }
+
+    /// Set the referer header
+    pub fn referer(mut self, referer: impl Into<String>) -> Self {
+        self.referer = Some(referer.into());
+        self
+    }
+
+    /// Add a custom header
+    pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((key.into(), value.into()));
+        self
+    }
+
+    /// Set cookies for authenticated downloads
+    pub fn cookies(mut self, cookies: Vec<String>) -> Self {
+        self.cookies = Some(cookies);
+        self
+    }
+
+    /// Set expected checksum for verification
+    pub fn checksum(mut self, checksum: ExpectedChecksum) -> Self {
+        self.checksum = Some(checksum);
+        self
+    }
+
+    /// Add a mirror/fallback URL
+    pub fn mirror(mut self, url: impl Into<String>) -> Self {
+        self.mirrors.push(url.into());
+        self
+    }
+
+    /// Set max connections for this download
+    pub fn max_connections(mut self, n: usize) -> Self {
+        self.max_connections = Some(n);
+        self
+    }
+
+    /// Set max download speed in bytes/sec
+    pub fn max_download_speed(mut self, bps: u64) -> Self {
+        self.max_download_speed = Some(bps);
+        self
+    }
+
+    /// Set max upload speed in bytes/sec (torrent only)
+    pub fn max_upload_speed(mut self, bps: u64) -> Self {
+        self.max_upload_speed = Some(bps);
+        self
+    }
+
+    /// Set seed ratio limit (torrent only)
+    pub fn seed_ratio(mut self, ratio: f64) -> Self {
+        self.seed_ratio = Some(ratio);
+        self
+    }
+
+    /// Set selected file indices (torrent only)
+    pub fn selected_files(mut self, indices: Vec<usize>) -> Self {
+        self.selected_files = Some(indices);
+        self
+    }
+
+    /// Enable sequential download mode for streaming (torrent only)
+    pub fn sequential(mut self, enabled: bool) -> Self {
+        self.sequential = Some(enabled);
+        self
+    }
+}

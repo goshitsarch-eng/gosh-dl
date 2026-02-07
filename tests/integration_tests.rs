@@ -1,3 +1,4 @@
+#![cfg(feature = "http")]
 //! Integration tests for gosh-dl
 //!
 //! These tests use wiremock to simulate HTTP servers and test

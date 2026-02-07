@@ -3,8 +3,10 @@
 //! This module handles persistent storage for download state and session data.
 //! Uses SQLite with WAL mode for crash-safe atomic commits.
 
-pub mod sqlite;
+#[cfg(feature = "storage")]
+pub(crate) mod sqlite;
 
+#[cfg(feature = "storage")]
 pub use sqlite::SqliteStorage;
 
 use crate::error::Result;
@@ -94,6 +96,12 @@ pub trait Storage: Send + Sync {
     /// Delete segment state for a download
     async fn delete_segments(&self, id: DownloadId) -> Result<()>;
 
+    /// Save raw torrent data (bencoded metainfo) for crash recovery
+    async fn save_torrent_data(&self, id: DownloadId, data: &[u8]) -> Result<()>;
+
+    /// Load raw torrent data for crash recovery
+    async fn load_torrent_data(&self, id: DownloadId) -> Result<Option<Vec<u8>>>;
+
     /// Check if database is healthy
     async fn health_check(&self) -> Result<()>;
 
@@ -106,6 +114,7 @@ pub trait Storage: Send + Sync {
 pub struct MemoryStorage {
     downloads: parking_lot::RwLock<std::collections::HashMap<DownloadId, DownloadStatus>>,
     segments: parking_lot::RwLock<std::collections::HashMap<DownloadId, Vec<Segment>>>,
+    torrent_data: parking_lot::RwLock<std::collections::HashMap<DownloadId, Vec<u8>>>,
 }
 
 impl MemoryStorage {
@@ -147,6 +156,15 @@ impl Storage for MemoryStorage {
     async fn delete_segments(&self, id: DownloadId) -> Result<()> {
         self.segments.write().remove(&id);
         Ok(())
+    }
+
+    async fn save_torrent_data(&self, id: DownloadId, data: &[u8]) -> Result<()> {
+        self.torrent_data.write().insert(id, data.to_vec());
+        Ok(())
+    }
+
+    async fn load_torrent_data(&self, id: DownloadId) -> Result<Option<Vec<u8>>> {
+        Ok(self.torrent_data.read().get(&id).cloned())
     }
 
     async fn health_check(&self) -> Result<()> {
