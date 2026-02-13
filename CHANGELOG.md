@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-02-13
+
+### Fixed
+- **Large file downloads failing at ~400MB**: the reqwest HTTP client was configured with `.timeout()` which sets a total request deadline (default 60s), not a per-read idle timeout — downloads taking longer than 60 seconds would be killed mid-stream; switched to `.read_timeout()` which resets after each successful read
+- **Segment failures killing entire download**: wired the existing `RetryPolicy` into the segmented download path — each segment now retries with exponential backoff and resumes from the byte position already written instead of failing the whole download immediately
+- **Rate limiter silent overflow**: speed limits were cast from `u64` to `u32` with truncation; values above `u32::MAX` now clamp instead of wrapping to zero
+- **SQLite busy errors with concurrent readers**: added `busy_timeout(5s)` so external tools (GUI, CLI monitors) reading the database don't cause `SQLITE_BUSY` failures
+- **Segment persistence not atomic**: wrapped `save_segments()` DELETE+INSERT in an explicit transaction to prevent corrupt resume data on crash
+- **WebSeed unbounded memory growth**: replaced unbounded event channel with a bounded channel (`max_connections * 2` capacity) to apply backpressure when the consumer falls behind
+- **WebSeed timeout same as main client**: applied the same `.timeout()` → `.read_timeout()` fix to the WebSeed HTTP client
+
 ## [0.2.2] - 2026-02-07
 
 ### Fixed
@@ -160,7 +171,9 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.5...v0.1.6
