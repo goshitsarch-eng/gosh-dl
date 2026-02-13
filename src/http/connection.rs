@@ -52,7 +52,7 @@ impl ConnectionPool {
     pub fn new(config: &HttpConfig) -> Result<Self> {
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(config.connect_timeout))
-            .timeout(Duration::from_secs(config.read_timeout))
+            .read_timeout(Duration::from_secs(config.read_timeout))
             .redirect(reqwest::redirect::Policy::limited(config.max_redirects))
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .pool_max_idle_per_host(32)
@@ -91,11 +91,13 @@ impl ConnectionPool {
         let mut pool = Self::new(config)?;
 
         pool.download_limiter = download_limit.and_then(|limit| {
-            NonZeroU32::new(limit as u32).map(|n| RateLimiter::direct(Quota::per_second(n)))
+            let clamped = limit.min(u32::MAX as u64) as u32;
+            NonZeroU32::new(clamped).map(|n| RateLimiter::direct(Quota::per_second(n)))
         });
 
         pool.upload_limiter = upload_limit.and_then(|limit| {
-            NonZeroU32::new(limit as u32).map(|n| RateLimiter::direct(Quota::per_second(n)))
+            let clamped = limit.min(u32::MAX as u64) as u32;
+            NonZeroU32::new(clamped).map(|n| RateLimiter::direct(Quota::per_second(n)))
         });
 
         Ok(pool)
@@ -109,14 +111,16 @@ impl ConnectionPool {
     /// Update download speed limit
     pub fn set_download_limit(&mut self, limit: Option<u64>) {
         self.download_limiter = limit.and_then(|l| {
-            NonZeroU32::new(l as u32).map(|n| RateLimiter::direct(Quota::per_second(n)))
+            let clamped = l.min(u32::MAX as u64) as u32;
+            NonZeroU32::new(clamped).map(|n| RateLimiter::direct(Quota::per_second(n)))
         });
     }
 
     /// Update upload speed limit
     pub fn set_upload_limit(&mut self, limit: Option<u64>) {
         self.upload_limiter = limit.and_then(|l| {
-            NonZeroU32::new(l as u32).map(|n| RateLimiter::direct(Quota::per_second(n)))
+            let clamped = l.min(u32::MAX as u64) as u32;
+            NonZeroU32::new(clamped).map(|n| RateLimiter::direct(Quota::per_second(n)))
         });
     }
 

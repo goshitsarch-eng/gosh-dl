@@ -573,6 +573,7 @@ impl HttpDownloader {
                     ua,
                     &all_headers,
                     max_connections,
+                    &self.retry_policy,
                     cancel_token,
                     progress_callback,
                 )

@@ -41,6 +41,7 @@ impl SqliteStorage {
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
             // Run schema migrations
             migrate(&conn)?;
@@ -406,41 +407,47 @@ impl Storage for SqliteStorage {
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = conn.blocking_lock();
 
+            let tx = conn.unchecked_transaction()?;
+
             // Delete existing segments first
-            conn.execute(
+            tx.execute(
                 "DELETE FROM segments WHERE download_id = ?1",
                 params![id_str],
             )?;
 
             // Insert new segments
-            let mut stmt = conn.prepare(
-                r#"
-                INSERT INTO segments (download_id, segment_index, start_byte, end_byte, downloaded, state, error_message, error_retries)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                "#,
-            )?;
+            {
+                let mut stmt = tx.prepare(
+                    r#"
+                    INSERT INTO segments (download_id, segment_index, start_byte, end_byte, downloaded, state, error_message, error_retries)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    "#,
+                )?;
 
-            for segment in &segments {
-                let (state_str, error_msg, retries) = match &segment.state {
-                    SegmentState::Pending => ("pending", None, 0),
-                    SegmentState::Downloading => ("downloading", None, 0),
-                    SegmentState::Completed => ("completed", None, 0),
-                    SegmentState::Failed { error, retries } => {
-                        ("failed", Some(error.clone()), *retries)
-                    }
-                };
+                for segment in &segments {
+                    let (state_str, error_msg, retries) = match &segment.state {
+                        SegmentState::Pending => ("pending", None, 0),
+                        SegmentState::Downloading => ("downloading", None, 0),
+                        SegmentState::Completed => ("completed", None, 0),
+                        SegmentState::Failed { error, retries } => {
+                            ("failed", Some(error.clone()), *retries)
+                        }
+                    };
 
-                stmt.execute(params![
-                    id_str,
-                    segment.index as i64,
-                    segment.start as i64,
-                    segment.end as i64,
-                    segment.downloaded as i64,
-                    state_str,
-                    error_msg,
-                    retries as i64,
-                ])?;
+                    stmt.execute(params![
+                        id_str,
+                        segment.index as i64,
+                        segment.start as i64,
+                        segment.end as i64,
+                        segment.downloaded as i64,
+                        state_str,
+                        error_msg,
+                        retries as i64,
+                    ])?;
+                }
             }
+
+            tx.commit()?;
 
             Ok(())
         })

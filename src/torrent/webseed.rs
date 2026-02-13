@@ -257,7 +257,7 @@ pub struct WebSeedManager {
     /// Active web seeds
     seeds: Vec<Arc<WebSeed>>,
     /// Event sender (to coordinator)
-    event_tx: mpsc::UnboundedSender<WebSeedEvent>,
+    event_tx: mpsc::Sender<WebSeedEvent>,
     /// Pieces being downloaded by webseeds
     webseed_pending: Arc<RwLock<HashSet<u32>>>,
     /// Shutdown flag
@@ -275,12 +275,13 @@ impl WebSeedManager {
         metainfo: Arc<Metainfo>,
         piece_manager: Arc<PieceManager>,
         config: WebSeedConfig,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<WebSeedEvent>)> {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+    ) -> Result<(Self, mpsc::Receiver<WebSeedEvent>)> {
+        let channel_capacity = config.max_connections * 2;
+        let (event_tx, event_rx) = mpsc::channel(channel_capacity);
 
         // Build HTTP client
         let client = Client::builder()
-            .timeout(config.request_timeout)
+            .read_timeout(config.request_timeout)
             .user_agent(&config.user_agent)
             .build()
             .map_err(|e| {
@@ -424,7 +425,7 @@ impl WebSeedManager {
                     piece_index,
                     data,
                     source_url: seed.url.clone(),
-                });
+                }).await;
             }
             Err(e) => {
                 let retryable = e.is_retryable();
@@ -439,7 +440,7 @@ impl WebSeedManager {
                     source_url: seed.url.clone(),
                     error: e.to_string(),
                     retryable,
-                });
+                }).await;
             }
         }
 

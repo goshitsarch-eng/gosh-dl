@@ -7,6 +7,7 @@
 use crate::error::{EngineError, NetworkErrorKind, Result, StorageErrorKind};
 use crate::storage::Segment;
 use crate::types::DownloadProgress;
+use super::connection::RetryPolicy;
 
 use bytes::Bytes;
 use futures::stream::StreamExt;
@@ -186,6 +187,7 @@ impl SegmentedDownload {
         user_agent: &str,
         headers: &[(String, String)],
         max_connections: usize,
+        retry_policy: &RetryPolicy,
         cancel_token: CancellationToken,
         progress_callback: F,
     ) -> Result<()>
@@ -230,6 +232,7 @@ impl SegmentedDownload {
             let last_progress = Arc::clone(&last_progress);
             let bytes_since_progress = Arc::clone(&bytes_since_progress);
             let total_size = self.total_size;
+            let retry_policy = retry_policy.clone();
 
             let handle = tokio::spawn(async move {
                 // Acquire permit
@@ -250,204 +253,264 @@ impl SegmentedDownload {
 
                 state.active_connections.fetch_add(1, Ordering::Relaxed);
 
-                // Adjusted start position for resume
-                let resume_start = start + already_downloaded;
-                if resume_start > end {
-                    // Already complete
+                // Persistent state across retries
+                let mut segment_bytes: u64 = already_downloaded;
+                let mut last_speed_update = Instant::now();
+                let mut bytes_for_speed: u64 = 0;
+                let mut attempt = 0u32;
+
+                // Check if already complete before entering retry loop
+                if start + segment_bytes > end {
                     state.active_connections.fetch_sub(1, Ordering::Relaxed);
                     return Ok(());
                 }
 
-                // Build request with Range header
-                let mut request = client.get(&url);
-                request = request.header("User-Agent", &user_agent);
-                request = request.header("Range", format!("bytes={}-{}", resume_start, end));
+                let result: Result<()> = 'retry: loop {
+                    // Check cancellation between retries
+                    if cancel_token.is_cancelled() {
+                        break 'retry Ok(());
+                    }
 
-                // Add ETag for validation if available
-                if let Some(ref etag_val) = etag {
-                    request = request.header("If-Range", etag_val);
-                }
+                    // Calculate resume position from current progress
+                    let resume_start = start + segment_bytes;
+                    if resume_start > end {
+                        break 'retry Ok(());
+                    }
 
-                // Add custom headers
-                for (name, value) in &headers {
-                    request = request.header(name.as_str(), value.as_str());
-                }
+                    // Build request with Range header
+                    let mut request = client.get(&url);
+                    request = request.header("User-Agent", &user_agent);
+                    request = request.header("Range", format!("bytes={}-{}", resume_start, end));
 
-                // Send request
-                let response = request.send().await.map_err(|e| {
-                    EngineError::network(
-                        NetworkErrorKind::Other,
-                        format!("Segment {} request failed: {}", segment_idx, e),
-                    )
-                })?;
+                    // Add ETag for validation if available
+                    if let Some(ref etag_val) = etag {
+                        request = request.header("If-Range", etag_val);
+                    }
 
-                let status = response.status();
+                    // Add custom headers
+                    for (name, value) in &headers {
+                        request = request.header(name.as_str(), value.as_str());
+                    }
 
-                // Handle 416 Range Not Satisfiable - file may have changed on server
-                if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-                    state.active_connections.fetch_sub(1, Ordering::Relaxed);
-                    return Err(EngineError::network(
-                        NetworkErrorKind::HttpStatus(416),
-                        format!(
-                            "Segment {} range not satisfiable (file may have changed on server)",
-                            segment_idx
-                        ),
-                    ));
-                }
+                    // Send request
+                    let response = match request.send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let err = EngineError::network(
+                                NetworkErrorKind::Other,
+                                format!("Segment {} request failed: {}", segment_idx, e),
+                            );
+                            attempt += 1;
+                            if retry_policy.should_retry(attempt - 1, &err) {
+                                tracing::warn!(
+                                    "Segment {} request failed (attempt {}/{}), retrying: {}",
+                                    segment_idx, attempt, retry_policy.max_attempts, e
+                                );
+                                let delay = retry_policy.delay_for_attempt(attempt - 1);
+                                tokio::time::sleep(delay).await;
+                                continue 'retry;
+                            }
+                            break 'retry Err(err);
+                        }
+                    };
 
-                if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-                    state.active_connections.fetch_sub(1, Ordering::Relaxed);
-                    return Err(EngineError::network(
-                        NetworkErrorKind::HttpStatus(status.as_u16()),
-                        format!("Segment {} HTTP error: {}", segment_idx, status),
-                    ));
-                }
+                    let status = response.status();
 
-                // Validate Content-Range header matches our request (security check)
-                if status == reqwest::StatusCode::PARTIAL_CONTENT {
-                    if let Some(content_range) = response.headers().get("content-range") {
-                        if let Ok(range_str) = content_range.to_str() {
-                            // Expected format: "bytes START-END/TOTAL" or "bytes START-END/*"
-                            if let Some(range_part) = range_str.strip_prefix("bytes ") {
-                                if let Some((range, _)) = range_part.split_once('/') {
-                                    if let Some((start_str, end_str)) = range.split_once('-') {
-                                        let range_start: u64 = start_str.parse().unwrap_or(0);
-                                        let range_end: u64 = end_str.parse().unwrap_or(0);
+                    // Handle 416 Range Not Satisfiable — not retryable
+                    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                        break 'retry Err(EngineError::network(
+                            NetworkErrorKind::HttpStatus(416),
+                            format!(
+                                "Segment {} range not satisfiable (file may have changed on server)",
+                                segment_idx
+                            ),
+                        ));
+                    }
 
-                                        // Verify the server is sending the range we requested
-                                        if range_start != resume_start || range_end != end {
-                                            state
-                                                .active_connections
-                                                .fetch_sub(1, Ordering::Relaxed);
-                                            return Err(EngineError::network(
-                                                NetworkErrorKind::Other,
-                                                format!(
-                                                    "Segment {} Content-Range mismatch: requested {}-{}, got {}-{}",
-                                                    segment_idx, resume_start, end, range_start, range_end
-                                                ),
-                                            ));
+                    // Handle server errors (5xx) with retry
+                    if status.is_server_error() {
+                        let err = EngineError::network(
+                            NetworkErrorKind::HttpStatus(status.as_u16()),
+                            format!("Segment {} server error: {}", segment_idx, status),
+                        );
+                        attempt += 1;
+                        if retry_policy.should_retry(attempt - 1, &err) {
+                            tracing::warn!(
+                                "Segment {} server error (attempt {}/{}), retrying: {}",
+                                segment_idx, attempt, retry_policy.max_attempts, status
+                            );
+                            let delay = retry_policy.delay_for_attempt(attempt - 1);
+                            tokio::time::sleep(delay).await;
+                            continue 'retry;
+                        }
+                        break 'retry Err(err);
+                    }
+
+                    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                        break 'retry Err(EngineError::network(
+                            NetworkErrorKind::HttpStatus(status.as_u16()),
+                            format!("Segment {} HTTP error: {}", segment_idx, status),
+                        ));
+                    }
+
+                    // Validate Content-Range header matches our request (security check)
+                    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                        if let Some(content_range) = response.headers().get("content-range") {
+                            if let Ok(range_str) = content_range.to_str() {
+                                // Expected format: "bytes START-END/TOTAL" or "bytes START-END/*"
+                                if let Some(range_part) = range_str.strip_prefix("bytes ") {
+                                    if let Some((range, _)) = range_part.split_once('/') {
+                                        if let Some((start_str, end_str)) = range.split_once('-') {
+                                            let range_start: u64 = start_str.parse().unwrap_or(0);
+                                            let range_end: u64 = end_str.parse().unwrap_or(0);
+
+                                            // Verify the server is sending the range we requested
+                                            if range_start != resume_start || range_end != end {
+                                                break 'retry Err(EngineError::network(
+                                                    NetworkErrorKind::Other,
+                                                    format!(
+                                                        "Segment {} Content-Range mismatch: requested {}-{}, got {}-{}",
+                                                        segment_idx, resume_start, end, range_start, range_end
+                                                    ),
+                                                ));
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                // Stream data to file
-                let mut stream = response.bytes_stream();
-                let mut segment_bytes: u64 = already_downloaded;
-                let mut last_speed_update = Instant::now();
-                let mut bytes_for_speed: u64 = 0;
+                    // Stream data to file
+                    let mut stream = response.bytes_stream();
+                    let mut stream_failed = false;
 
-                while let Some(chunk_result) = tokio::select! {
-                    chunk = stream.next() => chunk,
-                    _ = cancel_token.cancelled() => None,
-                } {
-                    // Check pause
-                    if state.paused.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let chunk: Bytes = match chunk_result {
-                        Ok(c) => c,
-                        Err(e) => {
-                            state.active_connections.fetch_sub(1, Ordering::Relaxed);
-                            return Err(EngineError::network(
-                                NetworkErrorKind::Other,
-                                format!("Segment {} stream error: {}", segment_idx, e),
-                            ));
+                    while let Some(chunk_result) = tokio::select! {
+                        chunk = stream.next() => chunk,
+                        _ = cancel_token.cancelled() => None,
+                    } {
+                        // Check pause
+                        if state.paused.load(Ordering::Relaxed) {
+                            break;
                         }
-                    };
 
-                    let chunk_len = chunk.len() as u64;
+                        let chunk: Bytes = match chunk_result {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let err = EngineError::network(
+                                    NetworkErrorKind::Other,
+                                    format!("Segment {} stream error: {}", segment_idx, e),
+                                );
+                                attempt += 1;
+                                if retry_policy.should_retry(attempt - 1, &err) {
+                                    tracing::warn!(
+                                        "Segment {} stream error (attempt {}/{}), retrying from byte {}: {}",
+                                        segment_idx, attempt, retry_policy.max_attempts, segment_bytes, e
+                                    );
+                                    stream_failed = true;
+                                    break;
+                                }
+                                break 'retry Err(err);
+                            }
+                        };
 
-                    // Write to file at correct offset
-                    {
-                        let mut file = file.lock().await;
-                        file.seek(SeekFrom::Start(start + segment_bytes))
-                            .await
-                            .map_err(|e| {
+                        let chunk_len = chunk.len() as u64;
+
+                        // Write to file at correct offset
+                        {
+                            let mut file = file.lock().await;
+                            file.seek(SeekFrom::Start(start + segment_bytes))
+                                .await
+                                .map_err(|e| {
+                                    EngineError::storage(
+                                        StorageErrorKind::Io,
+                                        PathBuf::new(),
+                                        format!("Seek failed: {}", e),
+                                    )
+                                })?;
+                            file.write_all(&chunk).await.map_err(|e| {
                                 EngineError::storage(
                                     StorageErrorKind::Io,
                                     PathBuf::new(),
-                                    format!("Seek failed: {}", e),
+                                    format!("Write failed: {}", e),
                                 )
                             })?;
-                        file.write_all(&chunk).await.map_err(|e| {
-                            EngineError::storage(
-                                StorageErrorKind::Io,
-                                PathBuf::new(),
-                                format!("Write failed: {}", e),
-                            )
-                        })?;
-                    }
-
-                    segment_bytes += chunk_len;
-
-                    // Update segment progress for persistence
-                    {
-                        let mut progress = state.segment_progress.write();
-                        if let Some(p) = progress.get_mut(segment_idx) {
-                            *p = segment_bytes;
                         }
-                    }
 
-                    // Update global counters
-                    state.downloaded.fetch_add(chunk_len, Ordering::Relaxed);
-                    bytes_since_progress.fetch_add(chunk_len, Ordering::Relaxed);
-                    bytes_for_speed += chunk_len;
+                        segment_bytes += chunk_len;
 
-                    // Update speed calculation
-                    let now = Instant::now();
-                    let speed_elapsed = now.duration_since(last_speed_update);
-                    if speed_elapsed >= Duration::from_millis(500) {
-                        let current_speed =
-                            (bytes_for_speed as f64 / speed_elapsed.as_secs_f64()) as u64;
-                        state.speed.store(current_speed, Ordering::Relaxed);
-                        bytes_for_speed = 0;
-                        last_speed_update = now;
-                    }
-
-                    // Emit progress at intervals
-                    // Calculate values and check if we should emit, then release lock before callback
-                    let should_emit = {
-                        let mut last = last_progress.write();
-                        if now.duration_since(*last) >= PROGRESS_INTERVAL {
-                            *last = now;
-                            bytes_since_progress.store(0, Ordering::Relaxed);
-                            true
-                        } else {
-                            false
+                        // Update segment progress for persistence
+                        {
+                            let mut progress = state.segment_progress.write();
+                            if let Some(p) = progress.get_mut(segment_idx) {
+                                *p = segment_bytes;
+                            }
                         }
-                    };
 
-                    if should_emit {
-                        let total_downloaded = state.downloaded.load(Ordering::Relaxed);
-                        let current_speed = state.speed.load(Ordering::Relaxed);
-                        let connections = state.active_connections.load(Ordering::Relaxed) as u32;
+                        // Update global counters
+                        state.downloaded.fetch_add(chunk_len, Ordering::Relaxed);
+                        bytes_since_progress.fetch_add(chunk_len, Ordering::Relaxed);
+                        bytes_for_speed += chunk_len;
 
-                        progress_callback(DownloadProgress {
-                            total_size: Some(total_size),
-                            completed_size: total_downloaded,
-                            download_speed: current_speed,
-                            upload_speed: 0,
-                            connections,
-                            seeders: 0,
-                            peers: 0,
-                            eta_seconds: if current_speed > 0 {
-                                Some((total_size.saturating_sub(total_downloaded)) / current_speed)
+                        // Update speed calculation
+                        let now = Instant::now();
+                        let speed_elapsed = now.duration_since(last_speed_update);
+                        if speed_elapsed >= Duration::from_millis(500) {
+                            let current_speed =
+                                (bytes_for_speed as f64 / speed_elapsed.as_secs_f64()) as u64;
+                            state.speed.store(current_speed, Ordering::Relaxed);
+                            bytes_for_speed = 0;
+                            last_speed_update = now;
+                        }
+
+                        // Emit progress at intervals
+                        let should_emit = {
+                            let mut last = last_progress.write();
+                            if now.duration_since(*last) >= PROGRESS_INTERVAL {
+                                *last = now;
+                                bytes_since_progress.store(0, Ordering::Relaxed);
+                                true
                             } else {
-                                None
-                            },
-                        });
+                                false
+                            }
+                        };
+
+                        if should_emit {
+                            let total_downloaded = state.downloaded.load(Ordering::Relaxed);
+                            let current_speed = state.speed.load(Ordering::Relaxed);
+                            let connections = state.active_connections.load(Ordering::Relaxed) as u32;
+
+                            progress_callback(DownloadProgress {
+                                total_size: Some(total_size),
+                                completed_size: total_downloaded,
+                                download_speed: current_speed,
+                                upload_speed: 0,
+                                connections,
+                                seeders: 0,
+                                peers: 0,
+                                eta_seconds: if current_speed > 0 {
+                                    Some((total_size.saturating_sub(total_downloaded)) / current_speed)
+                                } else {
+                                    None
+                                },
+                            });
+                        }
                     }
-                }
+
+                    if stream_failed {
+                        let delay = retry_policy.delay_for_attempt(attempt - 1);
+                        tokio::time::sleep(delay).await;
+                        continue 'retry;
+                    }
+
+                    // Stream completed successfully (or was paused/cancelled)
+                    break 'retry Ok(());
+                };
 
                 state.active_connections.fetch_sub(1, Ordering::Relaxed);
 
-                // Segment task completed (either fully or paused/cancelled)
-                Result::<()>::Ok(())
+                // Return the result from the retry loop
+                result
             });
 
             handles.push(handle);

@@ -67,7 +67,9 @@ pub struct HttpConfig {
     /// Connection timeout in seconds
     pub connect_timeout: u64,
 
-    /// Read timeout in seconds
+    /// Per-read idle timeout in seconds — if no data is received for this duration,
+    /// the request is cancelled. Resets after each successful read, so large downloads
+    /// are not affected as long as data keeps flowing.
     pub read_timeout: u64,
 
     /// Maximum redirects to follow
