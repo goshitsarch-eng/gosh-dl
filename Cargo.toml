@@ -1,6 +1,6 @@
 [package]
 name = "gosh-dl"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 rust-version = "1.85"
 description = "A fast, embeddable download engine for Rust. HTTP/HTTPS with multi-connection acceleration and full BitTorrent protocol support."
@@ -130,4 +130,8 @@ required-features = ["torrent"]
 
 [[example]]
 name = "progress_display"
+required-features = ["http"]
+
+[[example]]
+name = "test_http_large"
 required-features = ["http"]

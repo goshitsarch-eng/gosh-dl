@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-02-13
+
+### Fixed
+- **Torrent completion event never fires**: added success-path handling after `run_peer_loop()` in both torrent and magnet download paths — downloads reaching 100% now correctly emit `DownloadEvent::Completed`
+- **HTTP pause/resume loses progress without storage**: cached segment data in memory so resume works even without a `database_path` configured
+- **WebSeed connections not counted in peer stats**: `progress()` now includes active WebSeed connections in the connected peers count
+- **"Piece N not found in pending" race condition**: `verify_and_save()` now returns `Ok(false)` for duplicate/late blocks instead of erroring, preventing spurious failures in endgame mode
+- **Slow torrent speeds**: increased `max_pending_requests` from 16 to 64, allowing higher throughput on fast connections
+- **Dead tracker URLs in magnet example**: replaced non-functional tracker URLs in `magnet_smoke.rs` with operational ones
+
 ## [0.2.3] - 2026-02-13
 
 ### Fixed
@@ -171,7 +181,8 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.0...v0.2.1
