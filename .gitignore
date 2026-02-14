@@ -21,3 +21,5 @@ Thumbs.db
 
 # Internal documentation
 DOCUMENTATION_AUDIT.md
+examples/test_http_large.rs
+examples/test_torrent.rs
