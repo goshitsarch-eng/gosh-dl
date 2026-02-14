@@ -528,12 +528,15 @@ impl PieceManager {
         // Get piece data
         let data = {
             let pending = self.pending.read();
-            let piece = pending.get(&index).ok_or_else(|| {
-                EngineError::protocol(
-                    ProtocolErrorKind::PeerProtocol,
-                    format!("Piece {} not found in pending", index),
-                )
-            })?;
+            let piece = match pending.get(&index) {
+                Some(p) => p,
+                None => {
+                    // Piece was removed from pending (e.g., by cancel_stale_pieces).
+                    // Late-arriving blocks are expected; silently discard.
+                    tracing::trace!("Piece {} not in pending, discarding late block", index);
+                    return Ok(false);
+                }
+            };
 
             piece.data().ok_or_else(|| {
                 EngineError::protocol(

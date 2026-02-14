@@ -41,6 +41,9 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 struct ManagedDownload {
     status: DownloadStatus,
     handle: Option<DownloadHandle>,
+    /// Cached HTTP segment state for in-memory pause/resume (no storage needed)
+    #[cfg(feature = "http")]
+    cached_segments: Option<Vec<Segment>>,
 }
 
 /// Handle to control a running download
@@ -308,6 +311,8 @@ impl DownloadEngine {
                 ManagedDownload {
                     status: restored_status,
                     handle: None,
+                    #[cfg(feature = "http")]
+                    cached_segments: None,
                 },
             );
 
@@ -419,6 +424,8 @@ impl DownloadEngine {
                 ManagedDownload {
                     status: status.clone(),
                     handle: None,
+                    #[cfg(feature = "http")]
+                    cached_segments: None,
                 },
             );
         }
@@ -496,6 +503,8 @@ impl DownloadEngine {
                 ManagedDownload {
                     status: status.clone(),
                     handle: None,
+                    #[cfg(feature = "http")]
+                    cached_segments: None,
                 },
             );
         }
@@ -576,6 +585,8 @@ impl DownloadEngine {
                 ManagedDownload {
                     status: status.clone(),
                     handle: None,
+                    #[cfg(feature = "http")]
+                    cached_segments: None,
                 },
             );
         }
@@ -667,6 +678,7 @@ impl DownloadEngine {
             let _ = engine.event_tx.send(DownloadEvent::Started { id });
 
             // Run the peer connection loop
+            let downloader_ref = Arc::clone(&downloader_clone);
             if let Err(e) = downloader_clone.run_peer_loop().await {
                 let error_msg = e.to_string();
                 engine.update_state(
@@ -682,6 +694,26 @@ impl DownloadEngine {
                     error: error_msg,
                     retryable: e.is_retryable(),
                 });
+            } else if downloader_ref.is_complete() {
+                // Torrent completed successfully
+                let should_complete = {
+                    let mut downloads = engine.downloads.write();
+                    if let Some(download) = downloads.get_mut(&id) {
+                        if download.status.state == DownloadState::Paused {
+                            false
+                        } else {
+                            download.status.state = DownloadState::Completed;
+                            download.status.completed_at = Some(Utc::now());
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                if should_complete {
+                    let _ = engine.event_tx.send(DownloadEvent::Completed { id });
+                }
             }
 
             Ok(())
@@ -771,6 +803,7 @@ impl DownloadEngine {
             let _ = engine.event_tx.send(DownloadEvent::Started { id });
 
             // Run the peer connection loop (handles both downloading and metadata fetching for magnets)
+            let downloader_ref = Arc::clone(&downloader_clone);
             if let Err(e) = downloader_clone.run_peer_loop().await {
                 let error_msg = e.to_string();
                 engine.update_state(
@@ -786,6 +819,26 @@ impl DownloadEngine {
                     error: error_msg,
                     retryable: e.is_retryable(),
                 });
+            } else if downloader_ref.is_complete() {
+                // Magnet download completed successfully
+                let should_complete = {
+                    let mut downloads = engine.downloads.write();
+                    if let Some(download) = downloads.get_mut(&id) {
+                        if download.status.state == DownloadState::Paused {
+                            false
+                        } else {
+                            download.status.state = DownloadState::Completed;
+                            download.status.completed_at = Some(Utc::now());
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                if should_complete {
+                    let _ = engine.event_tx.send(DownloadEvent::Completed { id });
+                }
             }
 
             Ok(())
@@ -1123,6 +1176,12 @@ impl DownloadEngine {
             });
             let _ = self.event_tx.send(DownloadEvent::Paused { id });
 
+            // Cache segments in memory for storage-less pause/resume
+            #[cfg(feature = "http")]
+            {
+                download.cached_segments = segments.clone();
+            }
+
             (download.status.clone(), segments)
         };
 
@@ -1202,7 +1261,7 @@ impl DownloadEngine {
                     })?;
 
                     // Load saved segments from storage if available
-                    let saved_segments = if let Some(ref storage) = self.storage {
+                    let mut saved_segments = if let Some(ref storage) = self.storage {
                         match storage.load_segments(id).await {
                             Ok(segments) if !segments.is_empty() => {
                                 tracing::debug!(
@@ -1221,6 +1280,20 @@ impl DownloadEngine {
                     } else {
                         None
                     };
+
+                    // Fall back to in-memory cached segments (for storage-less pause/resume)
+                    if saved_segments.is_none() {
+                        let mut downloads = self.downloads.write();
+                        if let Some(download) = downloads.get_mut(&id) {
+                            saved_segments = download.cached_segments.take();
+                            if saved_segments.is_some() {
+                                tracing::debug!(
+                                    "Using cached segments for download {}",
+                                    id
+                                );
+                            }
+                        }
+                    }
 
                     self.start_download(id, url, options, saved_segments)
                         .await?;

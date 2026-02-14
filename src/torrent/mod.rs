@@ -125,7 +125,7 @@ impl Default for TorrentConfig {
             announce_interval: 0,
             request_timeout: Duration::from_secs(30),
             keepalive_interval: Duration::from_secs(120),
-            max_pending_requests: 16,
+            max_pending_requests: 64,
             dht_bootstrap_nodes: vec![
                 "router.bittorrent.com:6881".to_string(),
                 "router.utorrent.com:6881".to_string(),
@@ -434,6 +434,16 @@ impl TorrentDownloader {
             (0, 0)
         };
 
+        let mut connections = self.stats.peers_connected.load(Ordering::Relaxed) as u32;
+
+        // Include active WebSeed connections in the count
+        #[cfg(feature = "http")]
+        {
+            if let Some(ref ws) = *self.webseed_manager.read() {
+                connections += ws.active_seed_count() as u32;
+            }
+        }
+
         DownloadProgress {
             total_size: if total_size > 0 {
                 Some(total_size)
@@ -443,7 +453,7 @@ impl TorrentDownloader {
             completed_size,
             download_speed: self.stats.download_speed.load(Ordering::Relaxed),
             upload_speed: self.stats.upload_speed.load(Ordering::Relaxed),
-            connections: self.stats.peers_connected.load(Ordering::Relaxed) as u32,
+            connections,
             seeders: self.stats.seeders.load(Ordering::Relaxed) as u32,
             peers: self.stats.leechers.load(Ordering::Relaxed) as u32,
             eta_seconds: self.calculate_eta(),
