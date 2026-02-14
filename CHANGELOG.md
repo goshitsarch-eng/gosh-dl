@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-02-14
+
+### Fixed
+- **CI failures across all jobs**: removed phantom `test_http_large` example entry from Cargo.toml that referenced a file not committed to the repository
+- **Clippy `too_many_arguments` lint**: added `#[allow]` on `SegmentedDownload::start()` which grew to 8 parameters after the retry policy addition
+- **Code formatting**: ran `cargo fmt` on files modified in v0.2.4 (`engine.rs`, `segment.rs`, `webseed.rs`)
+
 ## [0.2.4] - 2026-02-13
 
 ### Fixed
@@ -181,7 +188,8 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.1...v0.2.2
