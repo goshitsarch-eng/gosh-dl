@@ -730,7 +730,11 @@ impl DownloadEngine {
                         let status = engine.downloads.read().get(&id).map(|d| d.status.clone());
                         if let Some(status) = status {
                             if let Err(e) = storage.save_download(&status).await {
-                                tracing::debug!("Failed to persist completed state for {}: {}", id, e);
+                                tracing::debug!(
+                                    "Failed to persist completed state for {}: {}",
+                                    id,
+                                    e
+                                );
                             }
                         }
                     }
@@ -883,7 +887,11 @@ impl DownloadEngine {
                         let status = engine.downloads.read().get(&id).map(|d| d.status.clone());
                         if let Some(status) = status {
                             if let Err(e) = storage.save_download(&status).await {
-                                tracing::debug!("Failed to persist completed state for {}: {}", id, e);
+                                tracing::debug!(
+                                    "Failed to persist completed state for {}: {}",
+                                    id,
+                                    e
+                                );
                             }
                         }
                     }
@@ -1122,7 +1130,11 @@ impl DownloadEngine {
                             let status = engine.downloads.read().get(&id).map(|d| d.status.clone());
                             if let Some(status) = status {
                                 if let Err(e) = storage.save_download(&status).await {
-                                    tracing::debug!("Failed to persist completed state for {}: {}", id, e);
+                                    tracing::debug!(
+                                        "Failed to persist completed state for {}: {}",
+                                        id,
+                                        e
+                                    );
                                 }
                             }
                         }
