@@ -1,6 +1,6 @@
 [package]
 name = "gosh-dl"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 rust-version = "1.85"
 description = "A fast, embeddable download engine for Rust. HTTP/HTTPS with multi-connection acceleration and full BitTorrent protocol support."
