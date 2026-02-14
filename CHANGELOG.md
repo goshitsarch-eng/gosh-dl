@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-02-14
+
+### Fixed
+- **Completed downloads lost on restart**: `persist_active_downloads()` only saved downloads where `is_active()` returned true (Downloading/Seeding/Connecting), so completed state was never written to the database — added event-driven persistence that saves state immediately when a download completes
+- **Completed downloads invisible after reload**: `load_persisted_downloads()` had an explicit `continue` that skipped any download with `Completed` state, making completed downloads vanish from the UI on restart — removed the skip so completed downloads load as inert entries
+- **Error state not persisted**: downloads that failed were also never persisted (same `is_active()` filter), so error state and messages were lost on restart — added persistence at all five error transition sites
+
 ## [0.2.5] - 2026-02-14
 
 ### Fixed

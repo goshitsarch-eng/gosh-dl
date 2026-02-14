@@ -286,11 +286,6 @@ impl DownloadEngine {
         let persisted = storage.load_all().await?;
 
         for status in persisted {
-            // Skip completed downloads - they don't need resumption
-            if matches!(status.state, DownloadState::Completed) {
-                continue;
-            }
-
             // For active/downloading states, mark as paused (crashed mid-download)
             let restored_state = match &status.state {
                 DownloadState::Downloading | DownloadState::Connecting => DownloadState::Paused,
@@ -665,6 +660,15 @@ impl DownloadEngine {
                         retryable: e.is_retryable(),
                     },
                 )?;
+                // Persist error state to storage
+                if let Some(ref storage) = engine.storage {
+                    let status = engine.downloads.read().get(&id).map(|d| d.status.clone());
+                    if let Some(status) = status {
+                        if let Err(e) = storage.save_download(&status).await {
+                            tracing::debug!("Failed to persist error state for {}: {}", id, e);
+                        }
+                    }
+                }
                 let _ = engine.event_tx.send(DownloadEvent::Failed {
                     id,
                     error: error_msg,
@@ -689,6 +693,15 @@ impl DownloadEngine {
                         retryable: e.is_retryable(),
                     },
                 )?;
+                // Persist error state to storage
+                if let Some(ref storage) = engine.storage {
+                    let status = engine.downloads.read().get(&id).map(|d| d.status.clone());
+                    if let Some(status) = status {
+                        if let Err(e) = storage.save_download(&status).await {
+                            tracing::debug!("Failed to persist error state for {}: {}", id, e);
+                        }
+                    }
+                }
                 let _ = engine.event_tx.send(DownloadEvent::Failed {
                     id,
                     error: error_msg,
@@ -712,6 +725,16 @@ impl DownloadEngine {
                 };
 
                 if should_complete {
+                    // Persist completed state to storage
+                    if let Some(ref storage) = engine.storage {
+                        let status = engine.downloads.read().get(&id).map(|d| d.status.clone());
+                        if let Some(status) = status {
+                            if let Err(e) = storage.save_download(&status).await {
+                                tracing::debug!("Failed to persist completed state for {}: {}", id, e);
+                            }
+                        }
+                    }
+
                     let _ = engine.event_tx.send(DownloadEvent::Completed { id });
                 }
             }
@@ -790,6 +813,15 @@ impl DownloadEngine {
                         retryable: e.is_retryable(),
                     },
                 )?;
+                // Persist error state to storage
+                if let Some(ref storage) = engine.storage {
+                    let status = engine.downloads.read().get(&id).map(|d| d.status.clone());
+                    if let Some(status) = status {
+                        if let Err(e) = storage.save_download(&status).await {
+                            tracing::debug!("Failed to persist error state for {}: {}", id, e);
+                        }
+                    }
+                }
                 let _ = engine.event_tx.send(DownloadEvent::Failed {
                     id,
                     error: error_msg,
@@ -814,6 +846,15 @@ impl DownloadEngine {
                         retryable: e.is_retryable(),
                     },
                 )?;
+                // Persist error state to storage
+                if let Some(ref storage) = engine.storage {
+                    let status = engine.downloads.read().get(&id).map(|d| d.status.clone());
+                    if let Some(status) = status {
+                        if let Err(e) = storage.save_download(&status).await {
+                            tracing::debug!("Failed to persist error state for {}: {}", id, e);
+                        }
+                    }
+                }
                 let _ = engine.event_tx.send(DownloadEvent::Failed {
                     id,
                     error: error_msg,
@@ -837,6 +878,16 @@ impl DownloadEngine {
                 };
 
                 if should_complete {
+                    // Persist completed state to storage
+                    if let Some(ref storage) = engine.storage {
+                        let status = engine.downloads.read().get(&id).map(|d| d.status.clone());
+                        if let Some(status) = status {
+                            if let Err(e) = storage.save_download(&status).await {
+                                tracing::debug!("Failed to persist completed state for {}: {}", id, e);
+                            }
+                        }
+                    }
+
                     let _ = engine.event_tx.send(DownloadEvent::Completed { id });
                 }
             }
@@ -1066,6 +1117,16 @@ impl DownloadEngine {
                     };
 
                     if should_complete {
+                        // Persist completed state to storage
+                        if let Some(ref storage) = engine.storage {
+                            let status = engine.downloads.read().get(&id).map(|d| d.status.clone());
+                            if let Some(status) = status {
+                                if let Err(e) = storage.save_download(&status).await {
+                                    tracing::debug!("Failed to persist completed state for {}: {}", id, e);
+                                }
+                            }
+                        }
+
                         // Clean up saved segments from storage
                         if let Some(ref storage) = engine.storage {
                             if let Err(e) = storage.delete_segments(id).await {
@@ -1093,6 +1154,16 @@ impl DownloadEngine {
                             retryable,
                         },
                     )?;
+
+                    // Persist error state to storage
+                    if let Some(ref storage) = engine.storage {
+                        let status = engine.downloads.read().get(&id).map(|d| d.status.clone());
+                        if let Some(status) = status {
+                            if let Err(e) = storage.save_download(&status).await {
+                                tracing::debug!("Failed to persist error state for {}: {}", id, e);
+                            }
+                        }
+                    }
 
                     let _ = engine.event_tx.send(DownloadEvent::Failed {
                         id,
