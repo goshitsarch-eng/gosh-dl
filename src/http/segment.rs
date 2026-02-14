@@ -4,10 +4,10 @@
 //! HTTP/HTTPS transfers. It splits files into segments and downloads
 //! them in parallel using multiple connections.
 
+use super::connection::RetryPolicy;
 use crate::error::{EngineError, NetworkErrorKind, Result, StorageErrorKind};
 use crate::storage::Segment;
 use crate::types::DownloadProgress;
-use super::connection::RetryPolicy;
 
 use bytes::Bytes;
 use futures::stream::StreamExt;
@@ -181,6 +181,7 @@ impl SegmentedDownload {
     }
 
     /// Start the segmented download
+    #[allow(clippy::too_many_arguments)]
     pub async fn start<F>(
         &self,
         client: &Client,
@@ -304,7 +305,10 @@ impl SegmentedDownload {
                             if retry_policy.should_retry(attempt - 1, &err) {
                                 tracing::warn!(
                                     "Segment {} request failed (attempt {}/{}), retrying: {}",
-                                    segment_idx, attempt, retry_policy.max_attempts, e
+                                    segment_idx,
+                                    attempt,
+                                    retry_policy.max_attempts,
+                                    e
                                 );
                                 let delay = retry_policy.delay_for_attempt(attempt - 1);
                                 tokio::time::sleep(delay).await;
@@ -337,7 +341,10 @@ impl SegmentedDownload {
                         if retry_policy.should_retry(attempt - 1, &err) {
                             tracing::warn!(
                                 "Segment {} server error (attempt {}/{}), retrying: {}",
-                                segment_idx, attempt, retry_policy.max_attempts, status
+                                segment_idx,
+                                attempt,
+                                retry_policy.max_attempts,
+                                status
                             );
                             let delay = retry_policy.delay_for_attempt(attempt - 1);
                             tokio::time::sleep(delay).await;
@@ -478,7 +485,8 @@ impl SegmentedDownload {
                         if should_emit {
                             let total_downloaded = state.downloaded.load(Ordering::Relaxed);
                             let current_speed = state.speed.load(Ordering::Relaxed);
-                            let connections = state.active_connections.load(Ordering::Relaxed) as u32;
+                            let connections =
+                                state.active_connections.load(Ordering::Relaxed) as u32;
 
                             progress_callback(DownloadProgress {
                                 total_size: Some(total_size),
@@ -489,7 +497,10 @@ impl SegmentedDownload {
                                 seeders: 0,
                                 peers: 0,
                                 eta_seconds: if current_speed > 0 {
-                                    Some((total_size.saturating_sub(total_downloaded)) / current_speed)
+                                    Some(
+                                        (total_size.saturating_sub(total_downloaded))
+                                            / current_speed,
+                                    )
                                 } else {
                                     None
                                 },

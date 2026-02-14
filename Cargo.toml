@@ -132,6 +132,3 @@ required-features = ["torrent"]
 name = "progress_display"
 required-features = ["http"]
 
-[[example]]
-name = "test_http_large"
-required-features = ["http"]

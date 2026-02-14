@@ -1287,10 +1287,7 @@ impl DownloadEngine {
                         if let Some(download) = downloads.get_mut(&id) {
                             saved_segments = download.cached_segments.take();
                             if saved_segments.is_some() {
-                                tracing::debug!(
-                                    "Using cached segments for download {}",
-                                    id
-                                );
+                                tracing::debug!("Using cached segments for download {}", id);
                             }
                         }
                     }

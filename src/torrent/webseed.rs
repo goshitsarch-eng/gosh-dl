@@ -421,11 +421,14 @@ impl WebSeedManager {
                 seed.record_success(bytes);
                 self.downloaded_bytes.fetch_add(bytes, Ordering::Relaxed);
 
-                let _ = self.event_tx.send(WebSeedEvent::PieceComplete {
-                    piece_index,
-                    data,
-                    source_url: seed.url.clone(),
-                }).await;
+                let _ = self
+                    .event_tx
+                    .send(WebSeedEvent::PieceComplete {
+                        piece_index,
+                        data,
+                        source_url: seed.url.clone(),
+                    })
+                    .await;
             }
             Err(e) => {
                 let retryable = e.is_retryable();
@@ -435,12 +438,15 @@ impl WebSeedManager {
                     self.config.initial_backoff,
                     self.config.max_backoff,
                 );
-                let _ = self.event_tx.send(WebSeedEvent::PieceFailed {
-                    piece_index,
-                    source_url: seed.url.clone(),
-                    error: e.to_string(),
-                    retryable,
-                }).await;
+                let _ = self
+                    .event_tx
+                    .send(WebSeedEvent::PieceFailed {
+                        piece_index,
+                        source_url: seed.url.clone(),
+                        error: e.to_string(),
+                        retryable,
+                    })
+                    .await;
             }
         }
 
