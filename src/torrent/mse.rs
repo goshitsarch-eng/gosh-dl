@@ -11,7 +11,7 @@ use std::io;
 use std::time::Duration;
 
 use num_bigint::BigUint;
-use rand::Rng;
+use rand::RngExt;
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -379,7 +379,7 @@ pub async fn mse_handshake_outgoing(
     // Step 1: Send Ya + random padding
     let padding_len = rand::rng().random_range(config.min_padding..=config.max_padding);
     let mut padding = vec![0u8; padding_len];
-    rand::Rng::fill(&mut rand::rng(), &mut padding[..]);
+    rand::RngExt::fill(&mut rand::rng(), &mut padding[..]);
 
     let mut send_buf = Vec::with_capacity(96 + padding_len);
     send_buf.extend_from_slice(key_pair.public_bytes());
@@ -466,7 +466,7 @@ pub async fn mse_handshake_outgoing(
     // VC (8) + crypto_provide (4) + len(PadC) (2) + PadC + len(IA) (2) + IA
     let padc_len: u16 = rand::rng().random_range(0..512);
     let mut padc = vec![0u8; padc_len as usize];
-    rand::Rng::fill(&mut rand::rng(), &mut padc[..]);
+    rand::RngExt::fill(&mut rand::rng(), &mut padc[..]);
 
     // IA = Initial payload (we send nothing initially)
     let ia_len: u16 = 0;

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-03-06
+
+### Changed
+- Updated `rand` from 0.9 to 0.10 — avoids duplicate dependencies in downstream projects
+  - Migrated from `Rng` trait to `RngExt` trait (renamed in 0.10)
+- Tightened `mainline` version from `"6"` to `"6.1.0"` to prevent resolving unexpectedly old versions
+
 ## [0.2.7] - 2026-02-14
 
 ### Fixed
@@ -200,7 +207,10 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.7...v0.2.8
+[0.2.7]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.6...v0.2.7
+[0.2.6]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.2...v0.2.3
