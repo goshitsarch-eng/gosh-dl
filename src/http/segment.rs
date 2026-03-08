@@ -5,6 +5,7 @@
 //! them in parallel using multiple connections.
 
 use super::connection::RetryPolicy;
+use super::resume::validate_ranged_response;
 use crate::error::{EngineError, NetworkErrorKind, Result, StorageErrorKind};
 use crate::storage::Segment;
 use crate::types::DownloadProgress;
@@ -33,6 +34,26 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Persistence interval for segment state
 const PERSISTENCE_INTERVAL: Duration = Duration::from_secs(5);
+
+fn log_progress_invariant(context: &str, progress: &DownloadProgress) {
+    if let Some(total_size) = progress.total_size {
+        if progress.completed_size > total_size {
+            debug_assert!(
+                progress.completed_size <= total_size,
+                "{} progress exceeded total size: {} > {}",
+                context,
+                progress.completed_size,
+                total_size
+            );
+            tracing::warn!(
+                "{} progress exceeded total size: {} > {}",
+                context,
+                progress.completed_size,
+                total_size
+            );
+        }
+    }
+}
 
 /// Shared state for a segmented download
 struct SharedState {
@@ -360,32 +381,16 @@ impl SegmentedDownload {
                         ));
                     }
 
-                    // Validate Content-Range header matches our request (security check)
-                    if status == reqwest::StatusCode::PARTIAL_CONTENT {
-                        if let Some(content_range) = response.headers().get("content-range") {
-                            if let Ok(range_str) = content_range.to_str() {
-                                // Expected format: "bytes START-END/TOTAL" or "bytes START-END/*"
-                                if let Some(range_part) = range_str.strip_prefix("bytes ") {
-                                    if let Some((range, _)) = range_part.split_once('/') {
-                                        if let Some((start_str, end_str)) = range.split_once('-') {
-                                            let range_start: u64 = start_str.parse().unwrap_or(0);
-                                            let range_end: u64 = end_str.parse().unwrap_or(0);
-
-                                            // Verify the server is sending the range we requested
-                                            if range_start != resume_start || range_end != end {
-                                                break 'retry Err(EngineError::network(
-                                                    NetworkErrorKind::Other,
-                                                    format!(
-                                                        "Segment {} Content-Range mismatch: requested {}-{}, got {}-{}",
-                                                        segment_idx, resume_start, end, range_start, range_end
-                                                    ),
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    if let Err(e) = validate_ranged_response(
+                        resume_start,
+                        Some(end),
+                        status,
+                        response
+                            .headers()
+                            .get("content-range")
+                            .and_then(|v| v.to_str().ok()),
+                    ) {
+                        break 'retry Err(e);
                     }
 
                     // Stream data to file
@@ -488,7 +493,7 @@ impl SegmentedDownload {
                             let connections =
                                 state.active_connections.load(Ordering::Relaxed) as u32;
 
-                            progress_callback(DownloadProgress {
+                            let progress = DownloadProgress {
                                 total_size: Some(total_size),
                                 completed_size: total_downloaded,
                                 download_speed: current_speed,
@@ -504,7 +509,9 @@ impl SegmentedDownload {
                                 } else {
                                     None
                                 },
-                            });
+                            };
+                            log_progress_invariant("segmented http download", &progress);
+                            progress_callback(progress);
                         }
                     }
 
@@ -580,7 +587,7 @@ impl SegmentedDownload {
 
         // Final progress update
         let total_downloaded = self.state.downloaded.load(Ordering::Relaxed);
-        progress_callback(DownloadProgress {
+        let progress = DownloadProgress {
             total_size: Some(self.total_size),
             completed_size: total_downloaded,
             download_speed: 0,
@@ -589,7 +596,9 @@ impl SegmentedDownload {
             seeders: 0,
             peers: 0,
             eta_seconds: None,
-        });
+        };
+        log_progress_invariant("segmented http download", &progress);
+        progress_callback(progress);
 
         // Check if complete
         if total_downloaded >= self.total_size {
@@ -714,7 +723,7 @@ impl SegmentedDownload {
 
     /// Get current progress
     pub fn progress(&self) -> DownloadProgress {
-        DownloadProgress {
+        let progress = DownloadProgress {
             total_size: Some(self.total_size),
             completed_size: self.state.downloaded.load(Ordering::Relaxed),
             download_speed: self.state.speed.load(Ordering::Relaxed),
@@ -733,7 +742,9 @@ impl SegmentedDownload {
                     None
                 }
             },
-        }
+        };
+        log_progress_invariant("segmented http download", &progress);
+        progress
     }
 }
 

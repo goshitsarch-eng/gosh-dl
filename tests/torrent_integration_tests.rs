@@ -779,6 +779,10 @@ async fn test_torrent_progress_tracking() {
         Some((piece_length * num_pieces) as u64),
         "Total size should be set"
     );
+    assert!(
+        progress.completed_size <= progress.total_size.unwrap(),
+        "Torrent progress must not exceed total size"
+    );
 
     // Run download
     let dl = Arc::clone(&downloader);
@@ -795,6 +799,17 @@ async fn test_torrent_progress_tracking() {
     }
 
     assert!(downloader.is_complete(), "Download should complete");
+
+    let final_progress = downloader.progress();
+    assert_eq!(
+        final_progress.completed_size,
+        final_progress.total_size.unwrap(),
+        "Completed torrent progress should equal total size"
+    );
+    assert!(
+        final_progress.percentage() <= 100.0 + f64::EPSILON,
+        "Torrent percentage must not exceed 100%"
+    );
 
     downloader.pause();
     handle.abort();

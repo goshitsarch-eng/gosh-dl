@@ -37,6 +37,26 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
+fn log_progress_invariant(context: &str, progress: &DownloadProgress) {
+    if let Some(total_size) = progress.total_size {
+        if progress.completed_size > total_size {
+            debug_assert!(
+                progress.completed_size <= total_size,
+                "{} progress exceeded total size: {} > {}",
+                context,
+                progress.completed_size,
+                total_size
+            );
+            tracing::warn!(
+                "{} progress exceeded total size: {} > {}",
+                context,
+                progress.completed_size,
+                total_size
+            );
+        }
+    }
+}
+
 /// HTTP Downloader
 pub struct HttpDownloader {
     pool: Arc<ConnectionPool>,
@@ -259,6 +279,18 @@ impl HttpDownloader {
             ));
         }
 
+        if existing_size > 0 {
+            resume::validate_ranged_response(
+                existing_size,
+                None,
+                status,
+                response
+                    .headers()
+                    .get("content-range")
+                    .and_then(|v| v.to_str().ok()),
+            )?;
+        }
+
         // Get actual content length from response if not from HEAD
         let total_size = content_length.or_else(|| {
             response
@@ -307,7 +339,7 @@ impl HttpDownloader {
                 total_size,
                 cancel_token.clone(),
                 move |completed, speed| {
-                    progress_callback(DownloadProgress {
+                    let progress = DownloadProgress {
                         total_size,
                         completed_size: completed,
                         download_speed: speed,
@@ -322,7 +354,9 @@ impl HttpDownloader {
                                 None
                             }
                         }),
-                    });
+                    };
+                    log_progress_invariant("http download", &progress);
+                    progress_callback(progress);
                 },
             )
             .await;

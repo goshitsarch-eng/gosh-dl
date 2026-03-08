@@ -68,6 +68,26 @@ use crate::error::Result;
 use crate::types::{DownloadEvent, DownloadId, DownloadProgress};
 use pex::parse_extension_handshake;
 
+fn log_progress_invariant(context: &str, progress: &DownloadProgress) {
+    if let Some(total_size) = progress.total_size {
+        if progress.completed_size > total_size {
+            debug_assert!(
+                progress.completed_size <= total_size,
+                "{} progress exceeded total size: {} > {}",
+                context,
+                progress.completed_size,
+                total_size
+            );
+            tracing::warn!(
+                "{} progress exceeded total size: {} > {}",
+                context,
+                progress.completed_size,
+                total_size
+            );
+        }
+    }
+}
+
 /// Configuration for torrent downloads
 #[derive(Debug, Clone)]
 pub struct TorrentConfig {
@@ -444,7 +464,7 @@ impl TorrentDownloader {
             }
         }
 
-        DownloadProgress {
+        let progress = DownloadProgress {
             total_size: if total_size > 0 {
                 Some(total_size)
             } else {
@@ -457,7 +477,9 @@ impl TorrentDownloader {
             seeders: self.stats.seeders.load(Ordering::Relaxed) as u32,
             peers: self.stats.leechers.load(Ordering::Relaxed) as u32,
             eta_seconds: self.calculate_eta(),
-        }
+        };
+        log_progress_invariant("torrent download", &progress);
+        progress
     }
 
     fn aggregate_transfer_rates(&self) -> (u64, u64) {

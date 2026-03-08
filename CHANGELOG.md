@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-03-08
+
+### Fixed
+- **HTTP progress exceeding 100%**: resumed and segmented downloads now reject `200 OK` responses to `Range` requests and require valid `206 Partial Content` + `Content-Range`, preventing duplicate byte accounting when servers falsely advertise range support
+- **Segment retry policy not honoring retryable HTTP statuses**: `408`, `429`, and `5xx` responses are now marked retryable so segmented downloads actually retry transient server failures before surfacing an error
+- **Progress invariant coverage**: added regression tests for lying range support, segmented retry/resume edge cases, and torrent progress bounds so `completed_size` no longer silently drifts past `total_size`
+
 ## [0.2.8] - 2026-03-06
 
 ### Changed
@@ -207,7 +214,8 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.8...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.9...HEAD
+[0.2.9]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.5...v0.2.6

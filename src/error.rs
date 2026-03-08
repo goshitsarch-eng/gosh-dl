@@ -192,6 +192,9 @@ impl EngineError {
             NetworkErrorKind::Timeout
                 | NetworkErrorKind::ConnectionReset
                 | NetworkErrorKind::Unreachable
+                | NetworkErrorKind::HttpStatus(408)
+                | NetworkErrorKind::HttpStatus(429)
+                | NetworkErrorKind::HttpStatus(500..=599)
         );
         Self::Network {
             kind,

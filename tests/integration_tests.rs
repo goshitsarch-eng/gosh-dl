@@ -5,7 +5,9 @@
 //! real download scenarios including concurrent downloads, pause/resume,
 //! and error recovery.
 
-use gosh_dl::{DownloadEngine, DownloadEvent, DownloadOptions, DownloadState, EngineConfig};
+use gosh_dl::{
+    DownloadEngine, DownloadEvent, DownloadOptions, DownloadProgress, DownloadState, EngineConfig,
+};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
@@ -47,6 +49,28 @@ where
     })
     .await;
     result.unwrap_or(None)
+}
+
+fn assert_progress_invariant(progress: &DownloadProgress) {
+    if let Some(total_size) = progress.total_size {
+        assert!(
+            progress.completed_size <= total_size,
+            "completed size {} exceeded total size {}",
+            progress.completed_size,
+            total_size
+        );
+        assert!(
+            progress.percentage() <= 100.0 + f64::EPSILON,
+            "progress percentage exceeded 100: {}",
+            progress.percentage()
+        );
+    }
+}
+
+fn assert_all_progress_invariants(progress_events: &[DownloadProgress]) {
+    for progress in progress_events {
+        assert_progress_invariant(progress);
+    }
 }
 
 // =============================================================================
@@ -626,6 +650,475 @@ async fn test_pause_download() {
     engine.shutdown().await.ok();
 }
 
+#[tokio::test]
+async fn test_segmented_download_rejects_ignored_range_requests() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let content: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+
+    Mock::given(method("HEAD"))
+        .and(path("/lying-range.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    for range in ["bytes=0-2047", "bytes=2048-4095"] {
+        Mock::given(method("GET"))
+            .and(path("/lying-range.bin"))
+            .and(header("Range", range))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", content.len().to_string())
+                    .set_body_bytes(content.clone()),
+            )
+            .mount(&mock_server)
+            .await;
+    }
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        max_connections_per_download: 2,
+        min_segment_size: 1024,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/lying-range.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let mut progress_events = Vec::new();
+    let mut terminal_event = None;
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < Duration::from_secs(10) {
+        match timeout(Duration::from_millis(100), events.recv()).await {
+            Ok(Ok(event)) => {
+                if let DownloadEvent::Progress { id: eid, progress } = &event {
+                    if *eid == id {
+                        progress_events.push(progress.clone());
+                    }
+                }
+                if matches!(
+                    event,
+                    DownloadEvent::Completed { id: eid } | DownloadEvent::Failed { id: eid, .. }
+                    if eid == id
+                ) {
+                    terminal_event = Some(event);
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    assert!(
+        matches!(terminal_event, Some(DownloadEvent::Failed { .. })),
+        "Segmented download should fail when a ranged request gets 200 OK"
+    );
+    assert_all_progress_invariants(&progress_events);
+
+    let status = engine.status(id).expect("Should have status");
+    match &status.state {
+        DownloadState::Error { message, .. } => {
+            assert!(
+                message.contains("Range request"),
+                "Expected a ranged-response error, got: {}",
+                message
+            );
+        }
+        state => panic!("Expected Error state, got {:?}", state),
+    }
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_segmented_download_succeeds_with_valid_partial_content() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let content: Vec<u8> = (0..4096).map(|i| (i % 253) as u8).collect();
+    let first_half = content[..2048].to_vec();
+    let second_half = content[2048..].to_vec();
+
+    Mock::given(method("HEAD"))
+        .and(path("/segmented-ok.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/segmented-ok.bin"))
+        .and(header("Range", "bytes=0-2047"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Length", first_half.len().to_string())
+                .insert_header("Content-Range", "bytes 0-2047/4096")
+                .set_body_bytes(first_half),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/segmented-ok.bin"))
+        .and(header("Range", "bytes=2048-4095"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Length", second_half.len().to_string())
+                .insert_header("Content-Range", "bytes 2048-4095/4096")
+                .set_body_bytes(second_half),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        max_connections_per_download: 2,
+        min_segment_size: 1024,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/segmented-ok.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let mut progress_events = Vec::new();
+    let mut completed = false;
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < Duration::from_secs(10) {
+        match timeout(Duration::from_millis(100), events.recv()).await {
+            Ok(Ok(event)) => {
+                if let DownloadEvent::Progress { id: eid, progress } = &event {
+                    if *eid == id {
+                        progress_events.push(progress.clone());
+                    }
+                }
+                if matches!(event, DownloadEvent::Completed { id: eid } if eid == id) {
+                    completed = true;
+                    break;
+                }
+                if matches!(event, DownloadEvent::Failed { id: eid, .. } if eid == id) {
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    assert!(
+        completed,
+        "Segmented download should complete with valid 206 responses"
+    );
+    assert_all_progress_invariants(&progress_events);
+
+    let downloaded_file = temp_dir.path().join("segmented-ok.bin");
+    let downloaded = tokio::fs::read(&downloaded_file)
+        .await
+        .expect("Failed to read downloaded file");
+    assert_eq!(
+        downloaded, content,
+        "Segmented download should preserve content"
+    );
+
+    let status = engine.status(id).expect("Should have status");
+    assert_eq!(status.state, DownloadState::Completed);
+    assert_progress_invariant(&status.progress);
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_segmented_retry_rejects_ignored_range_response() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let content: Vec<u8> = (0..4096).map(|i| (i % 239) as u8).collect();
+    let second_half = content[2048..].to_vec();
+
+    Mock::given(method("HEAD"))
+        .and(path("/retry-range.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/retry-range.bin"))
+        .and(header("Range", "bytes=0-2047"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/retry-range.bin"))
+        .and(header("Range", "bytes=0-2047"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/retry-range.bin"))
+        .and(header("Range", "bytes=2048-4095"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Length", second_half.len().to_string())
+                .insert_header("Content-Range", "bytes 2048-4095/4096")
+                .set_body_bytes(second_half),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        max_connections_per_download: 2,
+        min_segment_size: 1024,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/retry-range.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let mut progress_events = Vec::new();
+    let mut terminal_event = None;
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < Duration::from_secs(15) {
+        match timeout(Duration::from_millis(100), events.recv()).await {
+            Ok(Ok(event)) => {
+                if let DownloadEvent::Progress { id: eid, progress } = &event {
+                    if *eid == id {
+                        progress_events.push(progress.clone());
+                    }
+                }
+                if matches!(
+                    event,
+                    DownloadEvent::Completed { id: eid } | DownloadEvent::Failed { id: eid, .. }
+                    if eid == id
+                ) {
+                    terminal_event = Some(event);
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    assert!(
+        matches!(terminal_event, Some(DownloadEvent::Failed { .. })),
+        "Retrying a segment with an ignored Range response should fail"
+    );
+    assert_all_progress_invariants(&progress_events);
+
+    let status = engine.status(id).expect("Should have status");
+    match &status.state {
+        DownloadState::Error { message, .. } => {
+            assert!(
+                message.contains("Range request"),
+                "Expected a ranged-response error, got: {}",
+                message
+            );
+        }
+        state => panic!("Expected Error state, got {:?}", state),
+    }
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_resume_rejects_ignored_range_response() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let content: Vec<u8> = (0..4096).map(|i| (i % 241) as u8).collect();
+    let existing_size = 1024u64;
+    let part_path = temp_dir.path().join("resume-ignore.bin.part");
+    tokio::fs::write(&part_path, &content[..existing_size as usize])
+        .await
+        .expect("Failed to seed partial file");
+
+    Mock::given(method("HEAD"))
+        .and(path("/resume-ignore.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/resume-ignore.bin"))
+        .and(header("Range", "bytes=1024-"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        max_connections_per_download: 1,
+        min_segment_size: 1024 * 1024,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/resume-ignore.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let mut progress_events = Vec::new();
+    let mut terminal_event = None;
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < Duration::from_secs(10) {
+        match timeout(Duration::from_millis(100), events.recv()).await {
+            Ok(Ok(event)) => {
+                if let DownloadEvent::Progress { id: eid, progress } = &event {
+                    if *eid == id {
+                        progress_events.push(progress.clone());
+                    }
+                }
+                if matches!(
+                    event,
+                    DownloadEvent::Completed { id: eid } | DownloadEvent::Failed { id: eid, .. }
+                    if eid == id
+                ) {
+                    terminal_event = Some(event);
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    assert!(
+        matches!(terminal_event, Some(DownloadEvent::Failed { .. })),
+        "Resumed download should fail when the server ignores Range"
+    );
+    assert_all_progress_invariants(&progress_events);
+
+    let status = engine.status(id).expect("Should have status");
+    match &status.state {
+        DownloadState::Error { message, .. } => {
+            assert!(
+                message.contains("Range request"),
+                "Expected a ranged-response error, got: {}",
+                message
+            );
+        }
+        state => panic!("Expected Error state, got {:?}", state),
+    }
+
+    let metadata = tokio::fs::metadata(&part_path)
+        .await
+        .expect("Partial file should remain intact");
+    assert_eq!(
+        metadata.len(),
+        existing_size,
+        "Resume failure should not append duplicate bytes to the partial file"
+    );
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_non_range_download_still_completes() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let content = b"No range support still works".to_vec();
+
+    Mock::given(method("HEAD"))
+        .and(path("/no-range.bin"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", content.len().to_string()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/no-range.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/no-range.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let completed = wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Completed { id: eid } if *eid == id),
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert!(
+        completed.is_some(),
+        "Single-connection downloads without range support should still complete"
+    );
+
+    let status = engine.status(id).expect("Should have status");
+    assert_eq!(status.state, DownloadState::Completed);
+    assert_progress_invariant(&status.progress);
+
+    engine.shutdown().await.ok();
+}
+
 // =============================================================================
 // Error Handling Tests
 // =============================================================================
@@ -1061,6 +1554,7 @@ async fn test_progress_updates() {
         !progress_events.is_empty(),
         "Should receive progress updates"
     );
+    assert_all_progress_invariants(&progress_events);
 
     // Verify final progress shows correct total
     if let Some(last_progress) = progress_events.last() {
@@ -1069,6 +1563,7 @@ async fn test_progress_updates() {
             Some(test_content.len() as u64),
             "Total size should be correct"
         );
+        assert_progress_invariant(last_progress);
     }
 
     engine.shutdown().await.ok();

@@ -4,7 +4,7 @@
 //! that a partially downloaded file can be safely resumed.
 
 use crate::error::{EngineError, ProtocolErrorKind, Result};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use std::path::Path;
 use tokio::fs;
 
@@ -143,6 +143,54 @@ pub async fn verify_range_support(client: &Client, url: &str, user_agent: &str) 
     Ok(response.status() == reqwest::StatusCode::PARTIAL_CONTENT)
 }
 
+/// Validate that a response to a ranged request honors the requested byte span.
+pub fn validate_ranged_response(
+    expected_start: u64,
+    expected_end: Option<u64>,
+    status: StatusCode,
+    content_range: Option<&str>,
+) -> Result<()> {
+    if status != StatusCode::PARTIAL_CONTENT {
+        return Err(EngineError::protocol(
+            ProtocolErrorKind::RangeNotSupported,
+            format!(
+                "Server ignored Range request starting at byte {} and returned {}",
+                expected_start, status
+            ),
+        ));
+    }
+
+    let content_range = content_range.ok_or_else(|| {
+        EngineError::protocol(
+            ProtocolErrorKind::InvalidResponse,
+            "Missing Content-Range header on ranged response",
+        )
+    })?;
+
+    validate_resumed_position(expected_start, content_range)?;
+
+    if let Some(expected_end) = expected_end {
+        let (_, actual_end, _) = parse_content_range(content_range).ok_or_else(|| {
+            EngineError::protocol(
+                ProtocolErrorKind::InvalidResponse,
+                format!("Invalid Content-Range header: {}", content_range),
+            )
+        })?;
+
+        if actual_end != expected_end {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::InvalidResponse,
+                format!(
+                    "Range end mismatch: expected {}, got {}",
+                    expected_end, actual_end
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Calculate the range header value for resuming
 pub fn calculate_range_header(start: u64, end: Option<u64>) -> String {
     match end {
@@ -279,5 +327,37 @@ mod tests {
         // Invalid cases
         assert!(validate_resumed_position(50, "bytes 0-99/100").is_err());
         assert!(validate_resumed_position(0, "invalid header").is_err());
+    }
+
+    #[test]
+    fn test_validate_ranged_response() {
+        assert!(validate_ranged_response(
+            100,
+            Some(199),
+            StatusCode::PARTIAL_CONTENT,
+            Some("bytes 100-199/1000"),
+        )
+        .is_ok());
+
+        assert!(
+            validate_ranged_response(100, None, StatusCode::OK, None).is_err(),
+            "200 OK must be rejected for ranged requests"
+        );
+
+        assert!(
+            validate_ranged_response(100, Some(200), StatusCode::PARTIAL_CONTENT, None).is_err(),
+            "Missing Content-Range must be rejected"
+        );
+
+        assert!(
+            validate_ranged_response(
+                100,
+                Some(200),
+                StatusCode::PARTIAL_CONTENT,
+                Some("bytes 100-199/1000"),
+            )
+            .is_err(),
+            "Mismatched end offset must be rejected"
+        );
     }
 }
