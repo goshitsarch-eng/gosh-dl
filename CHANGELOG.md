@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-08
+
+### Fixed
+- **HTTP progress still exceeding 100% on compressed responses**: disabled transparent `gzip`/`brotli` decoding for engine-managed downloads and now force `Accept-Encoding: identity` so byte accounting matches the on-the-wire `Content-Length`
+- **Incorrect total size when `HEAD` and `GET` disagree**: single-connection downloads now prefer the actual `GET` response length, log mismatches, and fail early if streamed bytes exceed the expected total instead of drifting past completion
+- **WebSeed byte accounting drift**: WebSeed requests now use the same identity-encoding behavior as HTTP downloads so torrent-backed web downloads keep progress aligned with transferred bytes
+
 ## [0.2.9] - 2026-03-08
 
 ### Fixed
@@ -214,7 +221,8 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.9...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.9...v0.3.0
 [0.2.9]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.6...v0.2.7

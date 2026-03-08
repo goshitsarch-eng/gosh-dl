@@ -283,6 +283,8 @@ impl WebSeedManager {
         let client = Client::builder()
             .read_timeout(config.request_timeout)
             .user_agent(&config.user_agent)
+            .gzip(false)
+            .brotli(false)
             .build()
             .map_err(|e| {
                 EngineError::network(
@@ -494,6 +496,7 @@ impl WebSeedManager {
         let response = self
             .client
             .get(&url)
+            .header("Accept-Encoding", "identity")
             .header("Range", format!("bytes={}-{}", start, end - 1))
             .send()
             .await
@@ -676,6 +679,7 @@ impl WebSeedManager {
             let response = self
                 .client
                 .get(&url)
+                .header("Accept-Encoding", "identity")
                 .header("Range", format!("bytes={}-{}", file_offset, end_byte))
                 .send()
                 .await

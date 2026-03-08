@@ -57,8 +57,11 @@ impl ConnectionPool {
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Duration::from_secs(90))
-            .gzip(true)
-            .brotli(true);
+            // This is a download engine: preserve the exact bytes on the wire.
+            // Transparent decompression breaks progress accounting, checksums,
+            // range semantics, and on-disk fidelity.
+            .gzip(false)
+            .brotli(false);
 
         // Add proxy if configured
         if let Some(ref proxy_url) = config.proxy_url {

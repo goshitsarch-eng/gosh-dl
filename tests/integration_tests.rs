@@ -1119,6 +1119,175 @@ async fn test_non_range_download_still_completes() {
     engine.shutdown().await.ok();
 }
 
+#[tokio::test]
+async fn test_gzip_encoded_response_does_not_exceed_progress_bounds() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    // Gzip-compressed form of:
+    // "This is a compression regression test payload. " * 16
+    let encoded_body = vec![
+        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 11, 201, 200, 44, 86, 0, 162, 68, 133, 228, 252, 220,
+        130, 162, 212, 226, 226, 204, 252, 60, 133, 162, 212, 116, 24, 179, 36, 181, 184, 68, 161,
+        32, 177, 50, 39, 63, 49, 69, 79, 33, 100, 84, 249, 168, 242, 161, 172, 28, 0, 102, 106,
+        217, 239, 240, 2, 0, 0,
+    ];
+
+    Mock::given(method("HEAD"))
+        .and(path("/compressed.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", encoded_body.len().to_string())
+                .insert_header("Content-Encoding", "gzip"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/compressed.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", encoded_body.len().to_string())
+                .insert_header("Content-Encoding", "gzip")
+                .set_body_bytes(encoded_body.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/compressed.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let mut progress_events = Vec::new();
+    let mut completed = false;
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < Duration::from_secs(10) {
+        match timeout(Duration::from_millis(100), events.recv()).await {
+            Ok(Ok(event)) => {
+                if let DownloadEvent::Progress { id: eid, progress } = &event {
+                    if *eid == id {
+                        progress_events.push(progress.clone());
+                    }
+                }
+                if matches!(event, DownloadEvent::Completed { id: eid } if eid == id) {
+                    completed = true;
+                    break;
+                }
+                if matches!(event, DownloadEvent::Failed { id: eid, .. } if eid == id) {
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    assert!(
+        completed,
+        "Encoded responses should complete without inflating progress above 100%"
+    );
+    assert_all_progress_invariants(&progress_events);
+
+    let status = engine.status(id).expect("Should have status");
+    assert_eq!(status.state, DownloadState::Completed);
+    assert_eq!(
+        status.progress.total_size,
+        Some(encoded_body.len() as u64),
+        "Progress total should reflect the encoded transfer size"
+    );
+    assert_progress_invariant(&status.progress);
+
+    let downloaded_file = temp_dir.path().join("compressed.bin");
+    let downloaded = tokio::fs::read(&downloaded_file)
+        .await
+        .expect("Failed to read compressed download");
+    assert_eq!(
+        downloaded, encoded_body,
+        "Downloader should preserve the exact encoded bytes returned by the server"
+    );
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_download_prefers_get_content_length_when_head_mismatches() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let body = vec![7u8; 4096];
+
+    Mock::given(method("HEAD"))
+        .and(path("/head-mismatch.bin"))
+        .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "2048"))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/head-mismatch.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", body.len().to_string())
+                .set_body_bytes(body.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/head-mismatch.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let mut progress_events = Vec::new();
+    let mut completed = false;
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < Duration::from_secs(10) {
+        match timeout(Duration::from_millis(100), events.recv()).await {
+            Ok(Ok(event)) => {
+                if let DownloadEvent::Progress { id: eid, progress } = &event {
+                    if *eid == id {
+                        progress_events.push(progress.clone());
+                    }
+                }
+                if matches!(event, DownloadEvent::Completed { id: eid } if eid == id) {
+                    completed = true;
+                    break;
+                }
+                if matches!(event, DownloadEvent::Failed { id: eid, .. } if eid == id) {
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    assert!(
+        completed,
+        "GET Content-Length should override a stale HEAD Content-Length"
+    );
+    assert_all_progress_invariants(&progress_events);
+
+    let status = engine.status(id).expect("Should have status");
+    assert_eq!(status.state, DownloadState::Completed);
+    assert_eq!(
+        status.progress.total_size,
+        Some(body.len() as u64),
+        "Progress total should use the GET response length"
+    );
+    assert_progress_invariant(&status.progress);
+
+    engine.shutdown().await.ok();
+}
+
 // =============================================================================
 // Error Handling Tests
 // =============================================================================

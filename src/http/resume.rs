@@ -8,6 +8,8 @@ use reqwest::{Client, StatusCode};
 use std::path::Path;
 use tokio::fs;
 
+use super::ACCEPT_ENCODING_IDENTITY;
+
 /// Information about resume capability
 #[derive(Debug, Clone)]
 pub struct ResumeInfo {
@@ -45,6 +47,7 @@ pub async fn check_resume(
     let response = client
         .head(url)
         .header("User-Agent", user_agent)
+        .header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY)
         .send()
         .await
         .map_err(|e| {
@@ -129,6 +132,7 @@ pub async fn verify_range_support(client: &Client, url: &str, user_agent: &str) 
     let response = client
         .get(url)
         .header("User-Agent", user_agent)
+        .header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY)
         .header("Range", "bytes=0-0")
         .send()
         .await

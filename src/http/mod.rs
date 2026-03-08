@@ -22,7 +22,7 @@ pub use resume::{check_resume, ResumeInfo};
 pub use segment::{calculate_segment_count, probe_server, SegmentedDownload, ServerCapabilities};
 
 use crate::config::EngineConfig;
-use crate::error::{EngineError, NetworkErrorKind, Result, StorageErrorKind};
+use crate::error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result, StorageErrorKind};
 use crate::storage::Segment;
 use crate::types::DownloadProgress;
 
@@ -36,6 +36,8 @@ use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
+
+pub(crate) const ACCEPT_ENCODING_IDENTITY: &str = "identity";
 
 fn log_progress_invariant(context: &str, progress: &DownloadProgress) {
     if let Some(total_size) = progress.total_size {
@@ -148,6 +150,7 @@ impl HttpDownloader {
         for (name, value) in headers {
             request = request.header(name.as_str(), value.as_str());
         }
+        request = request.header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY);
 
         // Add cookies if provided
         if let Some(cookie_list) = cookies {
@@ -164,6 +167,7 @@ impl HttpDownloader {
                 head_request = head_request.header("Cookie", cookie_list.join("; "));
             }
         }
+        head_request = head_request.header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY);
         let head_response = head_request.send().await;
 
         let (content_length, supports_range, suggested_filename) = match head_response {
@@ -292,14 +296,26 @@ impl HttpDownloader {
         }
 
         // Get actual content length from response if not from HEAD
-        let total_size = content_length.or_else(|| {
-            response
-                .headers()
-                .get("content-length")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|len| len + existing_size)
-        });
+        let response_content_length = response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|len| len + existing_size);
+
+        if let (Some(head_len), Some(get_len)) = (content_length, response_content_length) {
+            if head_len != get_len {
+                tracing::warn!(
+                    "HEAD content-length mismatch for {}: HEAD={}, GET={}",
+                    url,
+                    head_len,
+                    get_len
+                );
+            }
+        }
+
+        // Prefer the GET response length over HEAD when available.
+        let total_size = response_content_length.or(content_length);
 
         // Open file for writing
         let file = if existing_size > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT {
@@ -441,6 +457,17 @@ impl HttpDownloader {
 
             // Update counters
             let new_total = downloaded.fetch_add(chunk_len, Ordering::Relaxed) + chunk_len;
+            if let Some(expected) = total_size {
+                if new_total > expected {
+                    return Err(EngineError::protocol(
+                        ProtocolErrorKind::InvalidResponse,
+                        format!(
+                            "Response exceeded expected size: received {} bytes, expected {} bytes",
+                            new_total, expected
+                        ),
+                    ));
+                }
+            }
             bytes_since_update += chunk_len;
 
             // Emit progress at intervals
@@ -483,11 +510,11 @@ impl HttpDownloader {
 
         // Validate received size matches expected (if known)
         if let Some(expected) = total_size {
-            if final_size < expected {
-                return Err(EngineError::network(
-                    NetworkErrorKind::Other,
+            if final_size != expected {
+                return Err(EngineError::protocol(
+                    ProtocolErrorKind::InvalidResponse,
                     format!(
-                        "Incomplete download: received {} bytes, expected {} bytes",
+                        "Download size mismatch: received {} bytes, expected {} bytes",
                         final_size, expected
                     ),
                 ));

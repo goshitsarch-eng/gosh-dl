@@ -6,7 +6,8 @@
 
 use super::connection::RetryPolicy;
 use super::resume::validate_ranged_response;
-use crate::error::{EngineError, NetworkErrorKind, Result, StorageErrorKind};
+use super::ACCEPT_ENCODING_IDENTITY;
+use crate::error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result, StorageErrorKind};
 use crate::storage::Segment;
 use crate::types::DownloadProgress;
 
@@ -277,6 +278,7 @@ impl SegmentedDownload {
 
                 // Persistent state across retries
                 let mut segment_bytes: u64 = already_downloaded;
+                let expected_segment_size = end - start + 1;
                 let mut last_speed_update = Instant::now();
                 let mut bytes_for_speed: u64 = 0;
                 let mut attempt = 0u32;
@@ -313,6 +315,7 @@ impl SegmentedDownload {
                     for (name, value) in &headers {
                         request = request.header(name.as_str(), value.as_str());
                     }
+                    request = request.header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY);
 
                     // Send request
                     let response = match request.send().await {
@@ -450,6 +453,15 @@ impl SegmentedDownload {
                         }
 
                         segment_bytes += chunk_len;
+                        if segment_bytes > expected_segment_size {
+                            break 'retry Err(EngineError::protocol(
+                                ProtocolErrorKind::InvalidResponse,
+                                format!(
+                                    "Segment {} exceeded expected size: received {} bytes, expected {} bytes",
+                                    segment_idx, segment_bytes, expected_segment_size
+                                ),
+                            ));
+                        }
 
                         // Update segment progress for persistence
                         {
@@ -460,7 +472,17 @@ impl SegmentedDownload {
                         }
 
                         // Update global counters
-                        state.downloaded.fetch_add(chunk_len, Ordering::Relaxed);
+                        let total_downloaded =
+                            state.downloaded.fetch_add(chunk_len, Ordering::Relaxed) + chunk_len;
+                        if total_downloaded > total_size {
+                            break 'retry Err(EngineError::protocol(
+                                ProtocolErrorKind::InvalidResponse,
+                                format!(
+                                    "Download exceeded expected size: received {} bytes, expected {} bytes",
+                                    total_downloaded, total_size
+                                ),
+                            ));
+                        }
                         bytes_since_progress.fetch_add(chunk_len, Ordering::Relaxed);
                         bytes_for_speed += chunk_len;
 
@@ -488,7 +510,6 @@ impl SegmentedDownload {
                         };
 
                         if should_emit {
-                            let total_downloaded = state.downloaded.load(Ordering::Relaxed);
                             let current_speed = state.speed.load(Ordering::Relaxed);
                             let connections =
                                 state.active_connections.load(Ordering::Relaxed) as u32;
@@ -587,6 +608,15 @@ impl SegmentedDownload {
 
         // Final progress update
         let total_downloaded = self.state.downloaded.load(Ordering::Relaxed);
+        if total_downloaded != self.total_size {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::InvalidResponse,
+                format!(
+                    "Segmented download size mismatch: received {} bytes, expected {} bytes",
+                    total_downloaded, self.total_size
+                ),
+            ));
+        }
         let progress = DownloadProgress {
             total_size: Some(self.total_size),
             completed_size: total_downloaded,
@@ -777,6 +807,7 @@ pub async fn probe_server(
     let response = client
         .head(url)
         .header("User-Agent", user_agent)
+        .header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY)
         .send()
         .await
         .map_err(|e| {
