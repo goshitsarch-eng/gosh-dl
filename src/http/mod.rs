@@ -59,6 +59,15 @@ fn log_progress_invariant(context: &str, progress: &DownloadProgress) {
     }
 }
 
+fn partial_path_for(save_path: &Path) -> PathBuf {
+    save_path.with_extension(
+        save_path
+            .extension()
+            .map(|e| format!("{}.part", e.to_string_lossy()))
+            .unwrap_or_else(|| "part".to_string()),
+    )
+}
+
 /// HTTP Downloader
 pub struct HttpDownloader {
     pool: Arc<ConnectionPool>,
@@ -132,8 +141,9 @@ impl HttpDownloader {
         progress_callback: F,
     ) -> Result<PathBuf>
     where
-        F: Fn(DownloadProgress) + Send + 'static,
+        F: Fn(DownloadProgress) + Send + Sync + 'static,
     {
+        let progress_callback = Arc::new(progress_callback);
         // Build the request
         let mut request = self.client().get(url);
 
@@ -170,35 +180,48 @@ impl HttpDownloader {
         head_request = head_request.header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY);
         let head_response = head_request.send().await;
 
-        let (content_length, supports_range, suggested_filename) = match head_response {
-            Ok(resp) => {
-                let length = resp
-                    .headers()
-                    .get("content-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok());
+        let (content_length, supports_range, suggested_filename, etag, last_modified) =
+            match head_response {
+                Ok(resp) => {
+                    let length = resp
+                        .headers()
+                        .get("content-length")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok());
 
-                let supports_range = resp
-                    .headers()
-                    .get("accept-ranges")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v.contains("bytes"))
-                    .unwrap_or(false);
+                    let supports_range = resp
+                        .headers()
+                        .get("accept-ranges")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.contains("bytes"))
+                        .unwrap_or(false);
 
-                // Try to get filename from Content-Disposition
-                let suggested = resp
-                    .headers()
-                    .get("content-disposition")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(parse_content_disposition);
+                    // Try to get filename from Content-Disposition
+                    let suggested = resp
+                        .headers()
+                        .get("content-disposition")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_content_disposition);
 
-                (length, supports_range, suggested)
-            }
-            Err(_) => {
-                // HEAD failed, we'll get metadata from GET response
-                (None, false, None)
-            }
-        };
+                    let etag = resp
+                        .headers()
+                        .get("etag")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+
+                    let last_modified = resp
+                        .headers()
+                        .get("last-modified")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+
+                    (length, supports_range, suggested, etag, last_modified)
+                }
+                Err(_) => {
+                    // HEAD failed, we'll get metadata from GET response
+                    (None, false, None, None, None)
+                }
+            };
 
         // Check for cancellation
         if cancel_token.is_cancelled() {
@@ -249,12 +272,7 @@ impl HttpDownloader {
         let save_path = save_dir.join(&final_filename);
 
         // Use .part extension during download
-        let part_path = save_path.with_extension(
-            save_path
-                .extension()
-                .map(|e| format!("{}.part", e.to_string_lossy()))
-                .unwrap_or_else(|| "part".to_string()),
-        );
+        let part_path = partial_path_for(&save_path);
 
         // Check if we can resume
         let existing_size = if supports_range && part_path.exists() {
@@ -266,145 +284,197 @@ impl HttpDownloader {
             0
         };
 
-        // Add Range header if resuming
-        if existing_size > 0 {
-            request = request.header("Range", format!("bytes={}-", existing_size));
-        }
+        let mut allow_resume = existing_size > 0;
 
-        // Send the request
-        let response = request.send().await?;
+        loop {
+            let resume_from = if allow_resume { existing_size } else { 0 };
+            let if_range = if resume_from > 0 {
+                etag.as_deref().or(last_modified.as_deref())
+            } else {
+                None
+            };
 
-        // Check response status
-        let status = response.status();
-        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(EngineError::network(
-                NetworkErrorKind::HttpStatus(status.as_u16()),
-                format!("HTTP error: {}", status),
-            ));
-        }
-
-        if existing_size > 0 {
-            resume::validate_ranged_response(
-                existing_size,
-                None,
-                status,
-                response
-                    .headers()
-                    .get("content-range")
-                    .and_then(|v| v.to_str().ok()),
-            )?;
-        }
-
-        // Get actual content length from response if not from HEAD
-        let response_content_length = response
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|len| len + existing_size);
-
-        if let (Some(head_len), Some(get_len)) = (content_length, response_content_length) {
-            if head_len != get_len {
-                tracing::warn!(
-                    "HEAD content-length mismatch for {}: HEAD={}, GET={}",
-                    url,
-                    head_len,
-                    get_len
-                );
-            }
-        }
-
-        // Prefer the GET response length over HEAD when available.
-        let total_size = response_content_length.or(content_length);
-
-        // Open file for writing
-        let file = if existing_size > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT {
-            // Append mode for resume
-            OpenOptions::new()
-                .write(true)
-                .append(true)
-                .open(&part_path)
-                .await
-                .map_err(|e| {
-                    EngineError::storage(
-                        StorageErrorKind::Io,
-                        &part_path,
-                        format!("Failed to open file for append: {}", e),
-                    )
-                })?
-        } else {
-            // Create new file
-            File::create(&part_path).await.map_err(|e| {
-                EngineError::storage(
-                    StorageErrorKind::Io,
-                    &part_path,
-                    format!("Failed to create file: {}", e),
+            let mut attempt_request = request.try_clone().ok_or_else(|| {
+                EngineError::Internal(
+                    "Failed to clone HTTP request builder for restartless retry".to_string(),
                 )
-            })?
-        };
+            })?;
 
-        // Download with progress tracking
-        let downloaded = Arc::new(AtomicU64::new(existing_size));
-
-        // Stream the response body
-        let result = self
-            .stream_to_file(
-                response,
-                file,
-                downloaded.clone(),
-                total_size,
-                cancel_token.clone(),
-                move |completed, speed| {
-                    let progress = DownloadProgress {
-                        total_size,
-                        completed_size: completed,
-                        download_speed: speed,
-                        upload_speed: 0,
-                        connections: 1,
-                        seeders: 0,
-                        peers: 0,
-                        eta_seconds: total_size.and_then(|total| {
-                            if speed > 0 {
-                                Some((total.saturating_sub(completed)) / speed)
-                            } else {
-                                None
-                            }
-                        }),
-                    };
-                    log_progress_invariant("http download", &progress);
-                    progress_callback(progress);
-                },
-            )
-            .await;
-
-        match result {
-            Ok(_) => {
-                // Verify checksum before renaming (if checksum was provided)
-                if let Some(expected) = checksum {
-                    let verified = verify_checksum(&part_path, expected).await?;
-                    if !verified {
-                        let actual = compute_checksum(&part_path, expected.algorithm).await?;
-                        return Err(checksum::checksum_mismatch_error(&expected.value, &actual));
-                    }
-                    tracing::debug!("Checksum verified: {} matches expected", expected.algorithm);
+            if resume_from > 0 {
+                attempt_request =
+                    attempt_request.header("Range", format!("bytes={}-", resume_from));
+                if let Some(if_range_val) = if_range {
+                    attempt_request = attempt_request.header("If-Range", if_range_val);
                 }
+            }
 
-                // Rename .part file to final name
-                tokio::fs::rename(&part_path, &save_path)
+            // Send the request
+            let response = attempt_request.send().await?;
+
+            // Check response status
+            let status = response.status();
+            if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err(EngineError::network(
+                    NetworkErrorKind::HttpStatus(status.as_u16()),
+                    format!("HTTP error: {}", status),
+                ));
+            }
+
+            if resume_from > 0 {
+                let range_validation = resume::validate_ranged_response(
+                    resume_from,
+                    None,
+                    status,
+                    response
+                        .headers()
+                        .get("content-range")
+                        .and_then(|v| v.to_str().ok()),
+                    resume::RangedResponseContext {
+                        sent_if_range: if_range.is_some(),
+                        expected_etag: etag.as_deref(),
+                        expected_last_modified: last_modified.as_deref(),
+                        response_etag: response.headers().get("etag").and_then(|v| v.to_str().ok()),
+                        response_last_modified: response
+                            .headers()
+                            .get("last-modified")
+                            .and_then(|v| v.to_str().ok()),
+                    },
+                );
+
+                if let Err(err) = range_validation {
+                    if resume::should_restart_without_ranges(&err) {
+                        tracing::warn!(
+                            "HTTP resume for {} cannot continue safely ({}). Restarting from byte 0 with a single stream.",
+                            url,
+                            err
+                        );
+                        allow_resume = false;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+
+            // Get actual content length from response if not from HEAD
+            let response_content_length = response
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|len| len + resume_from);
+
+            if let (Some(head_len), Some(get_len)) = (content_length, response_content_length) {
+                if head_len != get_len {
+                    tracing::warn!(
+                        "HEAD content-length mismatch for {}: HEAD={}, GET={}",
+                        url,
+                        head_len,
+                        get_len
+                    );
+                }
+            }
+
+            // Prefer the GET response length over HEAD when available.
+            let total_size = response_content_length.or(content_length);
+
+            // Open file for writing
+            let file = if resume_from > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT {
+                // Append mode for resume
+                OpenOptions::new()
+                    .write(true)
+                    .append(true)
+                    .open(&part_path)
                     .await
                     .map_err(|e| {
                         EngineError::storage(
                             StorageErrorKind::Io,
-                            &save_path,
-                            format!("Failed to rename file: {}", e),
+                            &part_path,
+                            format!("Failed to open file for append: {}", e),
                         )
-                    })?;
+                    })?
+            } else {
+                // Create a fresh partial file, truncating any stale resume data.
+                File::create(&part_path).await.map_err(|e| {
+                    EngineError::storage(
+                        StorageErrorKind::Io,
+                        &part_path,
+                        format!("Failed to create file: {}", e),
+                    )
+                })?
+            };
 
-                Ok(save_path)
-            }
-            Err(e) => {
-                // Keep .part file for potential resume
-                Err(e)
+            // Download with progress tracking
+            let downloaded = Arc::new(AtomicU64::new(resume_from));
+
+            // Stream the response body
+            let result = self
+                .stream_to_file(
+                    response,
+                    file,
+                    downloaded.clone(),
+                    total_size,
+                    cancel_token.clone(),
+                    {
+                        let progress_callback = Arc::clone(&progress_callback);
+                        move |completed, speed| {
+                            let progress = DownloadProgress {
+                                total_size,
+                                completed_size: completed,
+                                download_speed: speed,
+                                upload_speed: 0,
+                                connections: 1,
+                                seeders: 0,
+                                peers: 0,
+                                eta_seconds: total_size.and_then(|total| {
+                                    if speed > 0 {
+                                        Some((total.saturating_sub(completed)) / speed)
+                                    } else {
+                                        None
+                                    }
+                                }),
+                            };
+                            log_progress_invariant("http download", &progress);
+                            progress_callback(progress);
+                        }
+                    },
+                )
+                .await;
+
+            match result {
+                Ok(_) => {
+                    // Verify checksum before renaming (if checksum was provided)
+                    if let Some(expected) = checksum {
+                        let verified = verify_checksum(&part_path, expected).await?;
+                        if !verified {
+                            let actual = compute_checksum(&part_path, expected.algorithm).await?;
+                            return Err(checksum::checksum_mismatch_error(
+                                &expected.value,
+                                &actual,
+                            ));
+                        }
+                        tracing::debug!(
+                            "Checksum verified: {} matches expected",
+                            expected.algorithm
+                        );
+                    }
+
+                    // Rename .part file to final name
+                    tokio::fs::rename(&part_path, &save_path)
+                        .await
+                        .map_err(|e| {
+                            EngineError::storage(
+                                StorageErrorKind::Io,
+                                &save_path,
+                                format!("Failed to rename file: {}", e),
+                            )
+                        })?;
+
+                    return Ok(save_path);
+                }
+                Err(e) => {
+                    // Keep .part file for potential resume
+                    return Err(e);
+                }
             }
         }
     }
@@ -553,6 +623,7 @@ impl HttpDownloader {
     where
         F: Fn(DownloadProgress) + Send + Sync + 'static,
     {
+        let progress_callback = Arc::new(progress_callback);
         let ua = user_agent.unwrap_or(&self.config.default_user_agent);
 
         // Probe server capabilities
@@ -628,17 +699,53 @@ impl HttpDownloader {
             }
 
             // Start download
-            download
+            let segmented_result = download
                 .start(
                     self.client(),
                     ua,
                     &all_headers,
                     max_connections,
                     &self.retry_policy,
-                    cancel_token,
-                    progress_callback,
+                    cancel_token.clone(),
+                    {
+                        let progress_callback = Arc::clone(&progress_callback);
+                        move |progress| progress_callback(progress)
+                    },
                 )
-                .await?;
+                .await;
+
+            if let Err(err) = segmented_result {
+                if resume::should_restart_without_ranges(&err) && !cancel_token.is_cancelled() {
+                    tracing::warn!(
+                        "Segmented download for {} cannot continue safely ({}). Restarting from byte 0 with a single stream.",
+                        url,
+                        err
+                    );
+                    if let Some(ref slot) = segmented_ref {
+                        *slot.write() = None;
+                    }
+                    resume::cleanup_partial(&partial_path_for(&save_path)).await?;
+                    let path = self
+                        .download(
+                            url,
+                            save_dir,
+                            Some(&final_filename),
+                            user_agent,
+                            referer,
+                            headers,
+                            cookies,
+                            checksum,
+                            cancel_token,
+                            {
+                                let progress_callback = Arc::clone(&progress_callback);
+                                move |progress| progress_callback(progress)
+                            },
+                        )
+                        .await?;
+                    return Ok((path, None));
+                }
+                return Err(err);
+            }
 
             // Verify checksum if provided
             if let Some(expected) = checksum {
@@ -664,7 +771,10 @@ impl HttpDownloader {
                     cookies,
                     checksum,
                     cancel_token,
-                    progress_callback,
+                    {
+                        let progress_callback = Arc::clone(&progress_callback);
+                        move |progress| progress_callback(progress)
+                    },
                 )
                 .await?;
             Ok((path, None))

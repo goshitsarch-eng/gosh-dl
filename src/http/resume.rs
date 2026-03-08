@@ -3,12 +3,21 @@
 //! This module handles detecting resume capability and validating
 //! that a partially downloaded file can be safely resumed.
 
-use crate::error::{EngineError, ProtocolErrorKind, Result};
+use crate::error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result};
 use reqwest::{Client, StatusCode};
 use std::path::Path;
 use tokio::fs;
 
 use super::ACCEPT_ENCODING_IDENTITY;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RangedResponseContext<'a> {
+    pub sent_if_range: bool,
+    pub expected_etag: Option<&'a str>,
+    pub expected_last_modified: Option<&'a str>,
+    pub response_etag: Option<&'a str>,
+    pub response_last_modified: Option<&'a str>,
+}
 
 /// Information about resume capability
 #[derive(Debug, Clone)]
@@ -153,39 +162,75 @@ pub fn validate_ranged_response(
     expected_end: Option<u64>,
     status: StatusCode,
     content_range: Option<&str>,
+    context: RangedResponseContext<'_>,
 ) -> Result<()> {
+    let restart_required = |message: String| {
+        EngineError::protocol(
+            ProtocolErrorKind::RangeNotSupported,
+            format!("{message}. Restart from byte 0 required"),
+        )
+    };
+
     if status != StatusCode::PARTIAL_CONTENT {
+        if status == StatusCode::OK {
+            if let (Some(expected), Some(actual)) = (context.expected_etag, context.response_etag) {
+                if expected != actual {
+                    return Err(restart_required(format!(
+                        "Server returned 200 OK to a ranged request after ETag changed from {} to {}",
+                        expected, actual
+                    )));
+                }
+            }
+
+            if let (Some(expected), Some(actual)) = (
+                context.expected_last_modified,
+                context.response_last_modified,
+            ) {
+                if expected != actual {
+                    return Err(restart_required(format!(
+                        "Server returned 200 OK to a ranged request after Last-Modified changed from {} to {}",
+                        expected, actual
+                    )));
+                }
+            }
+
+            if context.sent_if_range {
+                return Err(restart_required(
+                    "Server returned 200 OK to a ranged request after If-Range validation; the remote file may have changed or the server ignored Range".to_string(),
+                ));
+            }
+        }
+
         return Err(EngineError::protocol(
             ProtocolErrorKind::RangeNotSupported,
             format!(
-                "Server ignored Range request starting at byte {} and returned {}",
+                "Server ignored Range request starting at byte {} and returned {}. Restart from byte 0 required",
                 expected_start, status
             ),
         ));
     }
 
     let content_range = content_range.ok_or_else(|| {
-        EngineError::protocol(
-            ProtocolErrorKind::InvalidResponse,
-            "Missing Content-Range header on ranged response",
-        )
+        restart_required("Missing Content-Range header on ranged response".to_string())
     })?;
 
-    validate_resumed_position(expected_start, content_range)?;
+    if let Err(err) = validate_resumed_position(expected_start, content_range) {
+        return Err(restart_required(format!(
+            "Server returned mismatched Content-Range for ranged request starting at byte {}: {}",
+            expected_start, err
+        )));
+    }
 
     if let Some(expected_end) = expected_end {
         let (_, actual_end, _) = parse_content_range(content_range).ok_or_else(|| {
-            EngineError::protocol(
-                ProtocolErrorKind::InvalidResponse,
-                format!("Invalid Content-Range header: {}", content_range),
-            )
+            restart_required(format!("Invalid Content-Range header: {}", content_range))
         })?;
 
         if actual_end != expected_end {
             return Err(EngineError::protocol(
-                ProtocolErrorKind::InvalidResponse,
+                ProtocolErrorKind::RangeNotSupported,
                 format!(
-                    "Range end mismatch: expected {}, got {}",
+                    "Range end mismatch: expected {}, got {}. Restart from byte 0 required",
                     expected_end, actual_end
                 ),
             ));
@@ -193,6 +238,20 @@ pub fn validate_ranged_response(
     }
 
     Ok(())
+}
+
+pub fn should_restart_without_ranges(err: &EngineError) -> bool {
+    match err {
+        EngineError::Protocol {
+            kind: ProtocolErrorKind::RangeNotSupported,
+            ..
+        } => true,
+        EngineError::Network {
+            kind: NetworkErrorKind::HttpStatus(416),
+            ..
+        } => true,
+        _ => false,
+    }
 }
 
 /// Calculate the range header value for resuming
@@ -340,16 +399,31 @@ mod tests {
             Some(199),
             StatusCode::PARTIAL_CONTENT,
             Some("bytes 100-199/1000"),
+            RangedResponseContext::default(),
         )
         .is_ok());
 
         assert!(
-            validate_ranged_response(100, None, StatusCode::OK, None).is_err(),
+            validate_ranged_response(
+                100,
+                None,
+                StatusCode::OK,
+                None,
+                RangedResponseContext::default(),
+            )
+            .is_err(),
             "200 OK must be rejected for ranged requests"
         );
 
         assert!(
-            validate_ranged_response(100, Some(200), StatusCode::PARTIAL_CONTENT, None).is_err(),
+            validate_ranged_response(
+                100,
+                Some(200),
+                StatusCode::PARTIAL_CONTENT,
+                None,
+                RangedResponseContext::default(),
+            )
+            .is_err(),
             "Missing Content-Range must be rejected"
         );
 
@@ -359,9 +433,34 @@ mod tests {
                 Some(200),
                 StatusCode::PARTIAL_CONTENT,
                 Some("bytes 100-199/1000"),
+                RangedResponseContext::default(),
             )
             .is_err(),
             "Mismatched end offset must be rejected"
+        );
+
+        let err = validate_ranged_response(
+            100,
+            None,
+            StatusCode::OK,
+            None,
+            RangedResponseContext {
+                sent_if_range: true,
+                expected_etag: Some("\"old\""),
+                response_etag: Some("\"new\""),
+                ..RangedResponseContext::default()
+            },
+        )
+        .expect_err("Changed validator must trigger restart classification");
+        assert!(
+            matches!(
+                err,
+                EngineError::Protocol {
+                    kind: ProtocolErrorKind::RangeNotSupported,
+                    ..
+                }
+            ),
+            "Expected restart-worthy RangeNotSupported error, got {err:?}"
         );
     }
 }

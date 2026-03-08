@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-03-08
+
+### Fixed
+- **Segmented downloads stopping late when range support disappears**: segmented HTTP transfers now downgrade to a single stream and restart safely from byte `0` instead of failing after a server or CDN ignores a later `Range` request
+- **Resume attempts failing hard on ignored `Range` responses**: single-connection HTTP resumes now restart cleanly from byte `0` when the server returns a full-body response instead of an appendable partial response
+- **Poor diagnostics for `If-Range` mismatches**: ranged-response validation now distinguishes likely validator/resource changes from plain ignored ranges and surfaces restart-required errors without reintroducing over-100% progress
+
 ## [0.3.0] - 2026-03-08
 
 ### Fixed
@@ -221,7 +228,8 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.9...v0.3.0
 [0.2.9]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.7...v0.2.8

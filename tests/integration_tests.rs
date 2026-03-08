@@ -13,7 +13,16 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+
+#[derive(Debug)]
+struct MissingHeaderMatcher(&'static str);
+
+impl Match for MissingHeaderMatcher {
+    fn matches(&self, request: &Request) -> bool {
+        !request.headers.contains_key(self.0)
+    }
+}
 
 /// Helper to create a test engine with a temp directory
 async fn create_test_engine(temp_dir: &TempDir) -> std::sync::Arc<DownloadEngine> {
@@ -651,7 +660,7 @@ async fn test_pause_download() {
 }
 
 #[tokio::test]
-async fn test_segmented_download_rejects_ignored_range_requests() {
+async fn test_segmented_download_falls_back_when_server_ignores_range_requests() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let mock_server = MockServer::start().await;
 
@@ -680,6 +689,17 @@ async fn test_segmented_download_rejects_ignored_range_requests() {
             .await;
     }
 
+    Mock::given(method("GET"))
+        .and(path("/lying-range.bin"))
+        .and(MissingHeaderMatcher("range"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
     let config = EngineConfig {
         download_dir: temp_dir.path().to_path_buf(),
         max_connections_per_download: 2,
@@ -698,7 +718,7 @@ async fn test_segmented_download_rejects_ignored_range_requests() {
         .expect("Failed to add download");
 
     let mut progress_events = Vec::new();
-    let mut terminal_event = None;
+    let mut completed = false;
     let start = std::time::Instant::now();
 
     while start.elapsed() < Duration::from_secs(10) {
@@ -709,12 +729,11 @@ async fn test_segmented_download_rejects_ignored_range_requests() {
                         progress_events.push(progress.clone());
                     }
                 }
-                if matches!(
-                    event,
-                    DownloadEvent::Completed { id: eid } | DownloadEvent::Failed { id: eid, .. }
-                    if eid == id
-                ) {
-                    terminal_event = Some(event);
+                if matches!(event, DownloadEvent::Completed { id: eid } if eid == id) {
+                    completed = true;
+                    break;
+                }
+                if matches!(event, DownloadEvent::Failed { id: eid, .. } if eid == id) {
                     break;
                 }
             }
@@ -723,22 +742,20 @@ async fn test_segmented_download_rejects_ignored_range_requests() {
     }
 
     assert!(
-        matches!(terminal_event, Some(DownloadEvent::Failed { .. })),
-        "Segmented download should fail when a ranged request gets 200 OK"
+        completed,
+        "Segmented download should restart without ranges and complete"
     );
     assert_all_progress_invariants(&progress_events);
 
+    let downloaded_file = temp_dir.path().join("lying-range.bin");
+    let downloaded = tokio::fs::read(&downloaded_file)
+        .await
+        .expect("Failed to read restarted download");
+    assert_eq!(downloaded, content);
+
     let status = engine.status(id).expect("Should have status");
-    match &status.state {
-        DownloadState::Error { message, .. } => {
-            assert!(
-                message.contains("Range request"),
-                "Expected a ranged-response error, got: {}",
-                message
-            );
-        }
-        state => panic!("Expected Error state, got {:?}", state),
-    }
+    assert_eq!(status.state, DownloadState::Completed);
+    assert_progress_invariant(&status.progress);
 
     engine.shutdown().await.ok();
 }
@@ -850,7 +867,7 @@ async fn test_segmented_download_succeeds_with_valid_partial_content() {
 }
 
 #[tokio::test]
-async fn test_segmented_retry_rejects_ignored_range_response() {
+async fn test_segmented_retry_falls_back_when_range_response_is_ignored() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let mock_server = MockServer::start().await;
 
@@ -898,6 +915,17 @@ async fn test_segmented_retry_rejects_ignored_range_response() {
         .mount(&mock_server)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/retry-range.bin"))
+        .and(MissingHeaderMatcher("range"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
     let config = EngineConfig {
         download_dir: temp_dir.path().to_path_buf(),
         max_connections_per_download: 2,
@@ -916,7 +944,7 @@ async fn test_segmented_retry_rejects_ignored_range_response() {
         .expect("Failed to add download");
 
     let mut progress_events = Vec::new();
-    let mut terminal_event = None;
+    let mut completed = false;
     let start = std::time::Instant::now();
 
     while start.elapsed() < Duration::from_secs(15) {
@@ -927,12 +955,11 @@ async fn test_segmented_retry_rejects_ignored_range_response() {
                         progress_events.push(progress.clone());
                     }
                 }
-                if matches!(
-                    event,
-                    DownloadEvent::Completed { id: eid } | DownloadEvent::Failed { id: eid, .. }
-                    if eid == id
-                ) {
-                    terminal_event = Some(event);
+                if matches!(event, DownloadEvent::Completed { id: eid } if eid == id) {
+                    completed = true;
+                    break;
+                }
+                if matches!(event, DownloadEvent::Failed { id: eid, .. } if eid == id) {
                     break;
                 }
             }
@@ -941,28 +968,26 @@ async fn test_segmented_retry_rejects_ignored_range_response() {
     }
 
     assert!(
-        matches!(terminal_event, Some(DownloadEvent::Failed { .. })),
-        "Retrying a segment with an ignored Range response should fail"
+        completed,
+        "Retrying a segment with an ignored Range response should restart without ranges"
     );
     assert_all_progress_invariants(&progress_events);
 
+    let downloaded_file = temp_dir.path().join("retry-range.bin");
+    let downloaded = tokio::fs::read(&downloaded_file)
+        .await
+        .expect("Failed to read restarted retry download");
+    assert_eq!(downloaded, content);
+
     let status = engine.status(id).expect("Should have status");
-    match &status.state {
-        DownloadState::Error { message, .. } => {
-            assert!(
-                message.contains("Range request"),
-                "Expected a ranged-response error, got: {}",
-                message
-            );
-        }
-        state => panic!("Expected Error state, got {:?}", state),
-    }
+    assert_eq!(status.state, DownloadState::Completed);
+    assert_progress_invariant(&status.progress);
 
     engine.shutdown().await.ok();
 }
 
 #[tokio::test]
-async fn test_resume_rejects_ignored_range_response() {
+async fn test_resume_restarts_from_zero_when_range_is_ignored() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let mock_server = MockServer::start().await;
 
@@ -994,6 +1019,17 @@ async fn test_resume_rejects_ignored_range_response() {
         .mount(&mock_server)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/resume-ignore.bin"))
+        .and(MissingHeaderMatcher("range"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
     let config = EngineConfig {
         download_dir: temp_dir.path().to_path_buf(),
         max_connections_per_download: 1,
@@ -1012,7 +1048,7 @@ async fn test_resume_rejects_ignored_range_response() {
         .expect("Failed to add download");
 
     let mut progress_events = Vec::new();
-    let mut terminal_event = None;
+    let mut completed = false;
     let start = std::time::Instant::now();
 
     while start.elapsed() < Duration::from_secs(10) {
@@ -1023,12 +1059,11 @@ async fn test_resume_rejects_ignored_range_response() {
                         progress_events.push(progress.clone());
                     }
                 }
-                if matches!(
-                    event,
-                    DownloadEvent::Completed { id: eid } | DownloadEvent::Failed { id: eid, .. }
-                    if eid == id
-                ) {
-                    terminal_event = Some(event);
+                if matches!(event, DownloadEvent::Completed { id: eid } if eid == id) {
+                    completed = true;
+                    break;
+                }
+                if matches!(event, DownloadEvent::Failed { id: eid, .. } if eid == id) {
                     break;
                 }
             }
@@ -1037,30 +1072,23 @@ async fn test_resume_rejects_ignored_range_response() {
     }
 
     assert!(
-        matches!(terminal_event, Some(DownloadEvent::Failed { .. })),
-        "Resumed download should fail when the server ignores Range"
+        completed,
+        "Resumed download should restart from byte 0 when the server ignores Range"
     );
     assert_all_progress_invariants(&progress_events);
 
     let status = engine.status(id).expect("Should have status");
-    match &status.state {
-        DownloadState::Error { message, .. } => {
-            assert!(
-                message.contains("Range request"),
-                "Expected a ranged-response error, got: {}",
-                message
-            );
-        }
-        state => panic!("Expected Error state, got {:?}", state),
-    }
+    assert_eq!(status.state, DownloadState::Completed);
+    assert_progress_invariant(&status.progress);
 
-    let metadata = tokio::fs::metadata(&part_path)
+    let downloaded_file = temp_dir.path().join("resume-ignore.bin");
+    let downloaded = tokio::fs::read(&downloaded_file)
         .await
-        .expect("Partial file should remain intact");
-    assert_eq!(
-        metadata.len(),
-        existing_size,
-        "Resume failure should not append duplicate bytes to the partial file"
+        .expect("Failed to read restarted resume download");
+    assert_eq!(downloaded, content);
+    assert!(
+        !part_path.exists(),
+        "Restarted download should finalize and remove the partial file"
     );
 
     engine.shutdown().await.ok();

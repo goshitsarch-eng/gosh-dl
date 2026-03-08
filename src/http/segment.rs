@@ -5,7 +5,9 @@
 //! them in parallel using multiple connections.
 
 use super::connection::RetryPolicy;
-use super::resume::validate_ranged_response;
+use super::resume::{
+    should_restart_without_ranges, validate_ranged_response, RangedResponseContext,
+};
 use super::ACCEPT_ENCODING_IDENTITY;
 use crate::error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result, StorageErrorKind};
 use crate::storage::Segment;
@@ -87,8 +89,7 @@ pub struct SegmentedDownload {
     supports_range: bool,
     /// ETag for validation
     etag: Option<String>,
-    /// Last-Modified for validation (stored for resume validation)
-    #[allow(dead_code)]
+    /// Last-Modified for validation
     last_modified: Option<String>,
     /// Shared state (wrapped in Arc for task sharing)
     state: Arc<SharedState>,
@@ -250,6 +251,7 @@ impl SegmentedDownload {
             let semaphore = Arc::clone(&semaphore);
             let cancel_token = cancel_token.clone();
             let etag = self.etag.clone();
+            let last_modified = self.last_modified.clone();
             let state = Arc::clone(&self.state);
             let progress_callback = Arc::clone(&progress_callback);
             let last_progress = Arc::clone(&last_progress);
@@ -307,8 +309,8 @@ impl SegmentedDownload {
                     request = request.header("Range", format!("bytes={}-{}", resume_start, end));
 
                     // Add ETag for validation if available
-                    if let Some(ref etag_val) = etag {
-                        request = request.header("If-Range", etag_val);
+                    if let Some(if_range_val) = etag.as_deref().or(last_modified.as_deref()) {
+                        request = request.header("If-Range", if_range_val);
                     }
 
                     // Add custom headers
@@ -392,6 +394,19 @@ impl SegmentedDownload {
                             .headers()
                             .get("content-range")
                             .and_then(|v| v.to_str().ok()),
+                        RangedResponseContext {
+                            sent_if_range: etag.is_some() || last_modified.is_some(),
+                            expected_etag: etag.as_deref(),
+                            expected_last_modified: last_modified.as_deref(),
+                            response_etag: response
+                                .headers()
+                                .get("etag")
+                                .and_then(|v| v.to_str().ok()),
+                            response_last_modified: response
+                                .headers()
+                                .get("last-modified")
+                                .and_then(|v| v.to_str().ok()),
+                        },
                     ) {
                         break 'retry Err(e);
                     }
@@ -557,6 +572,7 @@ impl SegmentedDownload {
 
         // Wait for all segment tasks to complete and collect errors
         let mut segment_errors: Vec<String> = Vec::new();
+        let mut restart_without_ranges_reason: Option<String> = None;
         for (idx, handle) in handles.into_iter().enumerate() {
             match handle.await {
                 Err(e) => {
@@ -567,6 +583,10 @@ impl SegmentedDownload {
                 Ok(Err(e)) => {
                     // Task returned an error
                     tracing::error!("Segment {} failed: {:?}", idx, e);
+                    if restart_without_ranges_reason.is_none() && should_restart_without_ranges(&e)
+                    {
+                        restart_without_ranges_reason = Some(e.to_string());
+                    }
                     segment_errors.push(format!("Segment {} failed: {}", idx, e));
                 }
                 Ok(Ok(())) => {
@@ -577,6 +597,15 @@ impl SegmentedDownload {
 
         // If any segments failed, return error
         if !segment_errors.is_empty() {
+            if let Some(reason) = restart_without_ranges_reason {
+                return Err(EngineError::protocol(
+                    ProtocolErrorKind::RangeNotSupported,
+                    format!(
+                        "Segmented download requires restart without ranges: {}",
+                        reason
+                    ),
+                ));
+            }
             return Err(EngineError::network(
                 NetworkErrorKind::Other,
                 format!(
