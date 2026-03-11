@@ -279,22 +279,17 @@ impl From<reqwest::Error> for EngineError {
             NetworkErrorKind::ConnectionRefused
         } else if err.is_redirect() {
             NetworkErrorKind::TooManyRedirects
+        } else if err.is_body() || err.is_decode() {
+            // Stream interrupted during body transfer — retryable
+            NetworkErrorKind::ConnectionReset
         } else if let Some(status) = err.status() {
             NetworkErrorKind::HttpStatus(status.as_u16())
         } else {
             NetworkErrorKind::Other
         };
 
-        let retryable = matches!(
-            kind,
-            NetworkErrorKind::Timeout | NetworkErrorKind::ConnectionRefused
-        );
-
-        Self::Network {
-            kind,
-            message: err.to_string(),
-            retryable,
-        }
+        // Use the standard constructor so retryability is computed consistently
+        Self::network(kind, err.to_string())
     }
 }
 

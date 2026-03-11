@@ -424,7 +424,7 @@ impl Default for HttpConfig {
             connect_timeout: 30,
             read_timeout: 60,
             max_redirects: 10,
-            max_retries: 3,
+            max_retries: 5,
             retry_delay_ms: 1000,
             max_retry_delay_ms: 30000,
             accept_invalid_certs: false,

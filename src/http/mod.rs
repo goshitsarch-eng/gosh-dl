@@ -285,6 +285,7 @@ impl HttpDownloader {
         };
 
         let mut allow_resume = existing_size > 0;
+        let mut stream_attempt = 0u32;
 
         loop {
             let resume_from = if allow_resume { existing_size } else { 0 };
@@ -473,6 +474,36 @@ impl HttpDownloader {
                 }
                 Err(e) => {
                     // Keep .part file for potential resume
+                    if e.is_retryable()
+                        && self.retry_policy.should_retry(stream_attempt, &e)
+                    {
+                        stream_attempt += 1;
+                        let delay = self.retry_policy.delay_for_attempt(stream_attempt - 1);
+                        if supports_range {
+                            tracing::warn!(
+                                "Stream error for {} (attempt {}/{}), will resume from partial: {}",
+                                url,
+                                stream_attempt,
+                                self.retry_policy.max_attempts,
+                                e
+                            );
+                            // Re-enter the loop: it will detect the .part file
+                            // and send a Range request to resume from where we left off
+                            allow_resume = true;
+                        } else {
+                            tracing::warn!(
+                                "Stream error for {} (attempt {}/{}), restarting (no range support): {}",
+                                url,
+                                stream_attempt,
+                                self.retry_policy.max_attempts,
+                                e
+                            );
+                            // Server doesn't support ranges — must restart from byte 0
+                            allow_resume = false;
+                        }
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
                     return Err(e);
                 }
             }
@@ -504,9 +535,7 @@ impl HttpDownloader {
                 return Err(EngineError::Shutdown);
             }
         } {
-            let chunk: bytes::Bytes = chunk_result.map_err(|e: reqwest::Error| {
-                EngineError::network(NetworkErrorKind::Other, format!("Stream error: {}", e))
-            })?;
+            let chunk: bytes::Bytes = chunk_result.map_err(EngineError::from)?;
 
             let chunk_len = chunk.len() as u64;
 

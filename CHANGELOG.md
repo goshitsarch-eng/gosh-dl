@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-03-11
+
+### Fixed
+- **Downloads bombing out on mid-stream connection drops**: body/decode errors from reqwest were classified as non-retryable `NetworkErrorKind::Other`, making the retry loop dead code for the most common failure mode — now correctly classified as `ConnectionReset` (retryable)
+- **Double retryability bug in `From<reqwest::Error>`**: the `From` impl computed a narrow retryable set (only Timeout and ConnectionRefused) instead of using the standard `EngineError::network()` constructor which also covers ConnectionReset, Unreachable, 408, 429, and 5xx
+- **Segment errors hardcoded as non-retryable**: segment request send and stream errors manually constructed `NetworkErrorKind::Other` instead of using proper reqwest error conversion — all segment errors now classify correctly
+- **Segmented download aggregate error always non-retryable**: when segments failed with retryable errors (e.g. 500s), the aggregate error was wrapped as `Other` (non-retryable) — now preserves retryability from underlying segment errors
+- **Single-stream downloads never retrying on stream errors**: `stream_to_file()` had no retry mechanism — stream errors now trigger automatic retry with resume (via Range requests when supported) or restart from byte 0 (when server lacks range support)
+- **Segment progress lost on failure**: the engine error handler never saved segment progress, so retrying a failed segmented download restarted from zero — segment progress is now saved to both memory cache and database before marking failure
+- **Sibling segments wasting bandwidth after fatal error**: when one segment hit a non-retryable error (403, 404), other segments continued downloading until completion — added a child cancellation token that stops siblings promptly
+
+### Changed
+- Default `max_retries` increased from 3 to 5 for better resilience on flaky connections
+
+### Added
+- 6 new integration tests: retry exhaustion with retryable flag, permanent 4xx non-retry, 416 fallback to single-stream, ETag change restart, sibling cancellation on fatal segment error, segment progress preservation on failure
+
 ## [0.3.1] - 2026-03-08
 
 ### Fixed
@@ -228,7 +245,8 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.9...v0.3.0
 [0.2.9]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.8...v0.2.9

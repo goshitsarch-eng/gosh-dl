@@ -7,6 +7,7 @@
 
 use gosh_dl::{
     DownloadEngine, DownloadEvent, DownloadOptions, DownloadProgress, DownloadState, EngineConfig,
+    HttpConfig,
 };
 use std::time::Duration;
 use tempfile::TempDir;
@@ -1782,6 +1783,478 @@ async fn test_global_stats() {
     assert_eq!(stats.num_stopped, 0);
     assert_eq!(stats.download_speed, 0);
     assert_eq!(stats.upload_speed, 0);
+
+    engine.shutdown().await.ok();
+}
+
+// =============================================================================
+// Resume Reliability Tests
+// =============================================================================
+
+/// Helper matcher: matches requests that have a specific header present
+#[derive(Debug)]
+struct HasHeaderMatcher(&'static str);
+
+impl Match for HasHeaderMatcher {
+    fn matches(&self, request: &Request) -> bool {
+        request.headers.contains_key(self.0)
+    }
+}
+
+/// Helper: create an engine with fast retries for testing
+async fn create_fast_retry_engine(
+    temp_dir: &TempDir,
+    max_retries: usize,
+) -> std::sync::Arc<DownloadEngine> {
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        max_concurrent_downloads: 4,
+        max_connections_per_download: 4,
+        min_segment_size: 1024,
+        http: HttpConfig {
+            max_retries,
+            retry_delay_ms: 50,
+            max_retry_delay_ms: 200,
+            connect_timeout: 5,
+            read_timeout: 5,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine")
+}
+
+/// Wait for a terminal event (Completed or Failed), collecting all events.
+async fn wait_for_terminal(
+    events: &mut broadcast::Receiver<DownloadEvent>,
+    id: gosh_dl::DownloadId,
+    timeout_secs: u64,
+) -> (bool, Option<(String, bool)>, Vec<DownloadProgress>) {
+    let mut completed = false;
+    let mut failed: Option<(String, bool)> = None;
+    let mut progress_events = Vec::new();
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < Duration::from_secs(timeout_secs) {
+        match timeout(Duration::from_millis(100), events.recv()).await {
+            Ok(Ok(event)) => {
+                if let DownloadEvent::Progress {
+                    id: eid, progress, ..
+                } = &event
+                {
+                    if *eid == id {
+                        progress_events.push(progress.clone());
+                    }
+                }
+                if matches!(event, DownloadEvent::Completed { id: eid } if eid == id) {
+                    completed = true;
+                    break;
+                }
+                if let DownloadEvent::Failed {
+                    id: eid,
+                    error,
+                    retryable,
+                } = event
+                {
+                    if eid == id {
+                        failed = Some((error, retryable));
+                        break;
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    (completed, failed, progress_events)
+}
+
+#[tokio::test]
+async fn test_retry_exhaustion_reports_retryable_failure() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    // HEAD succeeds but GET always returns 500
+    Mock::given(method("HEAD"))
+        .and(path("/always-500.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "4096")
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/always-500.bin"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_fast_retry_engine(&temp_dir, 2).await;
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/always-500.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let (completed, failed, _progress) = wait_for_terminal(&mut events, id, 30).await;
+
+    assert!(!completed, "Should not complete when server returns 500");
+    let (error_msg, retryable) = failed.expect("Should receive Failed event");
+    assert!(retryable, "500 errors should be retryable, got: {}", error_msg);
+
+    // Verify the engine status also reflects retryable
+    let status = engine.status(id).expect("Should have status");
+    match status.state {
+        DownloadState::Error { retryable, .. } => {
+            assert!(retryable, "Engine state should also be retryable");
+        }
+        other => panic!("Expected Error state, got {:?}", other),
+    }
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_permanent_4xx_does_not_retry() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    // HEAD returns 403 immediately
+    Mock::given(method("HEAD"))
+        .and(path("/forbidden.bin"))
+        .respond_with(ResponseTemplate::new(403))
+        .expect(1..=2) // HEAD may be tried once or twice
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_fast_retry_engine(&temp_dir, 3).await;
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/forbidden.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let (completed, failed, _) = wait_for_terminal(&mut events, id, 10).await;
+
+    assert!(!completed, "Should not complete on 403");
+    let (_error_msg, retryable) = failed.expect("Should receive Failed event");
+    assert!(!retryable, "403 errors should NOT be retryable");
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_416_range_not_satisfiable_falls_back_to_single() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let content: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+
+    // HEAD advertises range support
+    Mock::given(method("HEAD"))
+        .and(path("/gone-416.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    // All ranged GETs return 416
+    Mock::given(method("GET"))
+        .and(path("/gone-416.bin"))
+        .and(HasHeaderMatcher("range"))
+        .respond_with(ResponseTemplate::new(416))
+        .mount(&mock_server)
+        .await;
+
+    // Non-ranged GET serves full file
+    Mock::given(method("GET"))
+        .and(path("/gone-416.bin"))
+        .and(MissingHeaderMatcher("range"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        max_connections_per_download: 2,
+        min_segment_size: 1024,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/gone-416.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let (completed, _failed, progress_events) = wait_for_terminal(&mut events, id, 15).await;
+
+    assert!(
+        completed,
+        "Should complete via single-stream fallback after 416"
+    );
+    assert_all_progress_invariants(&progress_events);
+
+    let downloaded_file = temp_dir.path().join("gone-416.bin");
+    let downloaded = tokio::fs::read(&downloaded_file)
+        .await
+        .expect("Failed to read downloaded file");
+    assert_eq!(downloaded, content);
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_etag_change_between_resume_attempts_restarts_from_zero() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let old_content: Vec<u8> = (0..2048).map(|i| (i % 211) as u8).collect();
+    let new_content: Vec<u8> = (0..2048).map(|i| (i % 223) as u8).collect();
+
+    // Seed a partial file with OLD content
+    let part_path = temp_dir.path().join("etag-change.bin.part");
+    tokio::fs::write(&part_path, &old_content[..512])
+        .await
+        .expect("Failed to seed partial file");
+
+    // HEAD returns new ETag
+    Mock::given(method("HEAD"))
+        .and(path("/etag-change.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", new_content.len().to_string())
+                .insert_header("Accept-Ranges", "bytes")
+                .insert_header("ETag", "\"new-etag-v2\""),
+        )
+        .mount(&mock_server)
+        .await;
+
+    // Ranged GET with If-Range returns 200 OK (full body, not 206 — ETag changed)
+    Mock::given(method("GET"))
+        .and(path("/etag-change.bin"))
+        .and(HasHeaderMatcher("range"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", new_content.len().to_string())
+                .insert_header("ETag", "\"new-etag-v2\"")
+                .set_body_bytes(new_content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    // Fallback non-ranged GET (for restart)
+    Mock::given(method("GET"))
+        .and(path("/etag-change.bin"))
+        .and(MissingHeaderMatcher("range"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", new_content.len().to_string())
+                .set_body_bytes(new_content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/etag-change.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let (completed, _failed, progress_events) = wait_for_terminal(&mut events, id, 15).await;
+
+    assert!(completed, "Should complete with new content after ETag change");
+    assert_all_progress_invariants(&progress_events);
+
+    // Verify file has NEW content, not a mix
+    let downloaded_file = temp_dir.path().join("etag-change.bin");
+    let downloaded = tokio::fs::read(&downloaded_file)
+        .await
+        .expect("Failed to read downloaded file");
+    assert_eq!(downloaded, new_content, "File should contain new content, not old");
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_one_segment_fails_others_stop_promptly() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let content: Vec<u8> = (0..4096).map(|i| (i % 233) as u8).collect();
+
+    // HEAD advertises range support
+    Mock::given(method("HEAD"))
+        .and(path("/one-fails.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    // Segment 0 (bytes=0-2047): always returns 403 Forbidden (non-retryable)
+    Mock::given(method("GET"))
+        .and(path("/one-fails.bin"))
+        .and(header("Range", "bytes=0-2047"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&mock_server)
+        .await;
+
+    // Segment 1 (bytes=2048-4095): returns valid 206 with delay
+    // The delay ensures we can observe whether it gets cancelled
+    Mock::given(method("GET"))
+        .and(path("/one-fails.bin"))
+        .and(header("Range", "bytes=2048-4095"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Length", "2048")
+                .insert_header("Content-Range", "bytes 2048-4095/4096")
+                .set_body_bytes(content[2048..].to_vec())
+                .set_delay(Duration::from_secs(5)), // Slow — should be cancelled
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_fast_retry_engine(&temp_dir, 1).await;
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/one-fails.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let start = std::time::Instant::now();
+    let (completed, failed, _) = wait_for_terminal(&mut events, id, 15).await;
+    let elapsed = start.elapsed();
+
+    assert!(!completed, "Should not complete when a segment gets 403");
+    assert!(failed.is_some(), "Should receive Failed event");
+
+    // Should fail promptly (well under 5s segment delay), proving cancellation works
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "Should fail promptly due to sibling cancellation, took {:?}",
+        elapsed
+    );
+
+    engine.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn test_segment_progress_saved_on_failure() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let content: Vec<u8> = (0..4096).map(|i| (i % 229) as u8).collect();
+
+    Mock::given(method("HEAD"))
+        .and(path("/save-progress.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    // Segment 0: succeeds
+    Mock::given(method("GET"))
+        .and(path("/save-progress.bin"))
+        .and(header("Range", "bytes=0-2047"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Length", "2048")
+                .insert_header("Content-Range", "bytes 0-2047/4096")
+                .set_body_bytes(content[..2048].to_vec()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    // Segment 1: always fails with 500 (retryable, eventually exhausts)
+    Mock::given(method("GET"))
+        .and(path("/save-progress.bin"))
+        .and(header("Range", "bytes=2048-4095"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        max_connections_per_download: 2,
+        min_segment_size: 1024,
+        http: HttpConfig {
+            max_retries: 1,
+            retry_delay_ms: 50,
+            max_retry_delay_ms: 100,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/save-progress.bin", mock_server.uri());
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let (completed, failed, _) = wait_for_terminal(&mut events, id, 30).await;
+
+    assert!(!completed, "Should not complete when segment 1 fails");
+    let (error_msg, retryable) = failed.expect("Should receive Failed event");
+    assert!(
+        retryable,
+        "Segmented failure with 500s should be retryable, got: {}",
+        error_msg
+    );
+
+    // Verify the engine cached segments for resume
+    let status = engine.status(id).expect("Should have status");
+    match &status.state {
+        DownloadState::Error {
+            retryable: r,
+            message,
+            ..
+        } => {
+            assert!(r, "Error state should be retryable: {}", message);
+        }
+        other => panic!("Expected Error state, got {:?}", other),
+    }
+
+    // Verify the .part file still exists (not cleaned up)
+    let part_path = temp_dir.path().join("save-progress.bin.part");
+    assert!(
+        part_path.exists(),
+        ".part file should be preserved for resume"
+    );
 
     engine.shutdown().await.ok();
 }

@@ -225,6 +225,10 @@ impl SegmentedDownload {
         // Create semaphore for connection limiting
         let semaphore = Arc::new(Semaphore::new(max_connections));
 
+        // Child cancel token: cancelled on fatal (non-retryable) segment errors
+        // so sibling segments stop promptly instead of wasting bandwidth
+        let fatal_cancel = cancel_token.child_token();
+
         // Shared state for progress tracking
         let progress_callback = Arc::new(progress_callback);
         let last_progress = Arc::new(RwLock::new(Instant::now()));
@@ -249,7 +253,7 @@ impl SegmentedDownload {
             let headers = headers.to_vec();
             let file = Arc::clone(&file);
             let semaphore = Arc::clone(&semaphore);
-            let cancel_token = cancel_token.clone();
+            let cancel_token = fatal_cancel.clone();
             let etag = self.etag.clone();
             let last_modified = self.last_modified.clone();
             let state = Arc::clone(&self.state);
@@ -323,10 +327,7 @@ impl SegmentedDownload {
                     let response = match request.send().await {
                         Ok(r) => r,
                         Err(e) => {
-                            let err = EngineError::network(
-                                NetworkErrorKind::Other,
-                                format!("Segment {} request failed: {}", segment_idx, e),
-                            );
+                            let err: EngineError = e.into();
                             attempt += 1;
                             if retry_policy.should_retry(attempt - 1, &err) {
                                 tracing::warn!(
@@ -334,11 +335,14 @@ impl SegmentedDownload {
                                     segment_idx,
                                     attempt,
                                     retry_policy.max_attempts,
-                                    e
+                                    err
                                 );
                                 let delay = retry_policy.delay_for_attempt(attempt - 1);
                                 tokio::time::sleep(delay).await;
                                 continue 'retry;
+                            }
+                            if !err.is_retryable() {
+                                cancel_token.cancel();
                             }
                             break 'retry Err(err);
                         }
@@ -348,6 +352,7 @@ impl SegmentedDownload {
 
                     // Handle 416 Range Not Satisfiable — not retryable
                     if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                        cancel_token.cancel();
                         break 'retry Err(EngineError::network(
                             NetworkErrorKind::HttpStatus(416),
                             format!(
@@ -380,6 +385,7 @@ impl SegmentedDownload {
                     }
 
                     if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                        cancel_token.cancel();
                         break 'retry Err(EngineError::network(
                             NetworkErrorKind::HttpStatus(status.as_u16()),
                             format!("Segment {} HTTP error: {}", segment_idx, status),
@@ -427,18 +433,18 @@ impl SegmentedDownload {
                         let chunk: Bytes = match chunk_result {
                             Ok(c) => c,
                             Err(e) => {
-                                let err = EngineError::network(
-                                    NetworkErrorKind::Other,
-                                    format!("Segment {} stream error: {}", segment_idx, e),
-                                );
+                                let err: EngineError = e.into();
                                 attempt += 1;
                                 if retry_policy.should_retry(attempt - 1, &err) {
                                     tracing::warn!(
                                         "Segment {} stream error (attempt {}/{}), retrying from byte {}: {}",
-                                        segment_idx, attempt, retry_policy.max_attempts, segment_bytes, e
+                                        segment_idx, attempt, retry_policy.max_attempts, segment_bytes, err
                                     );
                                     stream_failed = true;
                                     break;
+                                }
+                                if !err.is_retryable() {
+                                    cancel_token.cancel();
                                 }
                                 break 'retry Err(err);
                             }
@@ -572,6 +578,7 @@ impl SegmentedDownload {
 
         // Wait for all segment tasks to complete and collect errors
         let mut segment_errors: Vec<String> = Vec::new();
+        let mut any_retryable = false;
         let mut restart_without_ranges_reason: Option<String> = None;
         for (idx, handle) in handles.into_iter().enumerate() {
             match handle.await {
@@ -583,6 +590,9 @@ impl SegmentedDownload {
                 Ok(Err(e)) => {
                     // Task returned an error
                     tracing::error!("Segment {} failed: {:?}", idx, e);
+                    if e.is_retryable() {
+                        any_retryable = true;
+                    }
                     if restart_without_ranges_reason.is_none() && should_restart_without_ranges(&e)
                     {
                         restart_without_ranges_reason = Some(e.to_string());
@@ -606,8 +616,15 @@ impl SegmentedDownload {
                     ),
                 ));
             }
+            // Preserve retryability: if any segment had a retryable error,
+            // the aggregate should also be retryable so the engine can retry
+            let kind = if any_retryable {
+                NetworkErrorKind::ConnectionReset
+            } else {
+                NetworkErrorKind::Other
+            };
             return Err(EngineError::network(
-                NetworkErrorKind::Other,
+                kind,
                 format!(
                     "Download failed: {} segment(s) failed: {}",
                     segment_errors.len(),
@@ -839,12 +856,7 @@ pub async fn probe_server(
         .header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY)
         .send()
         .await
-        .map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::Other,
-                format!("HEAD request failed: {}", e),
-            )
-        })?;
+        .map_err(EngineError::from)?;
 
     if !response.status().is_success() {
         return Err(EngineError::network(

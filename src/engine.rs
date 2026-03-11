@@ -1098,7 +1098,7 @@ impl DownloadEngine {
                     cancel_token_clone.clone(),
                     saved_segments,
                     progress_callback,
-                    Some(segmented_ref_for_task),
+                    Some(Arc::clone(&segmented_ref_for_task)),
                 )
                 .await;
 
@@ -1156,6 +1156,35 @@ impl DownloadEngine {
                 Err(e) => {
                     let retryable = e.is_retryable();
                     let error_msg = e.to_string();
+
+                    // Save segment progress so retries can resume from where we left off
+                    #[cfg(feature = "http")]
+                    {
+                        let segments: Option<Vec<Segment>> = segmented_ref_for_task
+                            .read()
+                            .as_ref()
+                            .map(|sd| sd.segments_with_progress());
+
+                        if let Some(ref segs) = segments {
+                            // Cache in memory for storage-less resume
+                            {
+                                let mut downloads = engine.downloads.write();
+                                if let Some(download) = downloads.get_mut(&id) {
+                                    download.cached_segments = Some(segs.clone());
+                                }
+                            }
+                            // Persist to database
+                            if let Some(ref storage) = engine.storage {
+                                if let Err(e) = storage.save_segments(id, segs).await {
+                                    tracing::debug!(
+                                        "Failed to persist segments on error for {}: {}",
+                                        id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
 
                     // Update status to error
                     engine.update_state(
