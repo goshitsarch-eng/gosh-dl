@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Recursive HTTP directory mirroring behind the `recursive-http` feature flag
+- `discover_http_recursive()` and `add_http_recursive()` engine APIs
+- Recursive boundary types: `RecursiveOptions`, `RecursiveManifest`, `RecursiveJob`, `TrackedRecursiveJob`, `RecursiveJobStatus`, and `RecursiveJobEvent`
+- Recursive parent job lifecycle APIs: `list_recursive_jobs()`, `recursive_job()`, `cancel_recursive_job()`, `remove_recursive_job()`, and `subscribe_recursive_jobs()`
+- Dedicated recursive parent event stream separate from `DownloadEvent`
+- SQLite schema v4 support for persisted tracked recursive jobs
+
+### Changed
+- Recursive HTTP child downloads now reuse the standard HTTP pipeline while carrying redirect-scope and fail-fast runtime metadata through persistence/restart
+
+### Fixed
+- Recursive enqueue is now transactional: if child creation fails partway through, already-added children are rolled back instead of being left orphaned
+- Recursive redirect scope is enforced during discovery, child downloads, and resumed child downloads restored from storage
+
+### Documentation
+- Updated the README, technical spec, and recursive design/checklist docs to match the current shipped recursive feature set and remaining follow-up work
+
 ## [0.3.2] - 2026-03-11
 
 ### Fixed

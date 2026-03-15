@@ -31,3 +31,9 @@ pub use crate::protocol::{
     TorrentInfo,
     TorrentStatusInfo,
 };
+
+#[cfg(feature = "recursive-http")]
+pub use crate::protocol::{
+    RecursiveEntry, RecursiveJob, RecursiveJobEvent, RecursiveJobProgress, RecursiveJobState,
+    RecursiveJobStatus, RecursiveManifest, RecursiveOptions, TrackedRecursiveJob,
+};

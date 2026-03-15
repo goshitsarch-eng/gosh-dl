@@ -7,9 +7,12 @@ use crate::error::{EngineError, Result};
 use crate::types::{
     DownloadId, DownloadKind, DownloadMetadata, DownloadProgress, DownloadState, DownloadStatus,
 };
+#[cfg(feature = "recursive-http")]
+use crate::types::TrackedRecursiveJob;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -76,7 +79,7 @@ impl SqliteStorage {
 }
 
 /// Current schema version — bump when adding migrations
-const CURRENT_SCHEMA_VERSION: u32 = 2;
+const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Database schema v1
 const SCHEMA_V1: &str = r#"
@@ -178,6 +181,27 @@ fn migrate(conn: &Connection) -> std::result::Result<(), rusqlite::Error> {
         // On fresh databases v1 already ran, so the table exists but lacks this column.
         conn.execute_batch("ALTER TABLE downloads ADD COLUMN torrent_data BLOB")?;
         conn.pragma_update(None, "user_version", 2)?;
+    }
+
+    if version < 3 {
+        // Add engine runtime metadata sidecar for resumable per-download context.
+        conn.execute_batch("ALTER TABLE downloads ADD COLUMN runtime_metadata_json TEXT")?;
+        conn.pragma_update(None, "user_version", 3)?;
+    }
+
+    if version < 4 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS recursive_jobs (
+                id TEXT PRIMARY KEY,
+                root_url TEXT NOT NULL,
+                child_ids_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_recursive_jobs_created_at ON recursive_jobs(created_at);
+            "#,
+        )?;
+        conn.pragma_update(None, "user_version", 4)?;
     }
 
     debug_assert_eq!(
@@ -576,6 +600,180 @@ impl Storage for SqliteStorage {
         })
         .await
         .map_err(|e| EngineError::Database(format!("Failed to load torrent data: {}", e)))?
+    }
+
+    async fn save_runtime_metadata(&self, id: DownloadId, runtime_json: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let id_str = id.as_uuid().to_string();
+        let runtime_json = runtime_json.to_string();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE downloads SET runtime_metadata_json = ?1 WHERE id = ?2",
+                params![runtime_json, id_str],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| EngineError::Database(format!("Failed to save runtime metadata: {}", e)))?
+    }
+
+    async fn load_runtime_metadata(&self, id: DownloadId) -> Result<Option<String>> {
+        let conn = self.conn.clone();
+        let id_str = id.as_uuid().to_string();
+
+        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT runtime_metadata_json FROM downloads WHERE id = ?1",
+                params![id_str],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+        .map_err(|e| EngineError::Database(format!("Failed to load runtime metadata: {}", e)))?
+    }
+
+    async fn load_all_runtime_metadata(&self) -> Result<HashMap<DownloadId, String>> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<HashMap<DownloadId, String>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, runtime_metadata_json
+                FROM downloads
+                WHERE runtime_metadata_json IS NOT NULL
+                "#,
+            )?;
+
+            let rows = stmt.query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let runtime_json: String = row.get(1)?;
+                Ok((id_str, runtime_json))
+            })?;
+
+            let mut results = HashMap::new();
+            for row in rows {
+                let (id_str, runtime_json) = row?;
+                let uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                results.insert(DownloadId::from_uuid(uuid), runtime_json);
+            }
+
+            Ok(results)
+        })
+        .await
+        .map_err(|e| EngineError::Database(format!("Failed to load runtime metadata: {}", e)))?
+    }
+
+    #[cfg(feature = "recursive-http")]
+    async fn save_recursive_job(&self, job: &TrackedRecursiveJob) -> Result<()> {
+        let conn = self.conn.clone();
+        let job = job.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.blocking_lock();
+            let child_ids_json = serde_json::to_string(&job.child_ids)
+                .map_err(|e| EngineError::Database(format!("Failed to serialize child ids: {}", e)))?;
+            conn.execute(
+                r#"
+                INSERT INTO recursive_jobs (id, root_url, child_ids_json, created_at)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(id) DO UPDATE SET
+                    root_url = excluded.root_url,
+                    child_ids_json = excluded.child_ids_json,
+                    created_at = excluded.created_at
+                "#,
+                params![
+                    job.id.to_string(),
+                    job.root_url,
+                    child_ids_json,
+                    job.created_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| EngineError::Database(format!("Failed to save recursive job: {}", e)))?
+    }
+
+    #[cfg(feature = "recursive-http")]
+    async fn load_recursive_jobs(&self) -> Result<Vec<TrackedRecursiveJob>> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<TrackedRecursiveJob>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, root_url, child_ids_json, created_at
+                FROM recursive_jobs
+                ORDER BY created_at DESC
+                "#,
+            )?;
+
+            let rows = stmt.query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let root_url: String = row.get(1)?;
+                let child_ids_json: String = row.get(2)?;
+                let created_at_str: String = row.get(3)?;
+                Ok((id_str, root_url, child_ids_json, created_at_str))
+            })?;
+
+            let mut jobs = Vec::new();
+            for row in rows {
+                let (id_str, root_url, child_ids_json, created_at_str) = row?;
+                let id = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+                    EngineError::Database(format!("Invalid recursive job id '{}': {}", id_str, e))
+                })?;
+                let child_ids = serde_json::from_str(&child_ids_json).map_err(|e| {
+                    EngineError::Database(format!(
+                        "Failed to deserialize recursive child ids for {}: {}",
+                        id, e
+                    ))
+                })?;
+                let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| {
+                        EngineError::Database(format!(
+                            "Invalid recursive job timestamp for {}: {}",
+                            id, e
+                        ))
+                    })?;
+                jobs.push(TrackedRecursiveJob {
+                    id,
+                    root_url,
+                    child_ids,
+                    created_at,
+                });
+            }
+
+            Ok(jobs)
+        })
+        .await
+        .map_err(|e| EngineError::Database(format!("Failed to load recursive jobs: {}", e)))?
+    }
+
+    #[cfg(feature = "recursive-http")]
+    async fn delete_recursive_job(&self, id: uuid::Uuid) -> Result<()> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.blocking_lock();
+            conn.execute("DELETE FROM recursive_jobs WHERE id = ?1", params![id_str])?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| EngineError::Database(format!("Failed to delete recursive job: {}", e)))?
     }
 
     async fn health_check(&self) -> Result<()> {
@@ -1099,22 +1297,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_schema_v1_to_v2_migration() {
+    async fn test_runtime_metadata_persistence() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let status = create_test_status();
+        let id = status.id;
+
+        storage.save_download(&status).await.unwrap();
+        storage
+            .save_runtime_metadata(id, r#"{"recursive_child":{"fail_fast":true}}"#)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.load_runtime_metadata(id).await.unwrap().as_deref(),
+            Some(r#"{"recursive_child":{"fail_fast":true}}"#)
+        );
+        assert!(storage
+            .load_all_runtime_metadata()
+            .await
+            .unwrap()
+            .contains_key(&id));
+    }
+
+    #[cfg(feature = "recursive-http")]
+    #[tokio::test]
+    async fn test_recursive_job_persistence() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let job = TrackedRecursiveJob {
+            id: uuid::Uuid::new_v4(),
+            root_url: "https://example.com/pub/".to_string(),
+            child_ids: vec![DownloadId::new(), DownloadId::new()],
+            created_at: Utc::now(),
+        };
+
+        storage.save_recursive_job(&job).await.unwrap();
+
+        let jobs = storage.load_recursive_jobs().await.unwrap();
+        assert_eq!(jobs, vec![job.clone()]);
+
+        storage.delete_recursive_job(job.id).await.unwrap();
+        assert!(storage.load_recursive_jobs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_schema_v1_to_v3_migration() {
         // Simulate a v1 database (tables exist, version = 1, no torrent_data column)
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         conn.execute_batch(SCHEMA_V1).unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
 
-        // Migrate should add the torrent_data column
+        // Migrate should add the torrent_data and runtime metadata columns.
         migrate(&conn).unwrap();
 
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
 
-        // Verify the column exists by inserting and querying
+        // Verify both columns exist by inserting and querying.
         conn.execute(
             "INSERT INTO downloads (id, kind, state, name, save_dir, created_at) VALUES (?1, 'http', 'queued', 'test', '/tmp', '2024-01-01T00:00:00Z')",
             params!["test-id"],
@@ -1122,6 +1363,11 @@ mod tests {
         conn.execute(
             "UPDATE downloads SET torrent_data = ?1 WHERE id = 'test-id'",
             params![vec![1u8, 2, 3]],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE downloads SET runtime_metadata_json = ?1 WHERE id = 'test-id'",
+            params![r#"{"recursive_child":{"fail_fast":true}}"#],
         )
         .unwrap();
         let data: Option<Vec<u8>> = conn
@@ -1132,5 +1378,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(data.unwrap(), vec![1u8, 2, 3]);
+        let runtime: Option<String> = conn
+            .query_row(
+                "SELECT runtime_metadata_json FROM downloads WHERE id = 'test-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.as_deref(),
+            Some(r#"{"recursive_child":{"fail_fast":true}}"#)
+        );
+
+        conn.execute(
+            "INSERT INTO recursive_jobs (id, root_url, child_ids_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "job-id",
+                "https://example.com/pub/",
+                r#"["0000000000000000"]"#,
+                "2024-01-01T00:00:00Z"
+            ],
+        )
+        .unwrap();
+        let root_url: String = conn
+            .query_row(
+                "SELECT root_url FROM recursive_jobs WHERE id = 'job-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_url, "https://example.com/pub/");
     }
 }

@@ -75,6 +75,7 @@ tracing = "0.1"
 
 # URL parsing
 url = "2"
+scraper = { version = "0.23", optional = true }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -89,6 +90,7 @@ tracing-subscriber = "0.3"
 [features]
 default = ["http", "torrent", "storage"]
 http = ["dep:reqwest"]
+recursive-http = ["http", "dep:scraper"]
 torrent = [
     "dep:reqwest",
     "dep:serde_bencode", "dep:bitvec",

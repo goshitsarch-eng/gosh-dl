@@ -218,6 +218,36 @@ impl SegmentedDownload {
     where
         F: Fn(DownloadProgress) + Send + Sync + 'static,
     {
+        self.start_with_scope(
+            client,
+            user_agent,
+            headers,
+            max_connections,
+            retry_policy,
+            #[cfg(feature = "recursive-http")]
+            None,
+            cancel_token,
+            progress_callback,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_with_scope<F>(
+        &self,
+        client: &Client,
+        user_agent: &str,
+        headers: &[(String, String)],
+        max_connections: usize,
+        retry_policy: &RetryPolicy,
+        #[cfg(feature = "recursive-http")]
+        redirect_scope: Option<super::crawl::RedirectScope>,
+        cancel_token: CancellationToken,
+        progress_callback: F,
+    ) -> Result<()>
+    where
+        F: Fn(DownloadProgress) + Send + Sync + 'static,
+    {
         // Create/open the file and pre-allocate space
         let file = self.prepare_file().await?;
         let file = Arc::new(tokio::sync::Mutex::new(file));
@@ -262,6 +292,8 @@ impl SegmentedDownload {
             let bytes_since_progress = Arc::clone(&bytes_since_progress);
             let total_size = self.total_size;
             let retry_policy = retry_policy.clone();
+            #[cfg(feature = "recursive-http")]
+            let redirect_scope = redirect_scope.clone();
 
             let handle = tokio::spawn(async move {
                 // Acquire permit
@@ -347,6 +379,10 @@ impl SegmentedDownload {
                             break 'retry Err(err);
                         }
                     };
+                    #[cfg(feature = "recursive-http")]
+                    if let Some(scope) = redirect_scope.as_ref() {
+                        super::crawl::validate_redirect_scope(response.url(), scope)?;
+                    }
 
                     let status = response.status();
 

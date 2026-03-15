@@ -11,7 +11,10 @@ pub use sqlite::SqliteStorage;
 
 use crate::error::Result;
 use crate::types::{DownloadId, DownloadStatus};
+#[cfg(feature = "recursive-http")]
+use crate::types::TrackedRecursiveJob;
 use async_trait::async_trait;
+use std::collections::HashMap;
 
 /// Segment state for HTTP multi-connection downloads
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +105,42 @@ pub trait Storage: Send + Sync {
     /// Load raw torrent data for crash recovery
     async fn load_torrent_data(&self, id: DownloadId) -> Result<Option<Vec<u8>>>;
 
+    /// Save engine-specific runtime metadata for a download.
+    ///
+    /// This is intended for resumable execution context that should not become
+    /// part of the public `DownloadStatus` boundary.
+    async fn save_runtime_metadata(&self, _id: DownloadId, _runtime_json: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Load engine-specific runtime metadata for a download.
+    async fn load_runtime_metadata(&self, _id: DownloadId) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Load all persisted runtime metadata keyed by download ID.
+    async fn load_all_runtime_metadata(&self) -> Result<HashMap<DownloadId, String>> {
+        Ok(HashMap::new())
+    }
+
+    /// Save a tracked recursive job record.
+    #[cfg(feature = "recursive-http")]
+    async fn save_recursive_job(&self, _job: &TrackedRecursiveJob) -> Result<()> {
+        Ok(())
+    }
+
+    /// Load all tracked recursive job records.
+    #[cfg(feature = "recursive-http")]
+    async fn load_recursive_jobs(&self) -> Result<Vec<TrackedRecursiveJob>> {
+        Ok(Vec::new())
+    }
+
+    /// Delete a tracked recursive job record.
+    #[cfg(feature = "recursive-http")]
+    async fn delete_recursive_job(&self, _id: uuid::Uuid) -> Result<()> {
+        Ok(())
+    }
+
     /// Check if database is healthy
     async fn health_check(&self) -> Result<()>;
 
@@ -115,6 +154,9 @@ pub struct MemoryStorage {
     downloads: parking_lot::RwLock<std::collections::HashMap<DownloadId, DownloadStatus>>,
     segments: parking_lot::RwLock<std::collections::HashMap<DownloadId, Vec<Segment>>>,
     torrent_data: parking_lot::RwLock<std::collections::HashMap<DownloadId, Vec<u8>>>,
+    runtime_metadata: parking_lot::RwLock<HashMap<DownloadId, String>>,
+    #[cfg(feature = "recursive-http")]
+    recursive_jobs: parking_lot::RwLock<HashMap<uuid::Uuid, TrackedRecursiveJob>>,
 }
 
 impl MemoryStorage {
@@ -141,6 +183,7 @@ impl Storage for MemoryStorage {
     async fn delete_download(&self, id: DownloadId) -> Result<()> {
         self.downloads.write().remove(&id);
         self.segments.write().remove(&id);
+        self.runtime_metadata.write().remove(&id);
         Ok(())
     }
 
@@ -167,6 +210,38 @@ impl Storage for MemoryStorage {
         Ok(self.torrent_data.read().get(&id).cloned())
     }
 
+    async fn save_runtime_metadata(&self, id: DownloadId, runtime_json: &str) -> Result<()> {
+        self.runtime_metadata
+            .write()
+            .insert(id, runtime_json.to_string());
+        Ok(())
+    }
+
+    async fn load_runtime_metadata(&self, id: DownloadId) -> Result<Option<String>> {
+        Ok(self.runtime_metadata.read().get(&id).cloned())
+    }
+
+    async fn load_all_runtime_metadata(&self) -> Result<HashMap<DownloadId, String>> {
+        Ok(self.runtime_metadata.read().clone())
+    }
+
+    #[cfg(feature = "recursive-http")]
+    async fn save_recursive_job(&self, job: &TrackedRecursiveJob) -> Result<()> {
+        self.recursive_jobs.write().insert(job.id, job.clone());
+        Ok(())
+    }
+
+    #[cfg(feature = "recursive-http")]
+    async fn load_recursive_jobs(&self) -> Result<Vec<TrackedRecursiveJob>> {
+        Ok(self.recursive_jobs.read().values().cloned().collect())
+    }
+
+    #[cfg(feature = "recursive-http")]
+    async fn delete_recursive_job(&self, id: uuid::Uuid) -> Result<()> {
+        self.recursive_jobs.write().remove(&id);
+        Ok(())
+    }
+
     async fn health_check(&self) -> Result<()> {
         Ok(())
     }
@@ -182,6 +257,8 @@ mod tests {
     use crate::types::{DownloadKind, DownloadMetadata, DownloadProgress, DownloadState};
     use chrono::Utc;
     use std::path::PathBuf;
+    #[cfg(feature = "recursive-http")]
+    use uuid::Uuid;
 
     fn create_test_status() -> DownloadStatus {
         DownloadStatus {
@@ -262,6 +339,52 @@ mod tests {
         storage.delete_segments(id).await.unwrap();
         let loaded = storage.load_segments(id).await.unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_runtime_metadata_storage() {
+        let storage = MemoryStorage::new();
+        let status = create_test_status();
+        let id = status.id;
+
+        storage.save_download(&status).await.unwrap();
+        storage
+            .save_runtime_metadata(id, r#"{"recursive_child":{"fail_fast":true}}"#)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.load_runtime_metadata(id).await.unwrap().as_deref(),
+            Some(r#"{"recursive_child":{"fail_fast":true}}"#)
+        );
+        assert!(storage
+            .load_all_runtime_metadata()
+            .await
+            .unwrap()
+            .contains_key(&id));
+
+        storage.delete_download(id).await.unwrap();
+        assert!(storage.load_runtime_metadata(id).await.unwrap().is_none());
+    }
+
+    #[cfg(feature = "recursive-http")]
+    #[tokio::test]
+    async fn test_recursive_job_storage() {
+        let storage = MemoryStorage::new();
+        let job = crate::types::TrackedRecursiveJob {
+            id: Uuid::new_v4(),
+            root_url: "https://example.com/pub/".to_string(),
+            child_ids: vec![DownloadId::new(), DownloadId::new()],
+            created_at: Utc::now(),
+        };
+
+        storage.save_recursive_job(&job).await.unwrap();
+
+        let jobs = storage.load_recursive_jobs().await.unwrap();
+        assert_eq!(jobs, vec![job.clone()]);
+
+        storage.delete_recursive_job(job.id).await.unwrap();
+        assert!(storage.load_recursive_jobs().await.unwrap().is_empty());
     }
 
     #[test]

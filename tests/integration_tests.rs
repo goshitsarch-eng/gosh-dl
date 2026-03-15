@@ -9,6 +9,10 @@ use gosh_dl::{
     DownloadEngine, DownloadEvent, DownloadOptions, DownloadProgress, DownloadState, EngineConfig,
     HttpConfig,
 };
+#[cfg(feature = "recursive-http")]
+use gosh_dl::{RecursiveJobEvent, RecursiveOptions};
+#[cfg(feature = "storage")]
+use gosh_dl::{SqliteStorage, Storage};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
@@ -39,6 +43,25 @@ async fn create_test_engine(temp_dir: &TempDir) -> std::sync::Arc<DownloadEngine
         .expect("Failed to create engine")
 }
 
+#[cfg(feature = "storage")]
+async fn create_persistent_test_engine(
+    temp_dir: &TempDir,
+    database_name: &str,
+    max_concurrent_downloads: usize,
+) -> std::sync::Arc<DownloadEngine> {
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        database_path: Some(temp_dir.path().join(database_name)),
+        max_concurrent_downloads,
+        max_connections_per_download: 4,
+        min_segment_size: 1024 * 1024,
+        ..Default::default()
+    };
+    DownloadEngine::new(config)
+        .await
+        .expect("Failed to create persistent engine")
+}
+
 /// Helper to wait for a specific event type
 async fn wait_for_event<F>(
     rx: &mut broadcast::Receiver<DownloadEvent>,
@@ -47,6 +70,28 @@ async fn wait_for_event<F>(
 ) -> Option<DownloadEvent>
 where
     F: Fn(&DownloadEvent) -> bool,
+{
+    let result = timeout(timeout_duration, async {
+        loop {
+            match rx.recv().await {
+                Ok(event) if predicate(&event) => return Some(event),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    })
+    .await;
+    result.unwrap_or(None)
+}
+
+#[cfg(feature = "recursive-http")]
+async fn wait_for_recursive_event<F>(
+    rx: &mut broadcast::Receiver<RecursiveJobEvent>,
+    predicate: F,
+    timeout_duration: Duration,
+) -> Option<RecursiveJobEvent>
+where
+    F: Fn(&RecursiveJobEvent) -> bool,
 {
     let result = timeout(timeout_duration, async {
         loop {
@@ -81,6 +126,74 @@ fn assert_all_progress_invariants(progress_events: &[DownloadProgress]) {
     for progress in progress_events {
         assert_progress_invariant(progress);
     }
+}
+
+#[cfg(feature = "recursive-http")]
+async fn wait_for_downloads_to_complete(engine: &std::sync::Arc<DownloadEngine>, ids: &[gosh_dl::DownloadId]) {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let statuses = ids
+                .iter()
+                .filter_map(|id| engine.status(*id))
+                .collect::<Vec<_>>();
+            if statuses.len() == ids.len()
+                && statuses
+                    .iter()
+                    .all(|status| matches!(status.state, DownloadState::Completed))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("recursive downloads should complete");
+}
+
+#[cfg(feature = "recursive-http")]
+async fn wait_for_downloads_to_finish(
+    engine: &std::sync::Arc<DownloadEngine>,
+    ids: &[gosh_dl::DownloadId],
+) {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let statuses = ids
+                .iter()
+                .filter_map(|id| engine.status(*id))
+                .collect::<Vec<_>>();
+            if statuses.len() == ids.len()
+                && statuses.iter().all(|status| {
+                    matches!(
+                        status.state,
+                        DownloadState::Completed | DownloadState::Error { .. }
+                    )
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("recursive downloads should reach a terminal state");
+}
+
+#[cfg(feature = "recursive-http")]
+fn child_id_by_filename(
+    engine: &std::sync::Arc<DownloadEngine>,
+    ids: &[gosh_dl::DownloadId],
+    filename: &str,
+) -> gosh_dl::DownloadId {
+    ids.iter()
+        .copied()
+        .find(|id| {
+            engine
+                .status(*id)
+                .and_then(|status| status.metadata.filename)
+                .as_deref()
+                == Some(filename)
+        })
+        .unwrap_or_else(|| panic!("missing child id for filename {filename}"))
 }
 
 // =============================================================================
@@ -278,6 +391,918 @@ async fn test_download_content_disposition_filename() {
     );
 
     engine.shutdown().await.ok();
+}
+
+#[cfg(feature = "recursive-http")]
+#[tokio::test]
+async fn test_recursive_download_downloads_nested_files() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(
+                    r#"
+                    <html><body>
+                        <a href="readme.txt">readme.txt</a>
+                        <a href="releases/">releases/</a>
+                    </body></html>
+                    "#,
+                ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/releases/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(r#"<html><body><a href="app.tar.gz">app.tar.gz</a></body></html>"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    for file_path in ["/pub/readme.txt", "/pub/releases/app.tar.gz"] {
+        Mock::given(method("HEAD"))
+            .and(path(file_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", "11")
+                    .insert_header("Accept-Ranges", "bytes"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(file_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", "11")
+                    .set_body_bytes(b"hello world".to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+    }
+
+    let engine = create_test_engine(&temp_dir).await;
+    let job = engine
+        .add_http_recursive(
+            &format!("{}/pub/", mock_server.uri()),
+            DownloadOptions::default(),
+            RecursiveOptions::default(),
+        )
+        .await
+        .expect("Failed to add recursive download");
+
+    assert_eq!(job.child_ids.len(), 2);
+    wait_for_downloads_to_complete(&engine, &job.child_ids).await;
+
+    assert_eq!(
+        tokio::fs::read_to_string(temp_dir.path().join("readme.txt"))
+            .await
+            .expect("Should read root file"),
+        "hello world"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(temp_dir.path().join("releases").join("app.tar.gz"))
+            .await
+            .expect("Should read nested file"),
+        "hello world"
+    );
+
+    let job_status = engine.recursive_job_status(&job);
+    assert_eq!(job_status.state, gosh_dl::RecursiveJobState::Completed);
+    assert_eq!(job_status.progress.total_children, 2);
+    assert_eq!(job_status.progress.completed_children, 2);
+    assert_eq!(job_status.progress.failed_children, 0);
+
+    engine.shutdown().await.ok();
+}
+
+#[cfg(feature = "recursive-http")]
+#[tokio::test]
+async fn test_recursive_discovery_rejects_redirect_out_of_scope() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(r#"<html><body><a href="nested/">nested/</a></body></html>"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/nested/"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/elsewhere/", mock_server.uri())),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/elsewhere/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(r#"<html><body><a href="file.txt">file.txt</a></body></html>"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let err = engine
+        .discover_http_recursive(
+            &format!("{}/pub/", mock_server.uri()),
+            &DownloadOptions::default(),
+            &RecursiveOptions::default(),
+        )
+        .await
+        .expect_err("redirect out of scope should fail");
+
+    assert!(
+        err.to_string().contains("redirect escaped recursive scope"),
+        "unexpected error: {err}"
+    );
+
+    engine.shutdown().await.ok();
+}
+
+#[cfg(feature = "recursive-http")]
+#[tokio::test]
+async fn test_recursive_discovery_rejects_colliding_relative_paths() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(
+                    r#"
+                    <html><body>
+                        <a href="file.txt?one">first</a>
+                        <a href="file.txt?two">second</a>
+                    </body></html>
+                    "#,
+                ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let err = engine
+        .discover_http_recursive(
+            &format!("{}/pub/", mock_server.uri()),
+            &DownloadOptions::default(),
+            &RecursiveOptions::default(),
+        )
+        .await
+        .expect_err("colliding paths should fail");
+
+    assert!(
+        matches!(err, gosh_dl::EngineError::AlreadyExists(_)),
+        "unexpected error: {err}"
+    );
+
+    engine.shutdown().await.ok();
+}
+
+#[cfg(feature = "recursive-http")]
+#[tokio::test]
+async fn test_recursive_child_download_rejects_redirect_out_of_scope() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(r#"<html><body><a href="file.txt">file.txt</a></body></html>"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/pub/file.txt"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/elsewhere/file.txt", mock_server.uri())),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/elsewhere/file.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let mut events = engine.subscribe();
+
+    let job = engine
+        .add_http_recursive(
+            &format!("{}/pub/", mock_server.uri()),
+            DownloadOptions::default(),
+            RecursiveOptions::default(),
+        )
+        .await
+        .expect("recursive job should be created");
+
+    assert_eq!(job.child_ids.len(), 1);
+    let child_id = job.child_ids[0];
+
+    let failed = wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Failed { id, .. } if *id == child_id),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(failed.is_some(), "child download should fail");
+    let status = engine.status(child_id).expect("child status should exist");
+    assert!(matches!(status.state, DownloadState::Error { .. }));
+    assert!(
+        !temp_dir.path().join("file.txt").exists(),
+        "out-of-scope redirect should not write the target file"
+    );
+
+    engine.shutdown().await.ok();
+}
+
+#[cfg(feature = "recursive-http")]
+#[tokio::test]
+async fn test_recursive_without_fail_fast_allows_other_children_to_finish() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(
+                    r#"<html><body><a href="bad.txt">bad.txt</a><a href="slow.txt">slow.txt</a></body></html>"#,
+                ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/pub/bad.txt"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/elsewhere/bad.txt", mock_server.uri())),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/elsewhere/bad.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "3")
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/pub/slow.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/slow.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .set_body_bytes(b"hello world".to_vec())
+                .set_delay(Duration::from_millis(250)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let job = engine
+        .add_http_recursive(
+            &format!("{}/pub/", mock_server.uri()),
+            DownloadOptions::default(),
+            RecursiveOptions::default(),
+        )
+        .await
+        .expect("recursive job should be created");
+
+    let bad_id = child_id_by_filename(&engine, &job.child_ids, "bad.txt");
+    let slow_id = child_id_by_filename(&engine, &job.child_ids, "slow.txt");
+
+    wait_for_downloads_to_finish(&engine, &job.child_ids).await;
+
+    assert!(matches!(
+        engine.status(bad_id).expect("bad child status").state,
+        DownloadState::Error { .. }
+    ));
+    assert_eq!(
+        engine.status(slow_id).expect("slow child status").state,
+        DownloadState::Completed
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(temp_dir.path().join("slow.txt"))
+            .await
+            .expect("slow child should complete"),
+        "hello world"
+    );
+    assert!(
+        !temp_dir.path().join("bad.txt").exists(),
+        "bad child should not produce a file"
+    );
+
+    let job_status = engine.recursive_job_status(&job);
+    assert_eq!(job_status.state, gosh_dl::RecursiveJobState::Partial);
+    assert_eq!(job_status.progress.total_children, 2);
+    assert_eq!(job_status.progress.completed_children, 1);
+    assert_eq!(job_status.progress.failed_children, 1);
+    assert_eq!(job_status.progress.missing_children, 0);
+
+    engine.shutdown().await.ok();
+}
+
+#[cfg(feature = "recursive-http")]
+#[tokio::test]
+async fn test_recursive_fail_fast_stops_other_children() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(
+                    r#"<html><body><a href="bad.txt">bad.txt</a><a href="slow.txt">slow.txt</a></body></html>"#,
+                ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/pub/bad.txt"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/elsewhere/bad.txt", mock_server.uri())),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/elsewhere/bad.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "3")
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/pub/slow.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/slow.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .set_body_bytes(b"hello world".to_vec())
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let job = engine
+        .add_http_recursive(
+            &format!("{}/pub/", mock_server.uri()),
+            DownloadOptions::default(),
+            RecursiveOptions {
+                fail_fast: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("recursive job should be created");
+
+    let bad_id = child_id_by_filename(&engine, &job.child_ids, "bad.txt");
+    let slow_id = child_id_by_filename(&engine, &job.child_ids, "slow.txt");
+
+    wait_for_downloads_to_finish(&engine, &job.child_ids).await;
+
+    assert!(matches!(
+        engine.status(bad_id).expect("bad child status").state,
+        DownloadState::Error { .. }
+    ));
+    match engine.status(slow_id).expect("slow child status").state {
+        DownloadState::Error { kind, message, retryable } => {
+            assert_eq!(kind, "RecursiveFailFast");
+            assert!(
+                message.contains(&bad_id.to_string()),
+                "fail-fast error should identify the triggering child: {message}"
+            );
+            assert!(!retryable, "fail-fast should not be retryable");
+        }
+        other => panic!("slow child should fail fast, got {other:?}"),
+    }
+    assert!(
+        !temp_dir.path().join("slow.txt").exists(),
+        "slow child should not complete once fail-fast triggers"
+    );
+
+    let job_status = engine.recursive_job_status(&job);
+    assert_eq!(job_status.state, gosh_dl::RecursiveJobState::Failed);
+    assert_eq!(job_status.progress.total_children, 2);
+    assert_eq!(job_status.progress.completed_children, 0);
+    assert_eq!(job_status.progress.failed_children, 2);
+
+    engine.shutdown().await.ok();
+}
+
+#[cfg(all(feature = "recursive-http", feature = "storage"))]
+#[tokio::test]
+async fn test_recursive_child_redirect_scope_persists_across_restart() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(r#"<html><body><a href="file.txt">file.txt</a></body></html>"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/pub/file.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(2))
+                .insert_header("Content-Length", "11")
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/file.txt"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/elsewhere/file.txt", mock_server.uri())),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/elsewhere/file.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .set_body_bytes(b"hello world".to_vec()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let child_id = {
+        let engine = create_persistent_test_engine(&temp_dir, "recursive.sqlite", 1).await;
+
+        let job = engine
+            .add_http_recursive(
+                &format!("{}/pub/", mock_server.uri()),
+                DownloadOptions::default(),
+                RecursiveOptions::default(),
+            )
+            .await
+            .expect("recursive job should be created");
+
+        assert_eq!(job.child_ids.len(), 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        engine.shutdown().await.ok();
+        job.child_ids[0]
+    };
+
+    let storage = SqliteStorage::new(temp_dir.path().join("recursive.sqlite"))
+        .await
+        .expect("should open persisted sqlite db");
+    assert!(
+        storage
+            .load_runtime_metadata(child_id)
+            .await
+            .expect("should load runtime metadata")
+            .is_some(),
+        "recursive child runtime metadata should be persisted"
+    );
+
+    let resumed_engine = create_persistent_test_engine(&temp_dir, "recursive.sqlite", 1).await;
+    let mut events = resumed_engine.subscribe();
+    assert_eq!(
+        resumed_engine
+            .status(child_id)
+            .expect("child status should be restored")
+            .state,
+        DownloadState::Paused
+    );
+
+    resumed_engine
+        .resume(child_id)
+        .await
+        .expect("resumed child should start");
+
+    let failed = wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Failed { id, .. } if *id == child_id),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let child_status = resumed_engine.status(child_id).expect("child status");
+    assert!(
+        failed.is_some(),
+        "resumed child should still fail out of scope, got state {:?}",
+        child_status.state
+    );
+    assert!(matches!(child_status.state, DownloadState::Error { .. }));
+    assert!(
+        !temp_dir.path().join("file.txt").exists(),
+        "persisted redirect scope should still block the redirected child"
+    );
+
+    resumed_engine.shutdown().await.ok();
+}
+
+#[cfg(all(feature = "recursive-http", feature = "storage"))]
+#[tokio::test]
+async fn test_tracked_recursive_jobs_persist_across_restart() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(
+                    r#"<html><body><a href="readme.txt">readme.txt</a><a href="nested/">nested/</a></body></html>"#,
+                ),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/nested/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(r#"<html><body><a href="file.txt">file.txt</a></body></html>"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    for file_path in ["/pub/readme.txt", "/pub/nested/file.txt"] {
+        Mock::given(method("HEAD"))
+            .and(path(file_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", "11")
+                    .insert_header("Accept-Ranges", "bytes"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(file_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", "11")
+                    .set_body_bytes(b"hello world".to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+    }
+
+    let root_url = format!("{}/pub/", mock_server.uri());
+    {
+        let engine = create_persistent_test_engine(&temp_dir, "tracked-recursive.sqlite", 4).await;
+        let job = engine
+            .add_http_recursive(
+                &root_url,
+                DownloadOptions::default(),
+                RecursiveOptions::default(),
+            )
+            .await
+            .expect("recursive job should be created");
+        wait_for_downloads_to_complete(&engine, &job.child_ids).await;
+        engine.shutdown().await.ok();
+    }
+
+    let resumed_engine =
+        create_persistent_test_engine(&temp_dir, "tracked-recursive.sqlite", 4).await;
+    let jobs = resumed_engine.list_recursive_jobs();
+    assert_eq!(jobs.len(), 1, "one tracked recursive job should be restored");
+
+    let tracked_job = &jobs[0];
+    assert_eq!(tracked_job.root_url, root_url);
+    assert_eq!(tracked_job.child_ids.len(), 2);
+
+    let aggregate = resumed_engine.recursive_job_status(&tracked_job.as_job());
+    assert_eq!(aggregate.state, gosh_dl::RecursiveJobState::Completed);
+    assert_eq!(aggregate.progress.total_children, 2);
+    assert_eq!(aggregate.progress.completed_children, 2);
+
+    resumed_engine.shutdown().await.ok();
+}
+
+#[cfg(feature = "recursive-http")]
+#[tokio::test]
+async fn test_cancel_recursive_job_keeps_tracked_record() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(r#"<html><body><a href="slow.txt">slow.txt</a></body></html>"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/pub/slow.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/slow.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .set_body_bytes(b"hello world".to_vec())
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let job = engine
+        .add_http_recursive(
+            &format!("{}/pub/", mock_server.uri()),
+            DownloadOptions::default(),
+            RecursiveOptions::default(),
+        )
+        .await
+        .expect("recursive job should be created");
+
+    let tracked_jobs = engine.list_recursive_jobs();
+    assert_eq!(tracked_jobs.len(), 1);
+    let tracked_job = tracked_jobs[0].clone();
+    assert_eq!(tracked_job.child_ids, job.child_ids);
+
+    engine
+        .cancel_recursive_job(tracked_job.id, false)
+        .await
+        .expect("cancel recursive job should succeed");
+
+    assert!(engine.status(job.child_ids[0]).is_none());
+    let remaining_jobs = engine.list_recursive_jobs();
+    assert_eq!(remaining_jobs.len(), 1, "tracked record should remain");
+    let aggregate = engine.recursive_job_status(&remaining_jobs[0].as_job());
+    assert_eq!(aggregate.state, gosh_dl::RecursiveJobState::Failed);
+    assert_eq!(aggregate.progress.missing_children, 1);
+
+    engine.shutdown().await.ok();
+}
+
+#[cfg(feature = "recursive-http")]
+#[tokio::test]
+async fn test_recursive_job_event_stream_reports_parent_lifecycle() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(r#"<html><body><a href="slow.txt">slow.txt</a></body></html>"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/pub/slow.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/slow.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .set_body_bytes(b"hello world".to_vec())
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let mut recursive_events = engine.subscribe_recursive_jobs();
+
+    let job = engine
+        .add_http_recursive(
+            &format!("{}/pub/", mock_server.uri()),
+            DownloadOptions::default(),
+            RecursiveOptions::default(),
+        )
+        .await
+        .expect("recursive job should be created");
+
+    let tracked_job = engine
+        .list_recursive_jobs()
+        .into_iter()
+        .find(|tracked| tracked.child_ids == job.child_ids)
+        .expect("tracked recursive job should exist");
+
+    let added = wait_for_recursive_event(
+        &mut recursive_events,
+        |event| matches!(event, RecursiveJobEvent::Added { job, .. } if job.id == tracked_job.id),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    match added.expect("added recursive event should be emitted") {
+        RecursiveJobEvent::Added { job, status } => {
+            assert_eq!(job.id, tracked_job.id);
+            assert_eq!(status.progress.total_children, 1);
+            assert_eq!(status.child_ids, tracked_job.child_ids);
+        }
+        other => panic!("unexpected recursive event: {other:?}"),
+    }
+
+    engine
+        .cancel_recursive_job(tracked_job.id, false)
+        .await
+        .expect("cancel recursive job should succeed");
+
+    let updated = wait_for_recursive_event(
+        &mut recursive_events,
+        |event| {
+            matches!(
+                event,
+                RecursiveJobEvent::Updated { job, status }
+                    if job.id == tracked_job.id
+                        && status.state == gosh_dl::RecursiveJobState::Failed
+                        && status.progress.missing_children == 1
+            )
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    match updated.expect("updated recursive event should be emitted") {
+        RecursiveJobEvent::Updated { job, status } => {
+            assert_eq!(job.id, tracked_job.id);
+            assert_eq!(status.progress.total_children, 1);
+            assert_eq!(status.progress.missing_children, 1);
+        }
+        other => panic!("unexpected recursive event: {other:?}"),
+    }
+
+    engine
+        .remove_recursive_job(tracked_job.id, false)
+        .await
+        .expect("remove recursive job should succeed");
+
+    let removed = wait_for_recursive_event(
+        &mut recursive_events,
+        |event| matches!(event, RecursiveJobEvent::Removed { id } if *id == tracked_job.id),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    assert!(
+        matches!(removed, Some(RecursiveJobEvent::Removed { id }) if id == tracked_job.id),
+        "removed recursive event should be emitted"
+    );
+
+    engine.shutdown().await.ok();
+}
+
+#[cfg(all(feature = "recursive-http", feature = "storage"))]
+#[tokio::test]
+async fn test_remove_recursive_job_prunes_persisted_record() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(r#"<html><body><a href="slow.txt">slow.txt</a></body></html>"#),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/pub/slow.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .insert_header("Accept-Ranges", "bytes"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pub/slow.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", "11")
+                .set_body_bytes(b"hello world".to_vec())
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let tracked_job_id = {
+        let engine = create_persistent_test_engine(&temp_dir, "remove-recursive.sqlite", 4).await;
+        engine
+            .add_http_recursive(
+                &format!("{}/pub/", mock_server.uri()),
+                DownloadOptions::default(),
+                RecursiveOptions::default(),
+            )
+            .await
+            .expect("recursive job should be created");
+
+        let tracked_jobs = engine.list_recursive_jobs();
+        assert_eq!(tracked_jobs.len(), 1);
+        let tracked_job_id = tracked_jobs[0].id;
+
+        engine
+            .remove_recursive_job(tracked_job_id, false)
+            .await
+            .expect("remove recursive job should succeed");
+        assert!(engine.list_recursive_jobs().is_empty());
+        engine.shutdown().await.ok();
+        tracked_job_id
+    };
+
+    let resumed_engine =
+        create_persistent_test_engine(&temp_dir, "remove-recursive.sqlite", 4).await;
+    assert!(
+        resumed_engine.recursive_job(tracked_job_id).is_none(),
+        "removed recursive job should not be restored"
+    );
+    assert!(resumed_engine.list_recursive_jobs().is_empty());
+    resumed_engine.shutdown().await.ok();
 }
 
 // =============================================================================

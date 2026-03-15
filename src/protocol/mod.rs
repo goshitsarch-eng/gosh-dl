@@ -13,6 +13,8 @@ mod checksum;
 mod error;
 mod events;
 mod options;
+#[cfg(feature = "recursive-http")]
+mod recursive;
 mod scheduler;
 mod status;
 mod torrent;
@@ -23,6 +25,11 @@ pub use checksum::{ChecksumAlgorithm, ExpectedChecksum};
 pub use error::{ProtocolError, ProtocolResult};
 pub use events::DownloadEvent;
 pub use options::{DownloadOptions, DownloadPriority};
+#[cfg(feature = "recursive-http")]
+pub use recursive::{
+    RecursiveEntry, RecursiveJob, RecursiveJobEvent, RecursiveJobProgress, RecursiveJobState,
+    RecursiveJobStatus, RecursiveManifest, RecursiveOptions, TrackedRecursiveJob,
+};
 pub use scheduler::{BandwidthLimits, ScheduleRule};
 pub use status::{DownloadMetadata, DownloadStatus, GlobalStats};
 pub use torrent::{PeerInfo, TorrentFile, TorrentInfo, TorrentStatusInfo};

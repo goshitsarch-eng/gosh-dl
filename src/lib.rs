@@ -62,6 +62,12 @@ pub use types::{
     TorrentStatusInfo,
 };
 
+#[cfg(feature = "recursive-http")]
+pub use types::{
+    RecursiveEntry, RecursiveJob, RecursiveJobEvent, RecursiveJobProgress, RecursiveJobState,
+    RecursiveJobStatus, RecursiveManifest, RecursiveOptions, TrackedRecursiveJob,
+};
+
 // Storage exports
 #[cfg(feature = "storage")]
 pub use storage::SqliteStorage;

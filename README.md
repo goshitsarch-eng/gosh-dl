@@ -14,7 +14,7 @@ Whether you're building a media application that needs BitTorrent with streaming
 
 The engine handles the complexity of segmented downloads, tracker communication, DHT peer discovery, and connection encryption while exposing a clean, intuitive API that integrates naturally with Tokio-based applications. Priority queues let you control which downloads matter most, bandwidth scheduling adapts to time-of-day constraints, and SQLite persistence ensures nothing is lost across restarts.
 
-A standalone CLI application is coming soon for those who need command-line access to these capabilities.
+A standalone CLI is available in the companion `gosh-dl-cli` project for users who want command-line access to the engine.
 
 ## Features
 
@@ -57,6 +57,7 @@ A standalone CLI application is coming soon for those who need command-line acce
 | uTP transport | 29 | LEDBAT congestion control, wired into peer connections (opt-in) |
 | HTTP resume | — | ETag/Last-Modified validation |
 | Mirror/failover | — | Automatic failover to alternate URLs |
+| Recursive HTTP mirroring | — | Feature-gated via `recursive-http`; crawls HTML directory indexes and expands into ordinary HTTP downloads |
 | Private torrent handling | 27 | Disables DHT/PEX/LPD |
 | Choking algorithm | — | Unchoke rotation, optimistic unchoking |
 
@@ -76,6 +77,14 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 gosh-dl = "0.1"
+tokio = { version = "1", features = ["full"] }
+```
+
+To enable recursive HTTP directory mirroring:
+
+```toml
+[dependencies]
+gosh-dl = { version = "0.1", features = ["recursive-http"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -137,6 +146,41 @@ let stopped = engine.stopped();
 let stats = engine.global_stats();
 ```
 
+With `recursive-http` enabled:
+
+```rust
+let manifest = engine
+    .discover_http_recursive(root_url, &options, &recursive_options)
+    .await?;
+
+let job = engine
+    .add_http_recursive(root_url, options, recursive_options)
+    .await?;
+
+let aggregate = engine.recursive_job_status(&job);
+println!(
+    "{:?} ({}/{})",
+    aggregate.state,
+    aggregate.progress.completed_children,
+    aggregate.progress.total_children,
+);
+
+let tracked = engine.list_recursive_jobs();
+println!("tracked jobs: {}", tracked.len());
+
+if let Some(parent) = tracked.first() {
+    let mut recursive_events = engine.subscribe_recursive_jobs();
+    engine.cancel_recursive_job(parent.id, false).await?;
+    engine.remove_recursive_job(parent.id, false).await?;
+
+    for _ in 0..2 {
+        if let Ok(event) = recursive_events.recv().await {
+            println!("recursive event: {:?}", event);
+        }
+    }
+}
+```
+
 ### Download Options
 
 ```rust
@@ -160,6 +204,44 @@ let options = DownloadOptions {
     ..Default::default()
 };
 ```
+
+### Recursive HTTP
+
+When the `recursive-http` feature is enabled, the engine also exposes `RecursiveOptions`:
+
+```rust
+use gosh_dl::RecursiveOptions;
+
+let recursive = RecursiveOptions {
+    max_depth: 4,
+    include_patterns: vec!["*.txt".to_string()],
+    exclude_patterns: vec!["private/*".to_string()],
+    ..Default::default()
+};
+```
+
+Current scope:
+
+- crawls HTML directory/index pages and follows `<a href>` links
+- same-host only by default
+- constrained to the root path prefix by default
+- discovered files are queued as ordinary HTTP downloads
+- rolls back already-added child downloads if recursive enqueue fails partway through
+- optional `fail_fast` cancels queued/active sibling child downloads after the first child failure
+- persists recursive child runtime context needed for redirect-scope and fail-fast recovery
+- persists tracked parent recursive jobs and restores them on restart
+- exposes aggregate parent status, lifecycle methods, and a dedicated parent event stream
+- propagates headers, cookies, user-agent, and referer during discovery
+
+Current limitations:
+
+- opt-in via the `recursive-http` Cargo feature
+- not full `wget -r` parity
+- no JavaScript rendering
+- recursive parent jobs use a separate event stream via `subscribe_recursive_jobs()`, not the main `DownloadEvent` stream
+- recursive redirect scope is enforced in discovery, child file downloads, and resumed child downloads restored from storage, but recursive jobs are still not resumable as crawls
+- recursive jobs are persisted and listable, but still do not participate in the main download queue/event model as first-class parent downloads
+- no persisted parent-level event or progress history beyond the tracked job record itself
 
 ### Events
 

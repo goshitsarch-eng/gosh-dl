@@ -11,6 +11,8 @@
 
 pub(crate) mod checksum;
 pub(crate) mod connection;
+#[cfg(feature = "recursive-http")]
+pub(crate) mod crawl;
 pub(crate) mod mirror;
 pub(crate) mod resume;
 pub(crate) mod segment;
@@ -143,6 +145,42 @@ impl HttpDownloader {
     where
         F: Fn(DownloadProgress) + Send + Sync + 'static,
     {
+        self.download_with_scope(
+            url,
+            save_dir,
+            filename,
+            user_agent,
+            referer,
+            headers,
+            cookies,
+            checksum,
+            #[cfg(feature = "recursive-http")]
+            None,
+            cancel_token,
+            progress_callback,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn download_with_scope<F>(
+        &self,
+        url: &str,
+        save_dir: &Path,
+        filename: Option<&str>,
+        user_agent: Option<&str>,
+        referer: Option<&str>,
+        headers: &[(String, String)],
+        cookies: Option<&[String]>,
+        checksum: Option<&ExpectedChecksum>,
+        #[cfg(feature = "recursive-http")]
+        redirect_scope: Option<crate::http::crawl::RedirectScope>,
+        cancel_token: CancellationToken,
+        progress_callback: F,
+    ) -> Result<PathBuf>
+    where
+        F: Fn(DownloadProgress) + Send + Sync + 'static,
+    {
         let progress_callback = Arc::new(progress_callback);
         // Build the request
         let mut request = self.client().get(url);
@@ -183,6 +221,10 @@ impl HttpDownloader {
         let (content_length, supports_range, suggested_filename, etag, last_modified) =
             match head_response {
                 Ok(resp) => {
+                    #[cfg(feature = "recursive-http")]
+                    if let Some(scope) = redirect_scope.as_ref() {
+                        crate::http::crawl::validate_redirect_scope(resp.url(), scope)?;
+                    }
                     let length = resp
                         .headers()
                         .get("content-length")
@@ -311,6 +353,10 @@ impl HttpDownloader {
 
             // Send the request
             let response = attempt_request.send().await?;
+            #[cfg(feature = "recursive-http")]
+            if let Some(scope) = redirect_scope.as_ref() {
+                crate::http::crawl::validate_redirect_scope(response.url(), scope)?;
+            }
 
             // Check response status
             let status = response.status();
@@ -652,6 +698,50 @@ impl HttpDownloader {
     where
         F: Fn(DownloadProgress) + Send + Sync + 'static,
     {
+        self.download_segmented_with_scope(
+            url,
+            save_dir,
+            filename,
+            user_agent,
+            referer,
+            headers,
+            cookies,
+            checksum,
+            #[cfg(feature = "recursive-http")]
+            None,
+            max_connections,
+            min_segment_size,
+            cancel_token,
+            saved_segments,
+            progress_callback,
+            segmented_ref,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn download_segmented_with_scope<F>(
+        &self,
+        url: &str,
+        save_dir: &Path,
+        filename: Option<&str>,
+        user_agent: Option<&str>,
+        referer: Option<&str>,
+        headers: &[(String, String)],
+        cookies: Option<&[String]>,
+        checksum: Option<&ExpectedChecksum>,
+        #[cfg(feature = "recursive-http")]
+        redirect_scope: Option<crate::http::crawl::RedirectScope>,
+        max_connections: usize,
+        min_segment_size: u64,
+        cancel_token: CancellationToken,
+        saved_segments: Option<Vec<Segment>>,
+        progress_callback: F,
+        segmented_ref: Option<Arc<RwLock<Option<Arc<SegmentedDownload>>>>>,
+    ) -> Result<(PathBuf, Option<Arc<SegmentedDownload>>)>
+    where
+        F: Fn(DownloadProgress) + Send + Sync + 'static,
+    {
         let progress_callback = Arc::new(progress_callback);
         let ua = user_agent.unwrap_or(&self.config.default_user_agent);
 
@@ -729,12 +819,14 @@ impl HttpDownloader {
 
             // Start download
             let segmented_result = download
-                .start(
+                .start_with_scope(
                     self.client(),
                     ua,
                     &all_headers,
                     max_connections,
                     &self.retry_policy,
+                    #[cfg(feature = "recursive-http")]
+                    redirect_scope.clone(),
                     cancel_token.clone(),
                     {
                         let progress_callback = Arc::clone(&progress_callback);
@@ -755,7 +847,7 @@ impl HttpDownloader {
                     }
                     resume::cleanup_partial(&partial_path_for(&save_path)).await?;
                     let path = self
-                        .download(
+                        .download_with_scope(
                             url,
                             save_dir,
                             Some(&final_filename),
@@ -764,6 +856,8 @@ impl HttpDownloader {
                             headers,
                             cookies,
                             checksum,
+                            #[cfg(feature = "recursive-http")]
+                            redirect_scope,
                             cancel_token,
                             {
                                 let progress_callback = Arc::clone(&progress_callback);
@@ -790,7 +884,7 @@ impl HttpDownloader {
         } else {
             // Fall back to single-connection download
             let path = self
-                .download(
+                .download_with_scope(
                     url,
                     save_dir,
                     Some(&final_filename),
@@ -799,6 +893,8 @@ impl HttpDownloader {
                     headers,
                     cookies,
                     checksum,
+                    #[cfg(feature = "recursive-http")]
+                    redirect_scope,
                     cancel_token,
                     {
                         let progress_callback = Arc::clone(&progress_callback);

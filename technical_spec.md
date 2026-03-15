@@ -41,6 +41,7 @@ src/
 │   ├── mod.rs             # Re-exports all protocol types
 │   ├── types.rs           # DownloadId, DownloadKind, State, Progress
 │   ├── options.rs         # DownloadOptions, DownloadPriority
+│   ├── recursive.rs       # Recursive HTTP discovery/job types (feature-gated)
 │   ├── status.rs          # DownloadStatus, DownloadMetadata, GlobalStats
 │   ├── events.rs          # DownloadEvent enum
 │   ├── torrent.rs         # TorrentInfo, TorrentFile, PeerInfo
@@ -50,6 +51,7 @@ src/
 │
 ├── http/                  # HTTP download engine
 │   ├── mod.rs             # HttpDownloader
+│   ├── crawl.rs           # Recursive HTTP discovery + manifest building (feature-gated)
 │   ├── segment.rs         # Segmented download logic
 │   ├── connection.rs      # Connection pooling, rate limiting
 │   ├── resume.rs          # Resume detection and validation
@@ -143,6 +145,32 @@ impl DownloadEngine {
     pub async fn add_http(&self, url: &str, opts: DownloadOptions) -> Result<DownloadId>;
     pub async fn add_torrent(&self, data: &[u8], opts: DownloadOptions) -> Result<DownloadId>;
     pub async fn add_magnet(&self, uri: &str, opts: DownloadOptions) -> Result<DownloadId>;
+    #[cfg(feature = "recursive-http")]
+    pub async fn discover_http_recursive(
+        &self,
+        root_url: &str,
+        opts: &DownloadOptions,
+        recursive: &RecursiveOptions,
+    ) -> Result<RecursiveManifest>;
+    #[cfg(feature = "recursive-http")]
+    pub async fn add_http_recursive(
+        &self,
+        root_url: &str,
+        opts: DownloadOptions,
+        recursive: RecursiveOptions,
+    ) -> Result<RecursiveJob>;
+    #[cfg(feature = "recursive-http")]
+    pub fn recursive_job_status(&self, job: &RecursiveJob) -> RecursiveJobStatus;
+    #[cfg(feature = "recursive-http")]
+    pub fn list_recursive_jobs(&self) -> Vec<TrackedRecursiveJob>;
+    #[cfg(feature = "recursive-http")]
+    pub fn recursive_job(&self, id: Uuid) -> Option<TrackedRecursiveJob>;
+    #[cfg(feature = "recursive-http")]
+    pub fn subscribe_recursive_jobs(&self) -> broadcast::Receiver<RecursiveJobEvent>;
+    #[cfg(feature = "recursive-http")]
+    pub async fn cancel_recursive_job(&self, id: Uuid, delete_files: bool) -> Result<()>;
+    #[cfg(feature = "recursive-http")]
+    pub async fn remove_recursive_job(&self, id: Uuid, delete_files: bool) -> Result<()>;
 
     // Control
     pub async fn pause(&self, id: DownloadId) -> Result<()>;
@@ -206,6 +234,82 @@ pub enum DownloadEvent {
     Removed { id: DownloadId },
     Paused { id: DownloadId },
     Resumed { id: DownloadId },
+}
+```
+
+### Recursive Types
+
+When `recursive-http` is enabled, the boundary also exposes:
+
+```rust
+pub struct RecursiveOptions {
+    pub max_depth: usize,
+    pub same_host_only: bool,
+    pub allowed_prefix: Option<String>,
+    pub include_patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+    pub preserve_paths: bool,
+    pub overwrite_existing: bool,
+    pub fail_fast: bool,
+    pub max_discovery_concurrency: usize,
+}
+
+pub struct RecursiveManifest {
+    pub root_url: String,
+    pub entries: Vec<RecursiveEntry>,
+}
+
+pub struct RecursiveEntry {
+    pub url: String,
+    pub relative_path: PathBuf,
+    pub size_hint: Option<u64>,
+}
+
+pub struct RecursiveJob {
+    pub root_url: String,
+    pub child_ids: Vec<DownloadId>,
+}
+
+pub struct TrackedRecursiveJob {
+    pub id: Uuid,
+    pub root_url: String,
+    pub child_ids: Vec<DownloadId>,
+    pub created_at: DateTime<Utc>,
+}
+
+pub enum RecursiveJobState {
+    Empty,
+    Queued,
+    Running,
+    Paused,
+    Completed,
+    Failed,
+    Partial,
+}
+
+pub struct RecursiveJobProgress {
+    pub total_children: usize,
+    pub queued_children: usize,
+    pub active_children: usize,
+    pub paused_children: usize,
+    pub completed_children: usize,
+    pub failed_children: usize,
+    pub missing_children: usize,
+    pub completed_size: u64,
+    pub total_size: Option<u64>,
+}
+
+pub struct RecursiveJobStatus {
+    pub root_url: String,
+    pub child_ids: Vec<DownloadId>,
+    pub state: RecursiveJobState,
+    pub progress: RecursiveJobProgress,
+}
+
+pub enum RecursiveJobEvent {
+    Added { job: TrackedRecursiveJob, status: RecursiveJobStatus },
+    Updated { job: TrackedRecursiveJob, status: RecursiveJobStatus },
+    Removed { id: Uuid },
 }
 ```
 
@@ -282,6 +386,7 @@ The `protocol/` module contains all types that cross the engine boundary. These 
 |------|-------|---------|
 | `types.rs` | `DownloadId`, `DownloadKind`, `DownloadState`, `DownloadProgress` | Core identifiers and state |
 | `options.rs` | `DownloadOptions`, `DownloadPriority` | Input to add_* methods |
+| `recursive.rs` | `RecursiveOptions`, `RecursiveManifest`, `RecursiveJob`, `TrackedRecursiveJob`, `RecursiveJobStatus`, `RecursiveJobEvent` | Recursive HTTP discovery, orchestration, aggregate state |
 | `status.rs` | `DownloadStatus`, `DownloadMetadata`, `GlobalStats` | Status queries |
 | `events.rs` | `DownloadEvent` | Event stream |
 | `torrent.rs` | `TorrentInfo`, `TorrentFile`, `TorrentStatusInfo`, `PeerInfo` | Torrent metadata |
@@ -302,6 +407,37 @@ use gosh_dl::{DownloadEvent, DownloadStatus};
 ---
 
 ## HTTP Implementation
+
+### Recursive HTTP Discovery
+
+The recursive HTTP feature is intentionally layered on top of the existing HTTP downloader instead of changing the semantics of `add_http()`.
+
+Current behavior:
+
+- feature-gated behind `recursive-http`
+- fetches HTML directory/index pages and extracts `<a href>` links
+- normalizes URLs, strips fragments, and enforces same-host/root-prefix scope by default
+- applies include/exclude filters to discovered file paths
+- builds a deterministic manifest of `RecursiveEntry` values
+- expands each manifest entry into an ordinary `add_http()` child download
+- rolls back already-added child downloads if recursive enqueue fails before the parent job is tracked
+- persists recursive child runtime metadata so redirect-scope and fail-fast semantics survive restart
+- persists and reloads tracked recursive job records independently from the child downloads
+- derives aggregate recursive job state and counters from the child download set
+- supports parent-level cancellation/removal operations over the child download set
+- emits recursive parent events on a dedicated event stream without changing `DownloadEvent`
+- optionally aborts queued/active sibling child downloads after the first child failure when `fail_fast` is enabled
+- enforces recursive redirect scope during discovery, child file downloads, and resumed child downloads restored from storage
+
+Current non-goals:
+
+- no new `DownloadKind` variant for recursive jobs
+- no parent recursive job in the main download queue/state machine
+- no recursive parent jobs in the main `DownloadEvent` stream
+- no persisted parent-level recursive event/progress history yet
+- no JavaScript execution or general-purpose site mirroring
+
+This keeps queueing, retries, segmented downloads, progress reporting, and persistence on the already-tested per-file HTTP path.
 
 ### Segmented Downloads
 
@@ -844,6 +980,15 @@ pub trait Storage: Send + Sync {
     async fn save_segments(&self, id: DownloadId, segments: &[Segment]) -> Result<()>;
     async fn load_segments(&self, id: DownloadId) -> Result<Vec<Segment>>;
     async fn delete_segments(&self, id: DownloadId) -> Result<()>;
+    async fn save_runtime_metadata(&self, id: DownloadId, runtime_json: &str) -> Result<()>;
+    async fn load_runtime_metadata(&self, id: DownloadId) -> Result<Option<String>>;
+    async fn load_all_runtime_metadata(&self) -> Result<HashMap<DownloadId, String>>;
+    #[cfg(feature = "recursive-http")]
+    async fn save_recursive_job(&self, job: &TrackedRecursiveJob) -> Result<()>;
+    #[cfg(feature = "recursive-http")]
+    async fn load_recursive_jobs(&self) -> Result<Vec<TrackedRecursiveJob>>;
+    #[cfg(feature = "recursive-http")]
+    async fn delete_recursive_job(&self, id: Uuid) -> Result<()>;
     async fn health_check(&self) -> Result<()>;
     async fn compact(&self) -> Result<()>;
 }
@@ -922,9 +1067,20 @@ CREATE TABLE segments (
     FOREIGN KEY (download_id) REFERENCES downloads(id) ON DELETE CASCADE,
     UNIQUE (download_id, segment_index)
 );
+
+ALTER TABLE downloads ADD COLUMN runtime_metadata_json TEXT;
+
+CREATE TABLE recursive_jobs (
+    id TEXT PRIMARY KEY,
+    root_url TEXT NOT NULL,
+    child_ids_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 ```
 
-**Crash recovery:** Downloads in `Downloading` state are restored as `Paused` with `downloaded` bytes preserved for resume.
+Current schema version is `4`.
+
+**Crash recovery:** Downloads in `Downloading` state are restored as `Paused` with `downloaded` bytes preserved for resume. When `recursive-http` is enabled, the runtime metadata sidecar restores recursive child redirect scope and fail-fast grouping, and the `recursive_jobs` table restores tracked parent job records.
 
 ---
 

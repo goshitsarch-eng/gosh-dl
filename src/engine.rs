@@ -27,15 +27,25 @@ use crate::types::{TorrentFile, TorrentStatusInfo};
 use chrono::Utc;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+#[cfg(all(feature = "http", feature = "recursive-http"))]
+use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 #[cfg(feature = "torrent")]
 use std::time::Duration;
 use tokio::sync::broadcast;
 #[cfg(feature = "http")]
 use url::Url;
+#[cfg(all(feature = "http", feature = "recursive-http"))]
+use crate::http::crawl;
+#[cfg(all(feature = "http", feature = "recursive-http"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(feature = "http", feature = "recursive-http"))]
+use uuid::Uuid;
 
 /// Maximum number of events to buffer
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
+#[cfg(all(feature = "http", feature = "recursive-http"))]
+const RECURSIVE_EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Internal representation of a managed download
 struct ManagedDownload {
@@ -44,6 +54,41 @@ struct ManagedDownload {
     /// Cached HTTP segment state for in-memory pause/resume (no storage needed)
     #[cfg(feature = "http")]
     cached_segments: Option<Vec<Segment>>,
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    redirect_scope: Option<crawl::RedirectScope>,
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    recursive_group_id: Option<Uuid>,
+}
+
+#[cfg(all(feature = "http", feature = "recursive-http"))]
+struct RecursiveGroup {
+    child_ids: HashSet<DownloadId>,
+    fail_fast: bool,
+    failed: bool,
+}
+
+#[cfg(all(feature = "http", feature = "recursive-http"))]
+struct RecursiveFailFastAbort {
+    id: DownloadId,
+    old_state: DownloadState,
+    error_message: String,
+    status: DownloadStatus,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+}
+
+#[cfg(all(feature = "http", feature = "recursive-http"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedDownloadRuntimeMetadata {
+    #[serde(default)]
+    recursive_child: Option<PersistedRecursiveChildState>,
+}
+
+#[cfg(all(feature = "http", feature = "recursive-http"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRecursiveChildState {
+    redirect_scope: crawl::PersistedRedirectScope,
+    recursive_group_id: Option<Uuid>,
+    fail_fast: bool,
 }
 
 /// Handle to control a running download
@@ -83,6 +128,12 @@ pub struct DownloadEngine {
 
     /// All managed downloads
     downloads: RwLock<HashMap<DownloadId, ManagedDownload>>,
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    recursive_groups: RwLock<HashMap<Uuid, RecursiveGroup>>,
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    recursive_jobs: RwLock<HashMap<Uuid, crate::types::TrackedRecursiveJob>>,
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    recursive_job_membership: RwLock<HashMap<DownloadId, HashSet<Uuid>>>,
 
     /// HTTP downloader
     #[cfg(feature = "http")]
@@ -90,6 +141,8 @@ pub struct DownloadEngine {
 
     /// Event broadcaster
     event_tx: broadcast::Sender<DownloadEvent>,
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    recursive_job_event_tx: broadcast::Sender<crate::types::RecursiveJobEvent>,
 
     /// Priority queue for limiting and ordering concurrent downloads
     priority_queue: Arc<PriorityQueue>,
@@ -117,6 +170,9 @@ impl DownloadEngine {
 
         // Create event channel
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        let (recursive_job_event_tx, _) =
+            broadcast::channel(RECURSIVE_EVENT_CHANNEL_CAPACITY);
 
         // Create HTTP downloader
         #[cfg(feature = "http")]
@@ -154,9 +210,17 @@ impl DownloadEngine {
             self_ref: weak.clone(),
             config: RwLock::new(config),
             downloads: RwLock::new(HashMap::new()),
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            recursive_groups: RwLock::new(HashMap::new()),
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            recursive_jobs: RwLock::new(HashMap::new()),
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            recursive_job_membership: RwLock::new(HashMap::new()),
             #[cfg(feature = "http")]
             http,
             event_tx,
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            recursive_job_event_tx,
             priority_queue,
             scheduler,
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -165,6 +229,8 @@ impl DownloadEngine {
 
         // Load persisted downloads from database
         engine.load_persisted_downloads().await?;
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        engine.load_persisted_recursive_jobs().await?;
 
         // Start background persistence task
         Self::start_persistence_task(Arc::clone(&engine));
@@ -284,6 +350,10 @@ impl DownloadEngine {
         };
 
         let persisted = storage.load_all().await?;
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        let runtime_metadata = storage.load_all_runtime_metadata().await?;
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        let mut restored_groups = HashMap::new();
 
         for status in persisted {
             // For active/downloading states, mark as paused (crashed mid-download)
@@ -300,6 +370,53 @@ impl DownloadEngine {
             restored_status.progress.upload_speed = 0;
             restored_status.progress.connections = 0;
 
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            let (redirect_scope, recursive_group_id, recursive_fail_fast) =
+                if let Some(runtime_json) = runtime_metadata.get(&status.id) {
+                    match self.parse_persisted_runtime_metadata(runtime_json) {
+                        Ok(runtime) => match runtime.recursive_child {
+                            Some(recursive_child) => (
+                                Some(crawl::RedirectScope::from_persisted(
+                                    recursive_child.redirect_scope,
+                                )?),
+                                recursive_child.recursive_group_id,
+                                recursive_child.fail_fast,
+                            ),
+                            None => (None, None, false),
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse runtime metadata for {}: {}",
+                                status.id,
+                                e
+                            );
+                            (None, None, false)
+                        }
+                    }
+                } else {
+                    (None, None, false)
+                };
+
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            if let Some(group_id) = recursive_group_id {
+                if recursive_fail_fast
+                    && !matches!(
+                        restored_status.state,
+                        DownloadState::Completed | DownloadState::Error { .. }
+                    )
+                {
+                    restored_groups
+                        .entry(group_id)
+                        .or_insert_with(|| RecursiveGroup {
+                            child_ids: HashSet::new(),
+                            fail_fast: true,
+                            failed: false,
+                        })
+                        .child_ids
+                        .insert(status.id);
+                }
+            }
+
             // Insert into downloads map
             self.downloads.write().insert(
                 status.id,
@@ -308,6 +425,10 @@ impl DownloadEngine {
                     handle: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
+                    #[cfg(all(feature = "http", feature = "recursive-http"))]
+                    redirect_scope,
+                    #[cfg(all(feature = "http", feature = "recursive-http"))]
+                    recursive_group_id,
                 },
             );
 
@@ -319,7 +440,57 @@ impl DownloadEngine {
             );
         }
 
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        {
+            self.recursive_groups.write().extend(restored_groups);
+        }
+
         Ok(())
+    }
+
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    async fn load_persisted_recursive_jobs(&self) -> Result<()> {
+        let storage = match &self.storage {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let jobs = storage.load_recursive_jobs().await?;
+        if jobs.is_empty() {
+            return Ok(());
+        }
+
+        let mut recursive_jobs = self.recursive_jobs.write();
+        for job in jobs {
+            self.register_recursive_job_membership(&job);
+            recursive_jobs.insert(job.id, job);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    fn register_recursive_job_membership(&self, job: &crate::types::TrackedRecursiveJob) {
+        let mut membership = self.recursive_job_membership.write();
+        for child_id in &job.child_ids {
+            membership.entry(*child_id).or_default().insert(job.id);
+        }
+    }
+
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    fn unregister_recursive_job_membership(&self, job: &crate::types::TrackedRecursiveJob) {
+        let mut membership = self.recursive_job_membership.write();
+        for child_id in &job.child_ids {
+            let should_remove = if let Some(job_ids) = membership.get_mut(child_id) {
+                job_ids.remove(&job.id);
+                job_ids.is_empty()
+            } else {
+                false
+            };
+            if should_remove {
+                membership.remove(child_id);
+            }
+        }
     }
 
     #[cfg(feature = "torrent")]
@@ -347,6 +518,27 @@ impl DownloadEngine {
     /// Add an HTTP/HTTPS download
     #[cfg(feature = "http")]
     pub async fn add_http(&self, url: &str, options: DownloadOptions) -> Result<DownloadId> {
+        self.add_http_internal(
+            url,
+            options,
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            None,
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "http")]
+    async fn add_http_internal(
+        &self,
+        url: &str,
+        options: DownloadOptions,
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        redirect_scope: Option<crawl::RedirectScope>,
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        recursive_group_id: Option<Uuid>,
+    ) -> Result<DownloadId> {
         // Validate URL
         let parsed_url = Url::parse(url)
             .map_err(|e| EngineError::invalid_input("url", format!("Invalid URL: {}", e)))?;
@@ -359,6 +551,16 @@ impl DownloadEngine {
                     "url",
                     format!("Unsupported scheme: {}", scheme),
                 ));
+            }
+        }
+
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        if let Some(group_id) = recursive_group_id {
+            if !self.recursive_groups.read().contains_key(&group_id) {
+                return Err(EngineError::Internal(format!(
+                    "recursive group {} missing for child download",
+                    group_id
+                )));
             }
         }
 
@@ -411,6 +613,10 @@ impl DownloadEngine {
             completed_at: None,
         };
 
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        let runtime_metadata_json =
+            self.build_persisted_runtime_metadata(redirect_scope.as_ref(), recursive_group_id)?;
+
         // Insert into downloads map
         {
             let mut downloads = self.downloads.write();
@@ -421,14 +627,31 @@ impl DownloadEngine {
                     handle: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
+                    #[cfg(all(feature = "http", feature = "recursive-http"))]
+                    redirect_scope,
+                    #[cfg(all(feature = "http", feature = "recursive-http"))]
+                    recursive_group_id,
                 },
             );
+        }
+
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        if let Some(group_id) = recursive_group_id {
+            if let Some(group) = self.recursive_groups.write().get_mut(&group_id) {
+                group.child_ids.insert(id);
+            }
         }
 
         // Persist to database
         if let Some(ref storage) = self.storage {
             if let Err(e) = storage.save_download(&status).await {
                 tracing::warn!("Failed to persist new download {}: {}", id, e);
+            }
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            if let Some(runtime_json) = runtime_metadata_json {
+                if let Err(e) = storage.save_runtime_metadata(id, &runtime_json).await {
+                    tracing::warn!("Failed to persist runtime metadata for {}: {}", id, e);
+                }
             }
         }
 
@@ -440,6 +663,505 @@ impl DownloadEngine {
             .await?;
 
         Ok(id)
+    }
+
+    /// Discover files reachable from an HTTP/HTTPS directory-like root URL.
+    ///
+    /// This method is feature-gated behind `recursive-http` and currently
+    /// validates recursive inputs before delegating to the in-progress crawler
+    /// implementation.
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    pub async fn discover_http_recursive(
+        &self,
+        root_url: &str,
+        options: &DownloadOptions,
+        recursive: &crate::types::RecursiveOptions,
+    ) -> Result<crate::types::RecursiveManifest> {
+        crawl::discover(&self.http, root_url, options, recursive).await
+    }
+
+    /// Expand a recursive HTTP/HTTPS discovery root into child HTTP downloads.
+    ///
+    /// Each child is intended to become a normal HTTP download so the existing
+    /// queueing, retry, and persistence paths remain unchanged.
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    pub async fn add_http_recursive(
+        &self,
+        root_url: &str,
+        options: DownloadOptions,
+        recursive: crate::types::RecursiveOptions,
+    ) -> Result<crate::types::RecursiveJob> {
+        let manifest = self
+            .discover_http_recursive(root_url, &options, &recursive)
+            .await?;
+        self.enqueue_recursive_manifest(manifest, options, &recursive)
+            .await
+    }
+
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    async fn enqueue_recursive_manifest(
+        &self,
+        manifest: crate::types::RecursiveManifest,
+        options: DownloadOptions,
+        recursive: &crate::types::RecursiveOptions,
+    ) -> Result<crate::types::RecursiveJob> {
+        let redirect_scope = crawl::RedirectScope::new(&manifest.root_url, recursive)?;
+        let recursive_group_id = if recursive.fail_fast && !manifest.entries.is_empty() {
+            let group_id = Uuid::new_v4();
+            self.recursive_groups.write().insert(
+                group_id,
+                RecursiveGroup {
+                    child_ids: HashSet::new(),
+                    fail_fast: true,
+                    failed: false,
+                },
+            );
+            Some(group_id)
+        } else {
+            None
+        };
+
+        let base_save_dir = options
+            .save_dir
+            .clone()
+            .unwrap_or_else(|| self.config.read().download_dir.clone());
+        let mut child_ids = Vec::with_capacity(manifest.entries.len());
+
+        for entry in &manifest.entries {
+            let mut child_options = options.clone();
+            child_options.save_dir = Some(match entry.relative_path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => base_save_dir.join(parent),
+                _ => base_save_dir.clone(),
+            });
+            child_options.filename = entry
+                .relative_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+            child_options.checksum = None;
+            child_options.mirrors.clear();
+
+            let child_id = match self
+                .add_http_internal(
+                    &entry.url,
+                    child_options,
+                    Some(redirect_scope.clone()),
+                    recursive_group_id,
+                )
+                .await
+            {
+                Ok(child_id) => child_id,
+                Err(err) => {
+                    self.rollback_recursive_enqueue(&child_ids, recursive_group_id)
+                        .await;
+                    return Err(err);
+                }
+            };
+            child_ids.push(child_id);
+        }
+
+        let tracked_job = crate::types::TrackedRecursiveJob {
+            id: Uuid::new_v4(),
+            root_url: manifest.root_url.clone(),
+            child_ids: child_ids.clone(),
+            created_at: Utc::now(),
+        };
+
+        self.register_recursive_job_membership(&tracked_job);
+        self.recursive_jobs
+            .write()
+            .insert(tracked_job.id, tracked_job.clone());
+
+        if let Some(ref storage) = self.storage {
+            if let Err(e) = storage.save_recursive_job(&tracked_job).await {
+                tracing::warn!(
+                    "Failed to persist recursive job {}: {}",
+                    tracked_job.id,
+                    e
+                );
+            }
+        }
+
+        let status = self.recursive_job_status(&tracked_job.as_job());
+        let _ = self
+            .recursive_job_event_tx
+            .send(crate::types::RecursiveJobEvent::Added {
+                job: tracked_job,
+                status,
+            });
+
+        Ok(crate::types::RecursiveJob {
+            root_url: manifest.root_url,
+            child_ids,
+        })
+    }
+
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    async fn rollback_recursive_enqueue(
+        &self,
+        child_ids: &[DownloadId],
+        recursive_group_id: Option<Uuid>,
+    ) {
+        for child_id in child_ids {
+            if self.status(*child_id).is_some() {
+                let _ = self.cancel(*child_id, false).await;
+            }
+        }
+
+        if let Some(group_id) = recursive_group_id {
+            self.recursive_groups.write().remove(&group_id);
+        }
+    }
+
+    /// List tracked recursive jobs restored from storage or created in-process.
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    pub fn list_recursive_jobs(&self) -> Vec<crate::types::TrackedRecursiveJob> {
+        let mut jobs = self
+            .recursive_jobs
+            .read()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        jobs
+    }
+
+    /// Look up a tracked recursive job by ID.
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    pub fn recursive_job(&self, id: Uuid) -> Option<crate::types::TrackedRecursiveJob> {
+        self.recursive_jobs.read().get(&id).cloned()
+    }
+
+    /// Subscribe to recursive parent job events.
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    pub fn subscribe_recursive_jobs(
+        &self,
+    ) -> broadcast::Receiver<crate::types::RecursiveJobEvent> {
+        self.recursive_job_event_tx.subscribe()
+    }
+
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    fn emit_recursive_job_update(&self, id: Uuid) {
+        if let Some(job) = self.recursive_job(id) {
+            let status = self.recursive_job_status(&job.as_job());
+            let _ = self
+                .recursive_job_event_tx
+                .send(crate::types::RecursiveJobEvent::Updated { job, status });
+        }
+    }
+
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    fn emit_recursive_job_updates_for_child(&self, child_id: DownloadId) {
+        let job_ids = self
+            .recursive_job_membership
+            .read()
+            .get(&child_id)
+            .cloned()
+            .unwrap_or_default();
+        for job_id in job_ids {
+            self.emit_recursive_job_update(job_id);
+        }
+    }
+
+    /// Cancel all currently present child downloads for a tracked recursive job.
+    ///
+    /// This leaves the tracked recursive job record intact so callers can still
+    /// inspect aggregate state/history after the children have been removed.
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    pub async fn cancel_recursive_job(&self, id: Uuid, delete_files: bool) -> Result<()> {
+        let job = self
+            .recursive_job(id)
+            .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
+
+        for child_id in job.child_ids {
+            if self.status(child_id).is_some() {
+                self.cancel(child_id, delete_files).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove a tracked recursive job record and cancel any remaining children.
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    pub async fn remove_recursive_job(&self, id: Uuid, delete_files: bool) -> Result<()> {
+        let job = self
+            .recursive_job(id)
+            .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
+
+        for child_id in &job.child_ids {
+            if self.status(*child_id).is_some() {
+                self.cancel(*child_id, delete_files).await?;
+            }
+        }
+
+        self.recursive_jobs.write().remove(&id);
+        self.unregister_recursive_job_membership(&job);
+        if let Some(ref storage) = self.storage {
+            if let Err(e) = storage.delete_recursive_job(id).await {
+                tracing::warn!("Failed to delete recursive job {}: {}", id, e);
+            }
+        }
+        let _ = self
+            .recursive_job_event_tx
+            .send(crate::types::RecursiveJobEvent::Removed { id });
+
+        Ok(())
+    }
+
+    /// Derive aggregate status for a recursive job from its child downloads.
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    pub fn recursive_job_status(
+        &self,
+        job: &crate::types::RecursiveJob,
+    ) -> crate::types::RecursiveJobStatus {
+        let mut progress = crate::types::RecursiveJobProgress {
+            total_children: job.child_ids.len(),
+            ..Default::default()
+        };
+        let mut summed_total_size = 0u64;
+        let mut all_total_sizes_known = true;
+
+        for child_id in &job.child_ids {
+            match self.status(*child_id) {
+                Some(status) => {
+                    progress.completed_size = progress
+                        .completed_size
+                        .saturating_add(status.progress.completed_size);
+
+                    if let Some(total_size) = status.progress.total_size {
+                        summed_total_size = summed_total_size.saturating_add(total_size);
+                    } else {
+                        all_total_sizes_known = false;
+                    }
+
+                    match status.state {
+                        DownloadState::Queued => progress.queued_children += 1,
+                        DownloadState::Connecting
+                        | DownloadState::Downloading
+                        | DownloadState::Seeding => progress.active_children += 1,
+                        DownloadState::Paused => progress.paused_children += 1,
+                        DownloadState::Completed => progress.completed_children += 1,
+                        DownloadState::Error { .. } => progress.failed_children += 1,
+                    }
+                }
+                None => {
+                    progress.missing_children += 1;
+                    all_total_sizes_known = false;
+                }
+            }
+        }
+
+        progress.total_size = if all_total_sizes_known {
+            Some(summed_total_size)
+        } else {
+            None
+        };
+
+        let state = if progress.total_children == 0 {
+            crate::types::RecursiveJobState::Empty
+        } else if progress.completed_children == progress.total_children {
+            crate::types::RecursiveJobState::Completed
+        } else if progress.failed_children + progress.missing_children == progress.total_children {
+            crate::types::RecursiveJobState::Failed
+        } else if progress.failed_children > 0 || progress.missing_children > 0 {
+            crate::types::RecursiveJobState::Partial
+        } else if progress.active_children > 0 {
+            crate::types::RecursiveJobState::Running
+        } else if progress.paused_children > 0 {
+            crate::types::RecursiveJobState::Paused
+        } else if progress.queued_children > 0 {
+            crate::types::RecursiveJobState::Queued
+        } else {
+            crate::types::RecursiveJobState::Partial
+        };
+
+        crate::types::RecursiveJobStatus {
+            root_url: job.root_url.clone(),
+            child_ids: job.child_ids.clone(),
+            state,
+            progress,
+        }
+    }
+
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    fn build_persisted_runtime_metadata(
+        &self,
+        redirect_scope: Option<&crawl::RedirectScope>,
+        recursive_group_id: Option<Uuid>,
+    ) -> Result<Option<String>> {
+        let runtime = match redirect_scope {
+            Some(redirect_scope) => PersistedDownloadRuntimeMetadata {
+                recursive_child: Some(PersistedRecursiveChildState {
+                    redirect_scope: redirect_scope.to_persisted(),
+                    recursive_group_id,
+                    fail_fast: recursive_group_id
+                        .and_then(|group_id| {
+                            self.recursive_groups.read().get(&group_id).map(|g| g.fail_fast)
+                        })
+                        .unwrap_or(false),
+                }),
+            },
+            None => PersistedDownloadRuntimeMetadata {
+                recursive_child: None,
+            },
+        };
+
+        if runtime.recursive_child.is_none() {
+            return Ok(None);
+        }
+
+        serde_json::to_string(&runtime).map(Some).map_err(|e| {
+            EngineError::Internal(format!("Failed to serialize runtime metadata: {}", e))
+        })
+    }
+
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    fn parse_persisted_runtime_metadata(
+        &self,
+        runtime_json: &str,
+    ) -> Result<PersistedDownloadRuntimeMetadata> {
+        serde_json::from_str(runtime_json).map_err(|e| {
+            EngineError::Internal(format!("Failed to deserialize runtime metadata: {}", e))
+        })
+    }
+
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    fn remove_recursive_group_member(&self, recursive_group_id: Option<Uuid>, id: DownloadId) {
+        let Some(group_id) = recursive_group_id else {
+            return;
+        };
+
+        let mut groups = self.recursive_groups.write();
+        let should_remove_group = if let Some(group) = groups.get_mut(&group_id) {
+            group.child_ids.remove(&id);
+            group.child_ids.is_empty()
+        } else {
+            false
+        };
+
+        if should_remove_group {
+            groups.remove(&group_id);
+        }
+    }
+
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    async fn trigger_recursive_fail_fast(
+        &self,
+        failed_id: DownloadId,
+        failed_message: &str,
+    ) -> Result<()> {
+        let recursive_group_id = {
+            let downloads = self.downloads.read();
+            downloads.get(&failed_id).and_then(|d| d.recursive_group_id)
+        };
+        let Some(group_id) = recursive_group_id else {
+            return Ok(());
+        };
+
+        let sibling_ids = {
+            let mut groups = self.recursive_groups.write();
+            let Some(group) = groups.get_mut(&group_id) else {
+                return Ok(());
+            };
+
+            if !group.fail_fast || group.failed {
+                return Ok(());
+            }
+
+            group.failed = true;
+            group
+                .child_ids
+                .iter()
+                .copied()
+                .filter(|id| *id != failed_id)
+                .collect::<Vec<_>>()
+        };
+
+        let fail_fast_message = format!(
+            "Aborted because recursive sibling download {} failed: {}",
+            failed_id, failed_message
+        );
+
+        let impacted = {
+            let mut downloads = self.downloads.write();
+            let mut impacted = Vec::new();
+
+            for sibling_id in sibling_ids {
+                let Some(download) = downloads.get_mut(&sibling_id) else {
+                    continue;
+                };
+
+                if !matches!(
+                    download.status.state,
+                    DownloadState::Queued
+                        | DownloadState::Connecting
+                        | DownloadState::Downloading
+                ) {
+                    continue;
+                }
+
+                let old_state = download.status.state.clone();
+                download.status.state = DownloadState::Error {
+                    kind: "RecursiveFailFast".to_string(),
+                    message: fail_fast_message.clone(),
+                    retryable: false,
+                };
+
+                impacted.push(RecursiveFailFastAbort {
+                    id: sibling_id,
+                    old_state,
+                    error_message: fail_fast_message.clone(),
+                    status: download.status.clone(),
+                    cancel_token: match download.handle.as_ref() {
+                        Some(DownloadHandle::Http(handle)) => Some(handle.cancel_token.clone()),
+                        _ => None,
+                    },
+                });
+            }
+
+            impacted
+        };
+
+        for abort in &impacted {
+            if let Some(cancel_token) = &abort.cancel_token {
+                cancel_token.cancel();
+            }
+        }
+
+        if let Some(ref storage) = self.storage {
+            for abort in &impacted {
+                if let Err(e) = storage.save_download(&abort.status).await {
+                    tracing::debug!(
+                        "Failed to persist recursive fail-fast state for {}: {}",
+                        abort.id,
+                        e
+                    );
+                }
+            }
+        }
+
+        for abort in impacted {
+            let new_state = DownloadState::Error {
+                kind: "RecursiveFailFast".to_string(),
+                message: abort.error_message.clone(),
+                retryable: false,
+            };
+
+            let _ = self.event_tx.send(DownloadEvent::StateChanged {
+                id: abort.id,
+                old_state: abort.old_state,
+                new_state,
+            });
+            let _ = self.event_tx.send(DownloadEvent::Failed {
+                id: abort.id,
+                error: abort.error_message.clone(),
+                retryable: false,
+            });
+            self.emit_recursive_job_updates_for_child(abort.id);
+            self.remove_recursive_group_member(Some(group_id), abort.id);
+        }
+
+        Ok(())
     }
 
     /// Add a BitTorrent download from torrent file data
@@ -500,6 +1222,10 @@ impl DownloadEngine {
                     handle: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
+                    #[cfg(all(feature = "http", feature = "recursive-http"))]
+                    redirect_scope: None,
+                    #[cfg(all(feature = "http", feature = "recursive-http"))]
+                    recursive_group_id: None,
                 },
             );
         }
@@ -582,6 +1308,10 @@ impl DownloadEngine {
                     handle: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
+                    #[cfg(all(feature = "http", feature = "recursive-http"))]
+                    redirect_scope: None,
+                    #[cfg(all(feature = "http", feature = "recursive-http"))]
+                    recursive_group_id: None,
                 },
             );
         }
@@ -1039,6 +1769,35 @@ impl DownloadEngine {
             let _ = engine.event_tx.send(DownloadEvent::Started { id });
 
             // Get save path and options
+            #[cfg(feature = "recursive-http")]
+            let (
+                save_dir,
+                filename,
+                user_agent,
+                referer,
+                headers,
+                cookies,
+                checksum,
+                redirect_scope,
+                recursive_group_id,
+            ) = {
+                let downloads = engine.downloads.read();
+                let download = downloads
+                    .get(&id)
+                    .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
+                (
+                    download.status.metadata.save_dir.clone(),
+                    download.status.metadata.filename.clone(),
+                    download.status.metadata.user_agent.clone(),
+                    download.status.metadata.referer.clone(),
+                    download.status.metadata.headers.clone(),
+                    download.status.metadata.cookies.clone(),
+                    download.status.metadata.checksum.clone(),
+                    download.redirect_scope.clone(),
+                    download.recursive_group_id,
+                )
+            };
+            #[cfg(not(feature = "recursive-http"))]
             let (save_dir, filename, user_agent, referer, headers, cookies, checksum) = {
                 let downloads = engine.downloads.read();
                 let download = downloads
@@ -1069,6 +1828,8 @@ impl DownloadEngine {
                 let _ = engine_clone
                     .event_tx
                     .send(DownloadEvent::Progress { id, progress });
+                #[cfg(feature = "recursive-http")]
+                engine_clone.emit_recursive_job_updates_for_child(id);
             };
 
             // Get config for segmented downloads
@@ -1084,7 +1845,7 @@ impl DownloadEngine {
                 Some(cookies.as_slice())
             };
             let result = http
-                .download_segmented(
+                .download_segmented_with_scope(
                     &url,
                     &save_dir,
                     filename.as_deref(),
@@ -1093,6 +1854,8 @@ impl DownloadEngine {
                     &headers,
                     cookies_opt,
                     checksum.as_ref(),
+                    #[cfg(feature = "recursive-http")]
+                    redirect_scope,
                     max_connections,
                     min_segment_size,
                     cancel_token_clone.clone(),
@@ -1148,6 +1911,11 @@ impl DownloadEngine {
 
                         let _ = engine.event_tx.send(DownloadEvent::Completed { id });
                     }
+
+                    #[cfg(feature = "recursive-http")]
+                    engine.emit_recursive_job_updates_for_child(id);
+                    #[cfg(feature = "recursive-http")]
+                    engine.remove_recursive_group_member(recursive_group_id, id);
                 }
                 Err(e) if cancel_token_clone.is_cancelled() => {
                     // Cancelled, already handled
@@ -1208,9 +1976,16 @@ impl DownloadEngine {
 
                     let _ = engine.event_tx.send(DownloadEvent::Failed {
                         id,
-                        error: error_msg,
+                        error: error_msg.clone(),
                         retryable,
                     });
+
+                    #[cfg(feature = "recursive-http")]
+                    {
+                        engine.emit_recursive_job_updates_for_child(id);
+                        engine.trigger_recursive_fail_fast(id, &error_msg).await?;
+                        engine.remove_recursive_group_member(recursive_group_id, id);
+                    }
                 }
             }
 
@@ -1477,7 +2252,7 @@ impl DownloadEngine {
 
     /// Cancel a download and optionally delete files
     pub async fn cancel(&self, id: DownloadId, delete_files: bool) -> Result<()> {
-        let (handle, save_path) = {
+        let (handle, save_path, recursive_group_id) = {
             let mut downloads = self.downloads.write();
             let download = downloads
                 .remove(&id)
@@ -1498,7 +2273,14 @@ impl DownloadEngine {
                 None
             };
 
-            (download.handle, save_path)
+            (
+                download.handle,
+                save_path,
+                #[cfg(all(feature = "http", feature = "recursive-http"))]
+                download.recursive_group_id,
+                #[cfg(not(all(feature = "http", feature = "recursive-http")))]
+                None,
+            )
         };
 
         // Cancel the task if running
@@ -1550,6 +2332,11 @@ impl DownloadEngine {
         }
 
         let _ = self.event_tx.send(DownloadEvent::Removed { id });
+
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        self.emit_recursive_job_updates_for_child(id);
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        self.remove_recursive_group_member(recursive_group_id, id);
 
         Ok(())
     }
@@ -1754,6 +2541,9 @@ impl DownloadEngine {
             new_state,
         });
 
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        self.emit_recursive_job_updates_for_child(id);
+
         Ok(())
     }
 }
@@ -1762,5 +2552,64 @@ impl Drop for DownloadEngine {
     fn drop(&mut self) {
         // Signal shutdown on drop
         self.shutdown.cancel();
+    }
+}
+
+#[cfg(all(test, feature = "http", feature = "recursive-http"))]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn recursive_enqueue_rolls_back_partial_children_on_error() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let engine = DownloadEngine::new(EngineConfig {
+            download_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        })
+        .await
+        .expect("engine should be created");
+
+        let manifest = crate::types::RecursiveManifest {
+            root_url: "https://example.com/pub/".to_string(),
+            entries: vec![
+                crate::types::RecursiveEntry {
+                    url: "https://example.com/pub/ok.txt".to_string(),
+                    relative_path: PathBuf::from("ok.txt"),
+                    size_hint: None,
+                },
+                crate::types::RecursiveEntry {
+                    url: "ftp://example.com/pub/bad.txt".to_string(),
+                    relative_path: PathBuf::from("bad.txt"),
+                    size_hint: None,
+                },
+            ],
+        };
+
+        let err = engine
+            .enqueue_recursive_manifest(
+                manifest,
+                DownloadOptions::default(),
+                &crate::types::RecursiveOptions {
+                    fail_fast: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("invalid child URL should fail recursive enqueue");
+
+        assert!(matches!(err, EngineError::InvalidInput { field: "url", .. }));
+        assert!(engine.list().is_empty(), "partial child downloads should be rolled back");
+        assert!(
+            engine.list_recursive_jobs().is_empty(),
+            "tracked parent jobs should not be created on enqueue failure"
+        );
+        assert!(
+            engine.recursive_groups.read().is_empty(),
+            "fail-fast groups should not leak after rollback"
+        );
+
+        engine.shutdown().await.ok();
     }
 }
