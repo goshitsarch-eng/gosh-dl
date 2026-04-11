@@ -240,8 +240,7 @@ impl SegmentedDownload {
         headers: &[(String, String)],
         max_connections: usize,
         retry_policy: &RetryPolicy,
-        #[cfg(feature = "recursive-http")]
-        redirect_scope: Option<super::crawl::RedirectScope>,
+        #[cfg(feature = "recursive-http")] redirect_scope: Option<super::crawl::RedirectScope>,
         cancel_token: CancellationToken,
         progress_callback: F,
     ) -> Result<()>

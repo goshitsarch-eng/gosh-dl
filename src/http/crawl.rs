@@ -41,7 +41,10 @@ pub(crate) struct PersistedRedirectScope {
 
 fn normalize_url(candidate: &str, base: &Url) -> Result<Url> {
     let joined = base.join(candidate).map_err(|e| {
-        EngineError::invalid_input("root_url", format!("Failed to resolve URL '{candidate}': {e}"))
+        EngineError::invalid_input(
+            "root_url",
+            format!("Failed to resolve URL '{candidate}': {e}"),
+        )
     })?;
 
     match joined.scheme() {
@@ -116,9 +119,12 @@ fn normalized_scope_prefix(root: &Url, recursive: &RecursiveOptions) -> Result<S
 
 impl RedirectScope {
     pub(crate) fn new(root_url: &str, recursive: &RecursiveOptions) -> Result<Self> {
-        let parsed_url = normalize_url(root_url, &Url::parse(root_url).map_err(|e| {
-            EngineError::invalid_input("root_url", format!("Invalid URL: {}", e))
-        })?)?;
+        let parsed_url = normalize_url(
+            root_url,
+            &Url::parse(root_url).map_err(|e| {
+                EngineError::invalid_input("root_url", format!("Invalid URL: {}", e))
+            })?,
+        )?;
 
         Ok(Self {
             scope_prefix: normalized_scope_prefix(&parsed_url, recursive)?,
@@ -384,11 +390,11 @@ async fn fetch_discovery_response(
 
             let is_html = final_url.path().ends_with('/')
                 || content_type
-                .as_deref()
-                .map(|value| {
-                    value.starts_with("text/html") || value.starts_with("application/xhtml+xml")
-                })
-                .unwrap_or(false);
+                    .as_deref()
+                    .map(|value| {
+                        value.starts_with("text/html") || value.starts_with("application/xhtml+xml")
+                    })
+                    .unwrap_or(false);
 
             if !is_html {
                 return Ok(DiscoveryResponse {
@@ -432,9 +438,11 @@ pub(crate) async fn discover(
     options: &DownloadOptions,
     recursive: &RecursiveOptions,
 ) -> Result<RecursiveManifest> {
-    let parsed_url = normalize_url(root_url, &Url::parse(root_url).map_err(|e| {
-        EngineError::invalid_input("root_url", format!("Invalid URL: {}", e))
-    })?)?;
+    let parsed_url = normalize_url(
+        root_url,
+        &Url::parse(root_url)
+            .map_err(|e| EngineError::invalid_input("root_url", format!("Invalid URL: {}", e)))?,
+    )?;
 
     if recursive.max_discovery_concurrency == 0 {
         return Err(EngineError::invalid_input(
@@ -548,11 +556,10 @@ pub(crate) async fn discover(
 mod tests {
     use super::{
         build_relative_path, insert_entry, is_url_in_scope, normalize_path, normalize_url,
-        path_is_selected, pattern_matches,
-        normalized_scope_prefix,
+        normalized_scope_prefix, path_is_selected, pattern_matches,
     };
-    use crate::{DownloadEngine, DownloadOptions, EngineConfig, EngineError, RecursiveEntry};
     use crate::types::RecursiveOptions;
+    use crate::{DownloadEngine, DownloadOptions, EngineConfig, EngineError, RecursiveEntry};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -568,7 +575,10 @@ mod tests {
 
         let normalized = normalize_url("./releases/app.tar.gz#download", &base).unwrap();
 
-        assert_eq!(normalized.as_str(), "https://example.com/pub/releases/app.tar.gz");
+        assert_eq!(
+            normalized.as_str(),
+            "https://example.com/pub/releases/app.tar.gz"
+        );
     }
 
     #[test]
@@ -806,7 +816,10 @@ mod tests {
             .iter()
             .map(|entry| entry.relative_path.to_string_lossy().to_string())
             .collect();
-        assert_eq!(paths, vec!["ignore.txt", "readme.txt", "releases/app.tar.gz"]);
+        assert_eq!(
+            paths,
+            vec!["ignore.txt", "readme.txt", "releases/app.tar.gz"]
+        );
     }
 
     #[tokio::test]
@@ -856,7 +869,9 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Type", "text/html")
-                    .set_body_string(r#"<html><body><a href="file.bin">file.bin</a></body></html>"#),
+                    .set_body_string(
+                        r#"<html><body><a href="file.bin">file.bin</a></body></html>"#,
+                    ),
             )
             .mount(&server)
             .await;
@@ -908,7 +923,9 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Type", "text/html")
-                    .set_body_string(r#"<html><body><a href="app.tar.gz">app.tar.gz</a></body></html>"#),
+                    .set_body_string(
+                        r#"<html><body><a href="app.tar.gz">app.tar.gz</a></body></html>"#,
+                    ),
             )
             .mount(&server)
             .await;
@@ -1042,5 +1059,4 @@ mod tests {
             .collect();
         assert_eq!(paths, vec!["releases/notes.txt"]);
     }
-
 }

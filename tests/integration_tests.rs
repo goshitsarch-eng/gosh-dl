@@ -129,7 +129,10 @@ fn assert_all_progress_invariants(progress_events: &[DownloadProgress]) {
 }
 
 #[cfg(feature = "recursive-http")]
-async fn wait_for_downloads_to_complete(engine: &std::sync::Arc<DownloadEngine>, ids: &[gosh_dl::DownloadId]) {
+async fn wait_for_downloads_to_complete(
+    engine: &std::sync::Arc<DownloadEngine>,
+    ids: &[gosh_dl::DownloadId],
+) {
     timeout(Duration::from_secs(10), async {
         loop {
             let statuses = ids
@@ -421,7 +424,9 @@ async fn test_recursive_download_downloads_nested_files() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/html")
-                .set_body_string(r#"<html><body><a href="app.tar.gz">app.tar.gz</a></body></html>"#),
+                .set_body_string(
+                    r#"<html><body><a href="app.tar.gz">app.tar.gz</a></body></html>"#,
+                ),
         )
         .mount(&mock_server)
         .await;
@@ -595,10 +600,10 @@ async fn test_recursive_child_download_rejects_redirect_out_of_scope() {
 
     Mock::given(method("HEAD"))
         .and(path("/pub/file.txt"))
-        .respond_with(
-            ResponseTemplate::new(302)
-                .insert_header("Location", format!("{}/elsewhere/file.txt", mock_server.uri())),
-        )
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("{}/elsewhere/file.txt", mock_server.uri()),
+        ))
         .mount(&mock_server)
         .await;
 
@@ -665,10 +670,10 @@ async fn test_recursive_without_fail_fast_allows_other_children_to_finish() {
 
     Mock::given(method("HEAD"))
         .and(path("/pub/bad.txt"))
-        .respond_with(
-            ResponseTemplate::new(302)
-                .insert_header("Location", format!("{}/elsewhere/bad.txt", mock_server.uri())),
-        )
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("{}/elsewhere/bad.txt", mock_server.uri()),
+        ))
         .mount(&mock_server)
         .await;
 
@@ -767,10 +772,10 @@ async fn test_recursive_fail_fast_stops_other_children() {
 
     Mock::given(method("HEAD"))
         .and(path("/pub/bad.txt"))
-        .respond_with(
-            ResponseTemplate::new(302)
-                .insert_header("Location", format!("{}/elsewhere/bad.txt", mock_server.uri())),
-        )
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("{}/elsewhere/bad.txt", mock_server.uri()),
+        ))
         .mount(&mock_server)
         .await;
 
@@ -828,7 +833,11 @@ async fn test_recursive_fail_fast_stops_other_children() {
         DownloadState::Error { .. }
     ));
     match engine.status(slow_id).expect("slow child status").state {
-        DownloadState::Error { kind, message, retryable } => {
+        DownloadState::Error {
+            kind,
+            message,
+            retryable,
+        } => {
             assert_eq!(kind, "RecursiveFailFast");
             assert!(
                 message.contains(&bad_id.to_string()),
@@ -881,10 +890,10 @@ async fn test_recursive_child_redirect_scope_persists_across_restart() {
 
     Mock::given(method("GET"))
         .and(path("/pub/file.txt"))
-        .respond_with(
-            ResponseTemplate::new(302)
-                .insert_header("Location", format!("{}/elsewhere/file.txt", mock_server.uri())),
-        )
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("{}/elsewhere/file.txt", mock_server.uri()),
+        ))
         .mount(&mock_server)
         .await;
 
@@ -1033,7 +1042,11 @@ async fn test_tracked_recursive_jobs_persist_across_restart() {
     let resumed_engine =
         create_persistent_test_engine(&temp_dir, "tracked-recursive.sqlite", 4).await;
     let jobs = resumed_engine.list_recursive_jobs();
-    assert_eq!(jobs.len(), 1, "one tracked recursive job should be restored");
+    assert_eq!(
+        jobs.len(),
+        1,
+        "one tracked recursive job should be restored"
+    );
 
     let tracked_job = &jobs[0];
     assert_eq!(tracked_job.root_url, root_url);
@@ -2931,7 +2944,11 @@ async fn test_retry_exhaustion_reports_retryable_failure() {
 
     assert!(!completed, "Should not complete when server returns 500");
     let (error_msg, retryable) = failed.expect("Should receive Failed event");
-    assert!(retryable, "500 errors should be retryable, got: {}", error_msg);
+    assert!(
+        retryable,
+        "500 errors should be retryable, got: {}",
+        error_msg
+    );
 
     // Verify the engine status also reflects retryable
     let status = engine.status(id).expect("Should have status");
@@ -3110,7 +3127,10 @@ async fn test_etag_change_between_resume_attempts_restarts_from_zero() {
 
     let (completed, _failed, progress_events) = wait_for_terminal(&mut events, id, 15).await;
 
-    assert!(completed, "Should complete with new content after ETag change");
+    assert!(
+        completed,
+        "Should complete with new content after ETag change"
+    );
     assert_all_progress_invariants(&progress_events);
 
     // Verify file has NEW content, not a mix
@@ -3118,7 +3138,10 @@ async fn test_etag_change_between_resume_attempts_restarts_from_zero() {
     let downloaded = tokio::fs::read(&downloaded_file)
         .await
         .expect("Failed to read downloaded file");
-    assert_eq!(downloaded, new_content, "File should contain new content, not old");
+    assert_eq!(
+        downloaded, new_content,
+        "File should contain new content, not old"
+    );
 
     engine.shutdown().await.ok();
 }

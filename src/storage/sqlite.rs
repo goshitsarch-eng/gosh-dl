@@ -4,11 +4,11 @@
 
 use super::{Segment, SegmentState, Storage};
 use crate::error::{EngineError, Result};
+#[cfg(feature = "recursive-http")]
+use crate::types::TrackedRecursiveJob;
 use crate::types::{
     DownloadId, DownloadKind, DownloadMetadata, DownloadProgress, DownloadState, DownloadStatus,
 };
-#[cfg(feature = "recursive-http")]
-use crate::types::TrackedRecursiveJob;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -682,8 +682,9 @@ impl Storage for SqliteStorage {
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = conn.blocking_lock();
-            let child_ids_json = serde_json::to_string(&job.child_ids)
-                .map_err(|e| EngineError::Database(format!("Failed to serialize child ids: {}", e)))?;
+            let child_ids_json = serde_json::to_string(&job.child_ids).map_err(|e| {
+                EngineError::Database(format!("Failed to serialize child ids: {}", e))
+            })?;
             conn.execute(
                 r#"
                 INSERT INTO recursive_jobs (id, root_url, child_ids_json, created_at)

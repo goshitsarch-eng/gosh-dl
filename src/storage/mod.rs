@@ -10,9 +10,9 @@ pub(crate) mod sqlite;
 pub use sqlite::SqliteStorage;
 
 use crate::error::Result;
-use crate::types::{DownloadId, DownloadStatus};
 #[cfg(feature = "recursive-http")]
 use crate::types::TrackedRecursiveJob;
+use crate::types::{DownloadId, DownloadStatus};
 use async_trait::async_trait;
 use std::collections::HashMap;
 
