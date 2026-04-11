@@ -768,7 +768,10 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/pub/"))
-            .and(header("user-agent", "gosh-dl/0.3.2"))
+            .and(header(
+                "user-agent",
+                format!("gosh-dl/{}", env!("CARGO_PKG_VERSION")).as_str(),
+            ))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Type", "text/html")

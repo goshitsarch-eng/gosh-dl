@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-11
+
 ### Added
 - Recursive HTTP directory mirroring behind the `recursive-http` feature flag
 - `discover_http_recursive()` and `add_http_recursive()` engine APIs
@@ -14,13 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recursive parent job lifecycle APIs: `list_recursive_jobs()`, `recursive_job()`, `cancel_recursive_job()`, `remove_recursive_job()`, and `subscribe_recursive_jobs()`
 - Dedicated recursive parent event stream separate from `DownloadEvent`
 - SQLite schema v4 support for persisted tracked recursive jobs
+- Regression coverage for HTTP limiter accounting, mirror failover, magnet preference retention, live config updates, and recursive parent-job behavior
 
 ### Changed
 - Recursive HTTP child downloads now reuse the standard HTTP pipeline while carrying redirect-scope and fail-fast runtime metadata through persistence/restart
+- Runtime configuration updates now propagate to live HTTP bandwidth limits and download queue concurrency
+- Torrent downloads now derive runtime transport, webseed, and scheduling settings from `EngineConfig::torrent`
 
 ### Fixed
 - Recursive enqueue is now transactional: if child creation fails partway through, already-added children are rolled back instead of being left orphaned
 - Recursive redirect scope is enforced during discovery, child downloads, and resumed child downloads restored from storage
+- HTTP rate limiting now charges exact byte counts instead of incorrect fixed-size chunks
+- Per-download HTTP mirrors and `max_connections` are now wired into execution
+- Resume now preserves priority, checksum, and mirrors
+- Magnet `selected_files` and `sequential` preferences now persist until metadata is available
+- Torrent webseed, transport policy, and encryption settings are now wired through without regressing plaintext/TCP defaults
+- Recursive HTTP child downloads no longer deadlock in `Queued` during state-transition updates
 
 ### Documentation
 - Updated the README, technical spec, and recursive design/checklist docs to match the current shipped recursive feature set and remaining follow-up work
@@ -263,7 +274,8 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.2.9...v0.3.0
