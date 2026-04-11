@@ -64,6 +64,10 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, Semaphore};
 
+use crate::config::{
+    EncryptionConfig as EngineEncryptionConfig, EncryptionPolicy as EngineEncryptionPolicy,
+    TransportPolicy, WebSeedConfig as EngineWebSeedConfig,
+};
 use crate::error::Result;
 use crate::types::{DownloadEvent, DownloadId, DownloadProgress};
 use pex::parse_extension_handshake;
@@ -232,6 +236,14 @@ pub struct TorrentDownloader {
     /// Set at construction for .torrent files, or when metadata is
     /// fetched for magnet links.
     raw_torrent_data: RwLock<Option<Vec<u8>>>,
+    /// Piece-selection preferences that may arrive before metadata is available.
+    pending_selected_files: RwLock<Option<Vec<usize>>>,
+    pending_sequential: RwLock<Option<bool>>,
+    /// Per-download transport and protocol settings derived from EngineConfig.
+    webseed_config: RwLock<EngineWebSeedConfig>,
+    mse_config: RwLock<MseConfig>,
+    transport_policy: RwLock<TransportPolicy>,
+    tcp_fallback: AtomicBool,
     /// uTP multiplexer for UDP-based peer connections (BEP 29).
     /// Initialized in `start()` when `config.enable_utp` is true.
     utp_mux: RwLock<Option<Arc<UtpMux>>>,
@@ -328,6 +340,15 @@ impl TorrentDownloader {
             #[cfg(feature = "http")]
             webseed_task: RwLock::new(None),
             raw_torrent_data: RwLock::new(None),
+            pending_selected_files: RwLock::new(None),
+            pending_sequential: RwLock::new(None),
+            webseed_config: RwLock::new(EngineWebSeedConfig::default()),
+            mse_config: RwLock::new(MseConfig {
+                policy: EncryptionPolicy::Disabled,
+                ..MseConfig::default()
+            }),
+            transport_policy: RwLock::new(TransportPolicy::PreferTcp),
+            tcp_fallback: AtomicBool::new(true),
             utp_mux: RwLock::new(None),
         })
     }
@@ -368,6 +389,15 @@ impl TorrentDownloader {
             #[cfg(feature = "http")]
             webseed_task: RwLock::new(None),
             raw_torrent_data: RwLock::new(None),
+            pending_selected_files: RwLock::new(None),
+            pending_sequential: RwLock::new(None),
+            webseed_config: RwLock::new(EngineWebSeedConfig::default()),
+            mse_config: RwLock::new(MseConfig {
+                policy: EncryptionPolicy::Disabled,
+                ..MseConfig::default()
+            }),
+            transport_policy: RwLock::new(TransportPolicy::PreferTcp),
+            tcp_fallback: AtomicBool::new(true),
             utp_mux: RwLock::new(None),
         })
     }
@@ -382,6 +412,7 @@ impl TorrentDownloader {
     /// Only pieces that contain data from the selected files will be downloaded.
     /// If `file_indices` is empty or None, all files will be downloaded.
     pub fn set_selected_files(&self, file_indices: Option<&[usize]>) {
+        *self.pending_selected_files.write() = file_indices.map(|indices| indices.to_vec());
         if let Some(ref pm) = *self.piece_manager.read() {
             pm.set_selected_files(file_indices);
         }
@@ -390,8 +421,47 @@ impl TorrentDownloader {
     /// Enable or disable sequential download mode.
     /// When enabled, pieces are downloaded in order for streaming support.
     pub fn set_sequential(&self, sequential: bool) {
+        *self.pending_sequential.write() = Some(sequential);
         if let Some(ref pm) = *self.piece_manager.read() {
             pm.set_sequential(sequential);
+        }
+    }
+
+    /// Override the webseed configuration for this download.
+    pub fn set_webseed_config(&self, config: EngineWebSeedConfig) {
+        *self.webseed_config.write() = config;
+    }
+
+    /// Override the MSE configuration for this download.
+    pub fn set_mse_config(&self, config: EngineEncryptionConfig) {
+        *self.mse_config.write() = MseConfig {
+            policy: match config.policy {
+                EngineEncryptionPolicy::Disabled => EncryptionPolicy::Disabled,
+                EngineEncryptionPolicy::Allowed => EncryptionPolicy::Allowed,
+                EngineEncryptionPolicy::Preferred => EncryptionPolicy::Preferred,
+                EngineEncryptionPolicy::Required => EncryptionPolicy::Required,
+            },
+            allow_plaintext: config.allow_plaintext,
+            allow_rc4: config.allow_rc4,
+            min_padding: config.min_padding,
+            max_padding: config.max_padding,
+        };
+    }
+
+    /// Override the transport policy for this download.
+    pub fn set_transport_policy(&self, policy: TransportPolicy, tcp_fallback: bool) {
+        *self.transport_policy.write() = policy;
+        self.tcp_fallback.store(tcp_fallback, Ordering::Relaxed);
+    }
+
+    fn apply_piece_manager_preferences(&self, piece_manager: &PieceManager) {
+        let selected_files = self.pending_selected_files.read().clone();
+        if let Some(selected_files) = selected_files.as_deref() {
+            piece_manager.set_selected_files(Some(selected_files));
+        }
+
+        if let Some(sequential) = *self.pending_sequential.read() {
+            piece_manager.set_sequential(sequential);
         }
     }
 
@@ -603,6 +673,12 @@ impl TorrentDownloader {
             return;
         }
 
+        let engine_webseed_config = self.webseed_config.read().clone();
+        if !engine_webseed_config.enabled {
+            tracing::debug!("Webseeds disabled for torrent {}", self.info_hash_hex());
+            return;
+        }
+
         tracing::info!(
             "Starting webseed downloads for torrent {} with {} seeds",
             self.info_hash_hex(),
@@ -610,7 +686,12 @@ impl TorrentDownloader {
         );
 
         // Create webseed manager
-        let config = WebSeedConfig::default();
+        let config = WebSeedConfig {
+            max_connections: engine_webseed_config.max_connections,
+            request_timeout: Duration::from_secs(engine_webseed_config.timeout_seconds),
+            max_failures: engine_webseed_config.max_failures,
+            ..WebSeedConfig::default()
+        };
         let (manager, mut event_rx) =
             match WebSeedManager::new(metainfo.clone(), piece_manager.clone(), config) {
                 Ok(result) => result,
@@ -1133,35 +1214,131 @@ impl TorrentDownloader {
         shared_stats: Arc<RwLock<HashMap<SocketAddr, PeerStats>>>,
         choking_decisions: Arc<RwLock<HashMap<SocketAddr, bool>>>,
     ) -> Result<()> {
-        // Connect to peer — try uTP first if available, fall back to TCP
+        // Connect to peer using the configured transport policy.
         let metadata_only = downloader.metadata_fetcher.is_some() && num_pieces == 0;
         let utp_mux = downloader.utp_mux.read().clone();
-        let mut conn = if let Some(ref mux) = utp_mux {
-            match mux.connect(addr).await {
-                Ok(socket) => {
-                    match PeerConnection::connect_utp(socket, info_hash, peer_id, num_pieces).await
-                    {
-                        Ok(c) => {
-                            tracing::info!("Connected to peer {} via uTP", addr);
-                            c
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "uTP handshake with {} failed: {}, falling back to TCP",
-                                addr,
-                                e
-                            );
-                            PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?
+        let transport_policy = *downloader.transport_policy.read();
+        let tcp_fallback = downloader.tcp_fallback.load(Ordering::Relaxed);
+        let mse_config = downloader.mse_config.read().clone();
+        let mut conn = match transport_policy {
+            TransportPolicy::TcpOnly => {
+                PeerConnection::connect_with_encryption(
+                    addr,
+                    info_hash,
+                    peer_id,
+                    num_pieces,
+                    Some(&mse_config),
+                )
+                .await?
+            }
+            TransportPolicy::PreferTcp => {
+                match PeerConnection::connect_with_encryption(
+                    addr,
+                    info_hash,
+                    peer_id,
+                    num_pieces,
+                    Some(&mse_config),
+                )
+                .await
+                {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        if let Some(ref mux) = utp_mux {
+                            if tcp_fallback {
+                                tracing::debug!(
+                                    "TCP connect to {} failed: {}, falling back to uTP",
+                                    addr,
+                                    error
+                                );
+                                let socket = mux.connect(addr).await?;
+                                PeerConnection::connect_utp(socket, info_hash, peer_id, num_pieces)
+                                    .await?
+                            } else {
+                                return Err(error);
+                            }
+                        } else {
+                            return Err(error);
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::debug!("uTP connect to {} failed: {}, falling back to TCP", addr, e);
-                    PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?
+            }
+            TransportPolicy::UtpOnly | TransportPolicy::PreferUtp => {
+                if let Some(ref mux) = utp_mux {
+                    match mux.connect(addr).await {
+                        Ok(socket) => {
+                            match PeerConnection::connect_utp(
+                                socket, info_hash, peer_id, num_pieces,
+                            )
+                            .await
+                            {
+                                Ok(c) => {
+                                    tracing::info!("Connected to peer {} via uTP", addr);
+                                    c
+                                }
+                                Err(e) => {
+                                    if tcp_fallback && transport_policy != TransportPolicy::UtpOnly
+                                    {
+                                        tracing::debug!(
+                                            "uTP handshake with {} failed: {}, falling back to TCP",
+                                            addr,
+                                            e
+                                        );
+                                        PeerConnection::connect_with_encryption(
+                                            addr,
+                                            info_hash,
+                                            peer_id,
+                                            num_pieces,
+                                            Some(&mse_config),
+                                        )
+                                        .await?
+                                    } else {
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if tcp_fallback && transport_policy != TransportPolicy::UtpOnly {
+                                tracing::debug!(
+                                    "uTP connect to {} failed: {}, falling back to TCP",
+                                    addr,
+                                    e
+                                );
+                                PeerConnection::connect_with_encryption(
+                                    addr,
+                                    info_hash,
+                                    peer_id,
+                                    num_pieces,
+                                    Some(&mse_config),
+                                )
+                                .await?
+                            } else {
+                                return Err(crate::error::EngineError::network(
+                                    crate::error::NetworkErrorKind::Other,
+                                    format!("uTP connect failed: {}", e),
+                                ));
+                            }
+                        }
+                    }
+                } else if transport_policy == TransportPolicy::UtpOnly {
+                    return Err(crate::error::EngineError::network(
+                        crate::error::NetworkErrorKind::Other,
+                        format!(
+                            "uTP transport required for {} but no multiplexer is available",
+                            addr
+                        ),
+                    ));
+                } else {
+                    PeerConnection::connect_with_encryption(
+                        addr,
+                        info_hash,
+                        peer_id,
+                        num_pieces,
+                        Some(&mse_config),
+                    )
+                    .await?
                 }
             }
-        } else {
-            PeerConnection::connect(addr, info_hash, peer_id, num_pieces).await?
         };
         tracing::info!("Connected to peer {}", addr);
 
@@ -1481,6 +1658,7 @@ impl TorrentDownloader {
                                                         metainfo.clone(),
                                                         downloader.save_dir.clone(),
                                                     ));
+                                                    downloader.apply_piece_manager_preferences(&pm);
 
                                                     // Verify existing files (same as start() does for torrent files)
                                                     *downloader.state.write() =
@@ -1979,6 +2157,7 @@ impl TorrentDownloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_torrent_config_default() {
@@ -1992,5 +2171,30 @@ mod tests {
     fn test_torrent_state() {
         assert_ne!(TorrentState::Downloading, TorrentState::Seeding);
         assert_eq!(TorrentState::Paused, TorrentState::Paused);
+    }
+
+    #[test]
+    fn test_magnet_preferences_are_retained_until_metadata_arrives() {
+        let magnet =
+            MagnetUri::parse("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567")
+                .expect("valid magnet");
+        let (event_tx, _) = broadcast::channel(4);
+        let downloader = TorrentDownloader::from_magnet(
+            DownloadId::new(),
+            magnet,
+            PathBuf::from("."),
+            TorrentConfig::default(),
+            event_tx,
+        )
+        .expect("downloader");
+
+        downloader.set_selected_files(Some(&[1, 3]));
+        downloader.set_sequential(true);
+
+        assert_eq!(
+            downloader.pending_selected_files.read().clone(),
+            Some(vec![1, 3])
+        );
+        assert_eq!(*downloader.pending_sequential.read(), Some(true));
     }
 }

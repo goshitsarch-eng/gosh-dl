@@ -553,9 +553,38 @@ impl PeerConnection {
 
         // Optionally perform MSE handshake
         let (stream, encrypted) = if let Some(config) = mse_config {
-            let peer_stream = connect_with_mse(tcp_stream, info_hash, config).await?;
-            let is_encrypted = peer_stream.is_encrypted();
-            (peer_stream, is_encrypted)
+            match connect_with_mse(tcp_stream, info_hash, config).await {
+                Ok(peer_stream) => {
+                    let is_encrypted = peer_stream.is_encrypted();
+                    (peer_stream, is_encrypted)
+                }
+                Err(error)
+                    if config.policy != super::mse::EncryptionPolicy::Required
+                        && config.allow_plaintext =>
+                {
+                    tracing::debug!(
+                        "MSE handshake with {} failed ({}), retrying plaintext",
+                        addr,
+                        error
+                    );
+                    let fallback_stream = timeout(PEER_CONNECT_TIMEOUT, TcpStream::connect(addr))
+                        .await
+                        .map_err(|_| {
+                            EngineError::network(
+                                NetworkErrorKind::Timeout,
+                                "Peer connection timeout",
+                            )
+                        })?
+                        .map_err(|e| {
+                            EngineError::network(
+                                NetworkErrorKind::ConnectionRefused,
+                                format!("Failed to connect: {}", e),
+                            )
+                        })?;
+                    (PeerStream::Plain(fallback_stream), false)
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             (PeerStream::Plain(tcp_stream), false)
         };

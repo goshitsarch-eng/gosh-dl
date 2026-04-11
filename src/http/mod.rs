@@ -125,6 +125,12 @@ impl HttpDownloader {
         &self.retry_policy
     }
 
+    /// Update the live HTTP bandwidth limits used by future requests.
+    pub fn set_bandwidth_limits(&self, download_limit: Option<u64>, upload_limit: Option<u64>) {
+        self.pool.set_download_limit(download_limit);
+        self.pool.set_upload_limit(upload_limit);
+    }
+
     /// Download a file from a URL
     ///
     /// Returns the final path of the downloaded file
@@ -173,8 +179,9 @@ impl HttpDownloader {
         headers: &[(String, String)],
         cookies: Option<&[String]>,
         checksum: Option<&ExpectedChecksum>,
-        #[cfg(feature = "recursive-http")]
-        redirect_scope: Option<crate::http::crawl::RedirectScope>,
+        #[cfg(feature = "recursive-http")] redirect_scope: Option<
+            crate::http::crawl::RedirectScope,
+        >,
         cancel_token: CancellationToken,
         progress_callback: F,
     ) -> Result<PathBuf>
@@ -520,9 +527,7 @@ impl HttpDownloader {
                 }
                 Err(e) => {
                     // Keep .part file for potential resume
-                    if e.is_retryable()
-                        && self.retry_policy.should_retry(stream_attempt, &e)
-                    {
+                    if e.is_retryable() && self.retry_policy.should_retry(stream_attempt, &e) {
                         stream_attempt += 1;
                         let delay = self.retry_policy.delay_for_attempt(stream_attempt - 1);
                         if supports_range {
@@ -730,8 +735,9 @@ impl HttpDownloader {
         headers: &[(String, String)],
         cookies: Option<&[String]>,
         checksum: Option<&ExpectedChecksum>,
-        #[cfg(feature = "recursive-http")]
-        redirect_scope: Option<crate::http::crawl::RedirectScope>,
+        #[cfg(feature = "recursive-http")] redirect_scope: Option<
+            crate::http::crawl::RedirectScope,
+        >,
         max_connections: usize,
         min_segment_size: u64,
         cancel_token: CancellationToken,

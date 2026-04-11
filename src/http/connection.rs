@@ -6,9 +6,11 @@
 use crate::config::HttpConfig;
 use crate::error::{EngineError, NetworkErrorKind, Result};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use parking_lot::RwLock as ParkingRwLock;
 use reqwest::Client;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -17,9 +19,9 @@ pub struct ConnectionPool {
     /// HTTP client (reqwest handles its own connection pool)
     client: Client,
     /// Global rate limiter for download speed
-    download_limiter: Option<DefaultDirectRateLimiter>,
+    download_limiter: ParkingRwLock<Option<Arc<DefaultDirectRateLimiter>>>,
     /// Global rate limiter for upload speed
-    upload_limiter: Option<DefaultDirectRateLimiter>,
+    upload_limiter: ParkingRwLock<Option<Arc<DefaultDirectRateLimiter>>>,
     /// Total bytes downloaded
     total_downloaded: AtomicU64,
     /// Total bytes uploaded
@@ -76,8 +78,8 @@ impl ConnectionPool {
 
         Ok(Self {
             client,
-            download_limiter: None,
-            upload_limiter: None,
+            download_limiter: ParkingRwLock::new(None),
+            upload_limiter: ParkingRwLock::new(None),
             total_downloaded: AtomicU64::new(0),
             total_uploaded: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
@@ -91,17 +93,9 @@ impl ConnectionPool {
         download_limit: Option<u64>,
         upload_limit: Option<u64>,
     ) -> Result<Self> {
-        let mut pool = Self::new(config)?;
-
-        pool.download_limiter = download_limit.and_then(|limit| {
-            let clamped = limit.min(u32::MAX as u64) as u32;
-            NonZeroU32::new(clamped).map(|n| RateLimiter::direct(Quota::per_second(n)))
-        });
-
-        pool.upload_limiter = upload_limit.and_then(|limit| {
-            let clamped = limit.min(u32::MAX as u64) as u32;
-            NonZeroU32::new(clamped).map(|n| RateLimiter::direct(Quota::per_second(n)))
-        });
+        let pool = Self::new(config)?;
+        pool.set_download_limit(download_limit);
+        pool.set_upload_limit(upload_limit);
 
         Ok(pool)
     }
@@ -112,44 +106,31 @@ impl ConnectionPool {
     }
 
     /// Update download speed limit
-    pub fn set_download_limit(&mut self, limit: Option<u64>) {
-        self.download_limiter = limit.and_then(|l| {
-            let clamped = l.min(u32::MAX as u64) as u32;
-            NonZeroU32::new(clamped).map(|n| RateLimiter::direct(Quota::per_second(n)))
-        });
+    pub fn set_download_limit(&self, limit: Option<u64>) {
+        *self.download_limiter.write() = limit.and_then(build_rate_limiter);
     }
 
     /// Update upload speed limit
-    pub fn set_upload_limit(&mut self, limit: Option<u64>) {
-        self.upload_limiter = limit.and_then(|l| {
-            let clamped = l.min(u32::MAX as u64) as u32;
-            NonZeroU32::new(clamped).map(|n| RateLimiter::direct(Quota::per_second(n)))
-        });
+    pub fn set_upload_limit(&self, limit: Option<u64>) {
+        *self.upload_limiter.write() = limit.and_then(build_rate_limiter);
     }
 
     /// Wait for rate limiter permission to download bytes
     pub async fn acquire_download(&self, bytes: u64) {
-        if let Some(ref limiter) = self.download_limiter {
-            // Acquire permission in chunks to avoid blocking too long
-            let chunk_size = 16384; // 16KB chunks
-            let chunks = (bytes / chunk_size).max(1) as u32;
-            for _ in 0..chunks {
-                if let Some(n) = NonZeroU32::new(chunk_size as u32) {
-                    let _ = limiter.until_n_ready(n).await;
-                }
+        let limiter = self.download_limiter.read().clone();
+        if let Some(limiter) = limiter {
+            for chunk in limiter_chunks(bytes) {
+                let _ = limiter.until_n_ready(chunk).await;
             }
         }
     }
 
     /// Wait for rate limiter permission to upload bytes
     pub async fn acquire_upload(&self, bytes: u64) {
-        if let Some(ref limiter) = self.upload_limiter {
-            let chunk_size = 16384;
-            let chunks = (bytes / chunk_size).max(1) as u32;
-            for _ in 0..chunks {
-                if let Some(n) = NonZeroU32::new(chunk_size as u32) {
-                    let _ = limiter.until_n_ready(n).await;
-                }
+        let limiter = self.upload_limiter.read().clone();
+        if let Some(limiter) = limiter {
+            for chunk in limiter_chunks(bytes) {
+                let _ = limiter.until_n_ready(chunk).await;
             }
         }
     }
@@ -216,6 +197,57 @@ impl ConnectionPool {
     /// Get connection statistics
     pub async fn stats(&self) -> ConnectionStats {
         self.stats.read().await.clone()
+    }
+}
+
+fn build_rate_limiter(limit: u64) -> Option<Arc<DefaultDirectRateLimiter>> {
+    let clamped = limit.min(u32::MAX as u64) as u32;
+    NonZeroU32::new(clamped).map(|n| Arc::new(RateLimiter::direct(Quota::per_second(n))))
+}
+
+fn limiter_chunks(bytes: u64) -> Vec<NonZeroU32> {
+    const CHUNK_SIZE: u64 = 16 * 1024;
+
+    if bytes == 0 {
+        return Vec::new();
+    }
+
+    let full_chunks = bytes / CHUNK_SIZE;
+    let remainder = bytes % CHUNK_SIZE;
+    let mut chunks = Vec::with_capacity(full_chunks as usize + usize::from(remainder > 0));
+
+    for _ in 0..full_chunks {
+        chunks.push(NonZeroU32::new(CHUNK_SIZE as u32).expect("chunk size is non-zero"));
+    }
+
+    if remainder > 0 {
+        chunks.push(NonZeroU32::new(remainder as u32).expect("remainder is non-zero"));
+    }
+
+    chunks
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::limiter_chunks;
+
+    #[test]
+    fn limiter_chunks_is_empty_for_zero_bytes() {
+        assert!(limiter_chunks(0).is_empty());
+    }
+
+    #[test]
+    fn limiter_chunks_preserves_exact_byte_count() {
+        let chunks = limiter_chunks(16 * 1024 + 17);
+        let total: u64 = chunks.into_iter().map(|chunk| chunk.get() as u64).sum();
+        assert_eq!(total, 16 * 1024 + 17);
+    }
+
+    #[test]
+    fn limiter_chunks_does_not_over_throttle_small_reads() {
+        let chunks = limiter_chunks(1);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].get(), 1);
     }
 }
 

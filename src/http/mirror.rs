@@ -132,6 +132,23 @@ impl MirrorManager {
         Some(self.current_url())
     }
 
+    /// Immediately fail over away from a specific URL.
+    pub fn failover_from(&self, url: &str) -> Option<&str> {
+        let idx = self.urls.iter().position(|candidate| candidate == url)?;
+        {
+            let mut failed = self.failed.write();
+            if !failed.contains(&idx) {
+                failed.push(idx);
+            }
+        }
+
+        if self.current_index.load(Ordering::Relaxed) == idx {
+            self.switch_to_next()
+        } else {
+            Some(self.current_url())
+        }
+    }
+
     /// Switch to next available URL
     fn switch_to_next(&self) -> Option<&str> {
         let failed = self.failed.read();
@@ -262,5 +279,17 @@ mod tests {
         assert!(mgr.has_available());
         assert_eq!(mgr.available_count(), 2);
         assert_eq!(mgr.current_url(), "http://primary.com/file.zip");
+    }
+
+    #[test]
+    fn test_immediate_failover_switches_sources() {
+        let mgr = MirrorManager::new(
+            "http://primary.com/file.zip".to_string(),
+            vec!["http://mirror.com/file.zip".to_string()],
+        );
+
+        let next = mgr.failover_from("http://primary.com/file.zip");
+        assert_eq!(next, Some("http://mirror.com/file.zip"));
+        assert_eq!(mgr.current_url(), "http://mirror.com/file.zip");
     }
 }

@@ -7,7 +7,7 @@
 use crate::protocol::DownloadId;
 use parking_lot::Mutex;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -74,6 +74,8 @@ struct PriorityQueueInner {
 pub struct PriorityQueue {
     /// Semaphore for limiting concurrent downloads
     semaphore: Arc<Semaphore>,
+    /// Current concurrency ceiling for new acquisitions.
+    max_concurrent: AtomicUsize,
     /// Internal queue state
     inner: Mutex<PriorityQueueInner>,
     /// Sequence counter for FIFO ordering
@@ -87,6 +89,7 @@ impl PriorityQueue {
     pub fn new(max_concurrent: usize) -> Arc<Self> {
         Arc::new(Self {
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_concurrent: AtomicUsize::new(max_concurrent),
             inner: Mutex::new(PriorityQueueInner {
                 waiting: BinaryHeap::new(),
                 active: HashMap::new(),
@@ -134,7 +137,9 @@ impl PriorityQueue {
             {
                 let inner = self.inner.lock();
                 if let Some(next) = inner.waiting.peek() {
-                    if next.id == id {
+                    if next.id == id
+                        && inner.active.len() < self.max_concurrent.load(Ordering::Relaxed)
+                    {
                         // We're next, try to acquire semaphore
                         drop(inner); // Release lock before async operation
 
@@ -188,6 +193,9 @@ impl PriorityQueue {
         priority: DownloadPriority,
     ) -> Option<PriorityPermit> {
         let mut inner = self.inner.lock();
+        if inner.active.len() >= self.max_concurrent.load(Ordering::Relaxed) {
+            return None;
+        }
 
         // Check if there are higher priority downloads waiting
         if let Some(next) = inner.waiting.peek() {
@@ -270,6 +278,15 @@ impl PriorityQueue {
             .get(&id)
             .or_else(|| inner.active.get(&id))
             .copied()
+    }
+
+    /// Update the concurrency ceiling for future acquisitions.
+    pub fn set_max_concurrent(&self, max_concurrent: usize) {
+        let previous = self.max_concurrent.swap(max_concurrent, Ordering::Relaxed);
+        if max_concurrent > previous {
+            self.semaphore.add_permits(max_concurrent - previous);
+        }
+        self.notify.notify_waiters();
     }
 
     /// Get the number of active downloads

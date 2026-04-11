@@ -7,7 +7,7 @@
 use crate::config::EngineConfig;
 use crate::error::{EngineError, Result};
 #[cfg(feature = "http")]
-use crate::http::{HttpDownloader, SegmentedDownload};
+use crate::http::{HttpDownloader, MirrorManager, SegmentedDownload};
 use crate::priority_queue::{DownloadPriority, PriorityQueue};
 use crate::scheduler::{BandwidthLimits, BandwidthScheduler};
 #[cfg(feature = "storage")]
@@ -23,9 +23,13 @@ use crate::types::{DownloadKind, DownloadMetadata, DownloadProgress};
 #[cfg(feature = "torrent")]
 use crate::types::{TorrentFile, TorrentStatusInfo};
 
+#[cfg(all(feature = "http", feature = "recursive-http"))]
+use crate::http::crawl;
 #[cfg(any(feature = "http", feature = "torrent"))]
 use chrono::Utc;
 use parking_lot::RwLock;
+#[cfg(all(feature = "http", feature = "recursive-http"))]
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(all(feature = "http", feature = "recursive-http"))]
 use std::collections::HashSet;
@@ -35,10 +39,6 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 #[cfg(feature = "http")]
 use url::Url;
-#[cfg(all(feature = "http", feature = "recursive-http"))]
-use crate::http::crawl;
-#[cfg(all(feature = "http", feature = "recursive-http"))]
-use serde::{Deserialize, Serialize};
 #[cfg(all(feature = "http", feature = "recursive-http"))]
 use uuid::Uuid;
 
@@ -171,8 +171,7 @@ impl DownloadEngine {
         // Create event channel
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         #[cfg(all(feature = "http", feature = "recursive-http"))]
-        let (recursive_job_event_tx, _) =
-            broadcast::channel(RECURSIVE_EVENT_CHANNEL_CAPACITY);
+        let (recursive_job_event_tx, _) = broadcast::channel(RECURSIVE_EVENT_CHANNEL_CAPACITY);
 
         // Create HTTP downloader
         #[cfg(feature = "http")]
@@ -287,7 +286,13 @@ impl DownloadEngine {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        engine.scheduler.read().update();
+                        if engine.scheduler.read().update() {
+                            let limits = engine.scheduler.read().get_limits();
+                            #[cfg(feature = "http")]
+                            engine
+                                .http
+                                .set_bandwidth_limits(limits.download, limits.upload);
+                        }
                     }
                     _ = shutdown.cancelled() => {
                         break;
@@ -534,10 +539,10 @@ impl DownloadEngine {
         &self,
         url: &str,
         options: DownloadOptions,
-        #[cfg(all(feature = "http", feature = "recursive-http"))]
-        redirect_scope: Option<crawl::RedirectScope>,
-        #[cfg(all(feature = "http", feature = "recursive-http"))]
-        recursive_group_id: Option<Uuid>,
+        #[cfg(all(feature = "http", feature = "recursive-http"))] redirect_scope: Option<
+            crawl::RedirectScope,
+        >,
+        #[cfg(all(feature = "http", feature = "recursive-http"))] recursive_group_id: Option<Uuid>,
     ) -> Result<DownloadId> {
         // Validate URL
         let parsed_url = Url::parse(url)
@@ -773,11 +778,7 @@ impl DownloadEngine {
 
         if let Some(ref storage) = self.storage {
             if let Err(e) = storage.save_recursive_job(&tracked_job).await {
-                tracing::warn!(
-                    "Failed to persist recursive job {}: {}",
-                    tracked_job.id,
-                    e
-                );
+                tracing::warn!("Failed to persist recursive job {}: {}", tracked_job.id, e);
             }
         }
 
@@ -833,9 +834,7 @@ impl DownloadEngine {
 
     /// Subscribe to recursive parent job events.
     #[cfg(all(feature = "http", feature = "recursive-http"))]
-    pub fn subscribe_recursive_jobs(
-        &self,
-    ) -> broadcast::Receiver<crate::types::RecursiveJobEvent> {
+    pub fn subscribe_recursive_jobs(&self) -> broadcast::Receiver<crate::types::RecursiveJobEvent> {
         self.recursive_job_event_tx.subscribe()
     }
 
@@ -996,7 +995,10 @@ impl DownloadEngine {
                     recursive_group_id,
                     fail_fast: recursive_group_id
                         .and_then(|group_id| {
-                            self.recursive_groups.read().get(&group_id).map(|g| g.fail_fast)
+                            self.recursive_groups
+                                .read()
+                                .get(&group_id)
+                                .map(|g| g.fail_fast)
                         })
                         .unwrap_or(false),
                 }),
@@ -1093,9 +1095,7 @@ impl DownloadEngine {
 
                 if !matches!(
                     download.status.state,
-                    DownloadState::Queued
-                        | DownloadState::Connecting
-                        | DownloadState::Downloading
+                    DownloadState::Queued | DownloadState::Connecting | DownloadState::Downloading
                 ) {
                     continue;
                 }
@@ -1334,6 +1334,38 @@ impl DownloadEngine {
 
     /// Start a torrent download task
     #[cfg(feature = "torrent")]
+    fn build_torrent_runtime_config(&self, options: &DownloadOptions) -> TorrentConfig {
+        let config = self.config.read();
+        TorrentConfig {
+            max_peers: config.max_peers,
+            listen_port_range: config.torrent.listen_port_range,
+            enable_dht: config.enable_dht,
+            enable_pex: config.enable_pex,
+            enable_lpd: config.enable_lpd,
+            seed_ratio: options.seed_ratio.or(Some(config.seed_ratio)),
+            max_upload_speed: options
+                .max_upload_speed
+                .or(config.global_upload_limit)
+                .unwrap_or(0),
+            max_download_speed: options
+                .max_download_speed
+                .or(config.global_download_limit)
+                .unwrap_or(0),
+            announce_interval: config.torrent.tracker_update_interval,
+            request_timeout: Duration::from_secs(config.torrent.peer_timeout),
+            keepalive_interval: Duration::from_secs(120),
+            max_pending_requests: config.torrent.max_pending_requests,
+            dht_bootstrap_nodes: config.torrent.dht_bootstrap_nodes.clone(),
+            tick_interval_ms: config.torrent.tick_interval_ms,
+            connect_interval_secs: config.torrent.connect_interval_secs,
+            choking_interval_secs: config.torrent.choking_interval_secs,
+            enable_utp: config.torrent.utp.enabled
+                && config.torrent.utp.policy != crate::config::TransportPolicy::TcpOnly,
+        }
+    }
+
+    /// Start a torrent download task
+    #[cfg(feature = "torrent")]
     async fn start_torrent(
         &self,
         id: DownloadId,
@@ -1341,18 +1373,30 @@ impl DownloadEngine {
         save_dir: std::path::PathBuf,
         options: DownloadOptions,
     ) -> Result<()> {
-        let config = self.config.read();
-        let torrent_config = TorrentConfig {
-            max_peers: config.max_peers,
-            enable_dht: config.enable_dht,
-            enable_pex: config.enable_pex,
-            enable_lpd: config.enable_lpd,
-            seed_ratio: Some(config.seed_ratio),
-            max_upload_speed: config.global_upload_limit.unwrap_or(0),
-            max_download_speed: config.global_download_limit.unwrap_or(0),
-            ..TorrentConfig::default()
+        let torrent_config = self.build_torrent_runtime_config(&options);
+        let (webseed_config, encryption_config, transport_policy, tcp_fallback) = {
+            let config = self.config.read();
+            let encryption = if config.torrent.encryption.policy
+                == crate::config::EncryptionPolicy::Preferred
+                && config.torrent.encryption.allow_plaintext
+                && config.torrent.encryption.allow_rc4
+                && config.torrent.encryption.min_padding == 0
+                && config.torrent.encryption.max_padding == 512
+            {
+                crate::config::EncryptionConfig {
+                    policy: crate::config::EncryptionPolicy::Disabled,
+                    ..config.torrent.encryption.clone()
+                }
+            } else {
+                config.torrent.encryption.clone()
+            };
+            (
+                config.torrent.webseed.clone(),
+                encryption,
+                config.torrent.utp.policy,
+                config.torrent.utp.tcp_fallback,
+            )
         };
-        drop(config);
 
         let downloader = Arc::new(TorrentDownloader::from_torrent(
             id,
@@ -1361,6 +1405,9 @@ impl DownloadEngine {
             torrent_config,
             self.event_tx.clone(),
         )?);
+        downloader.set_webseed_config(webseed_config);
+        downloader.set_mse_config(encryption_config);
+        downloader.set_transport_policy(transport_policy, tcp_fallback);
 
         // Apply selected files for partial download
         if let Some(ref selected) = options.selected_files {
@@ -1503,18 +1550,30 @@ impl DownloadEngine {
         save_dir: std::path::PathBuf,
         options: DownloadOptions,
     ) -> Result<()> {
-        let config = self.config.read();
-        let torrent_config = TorrentConfig {
-            max_peers: config.max_peers,
-            enable_dht: config.enable_dht,
-            enable_pex: config.enable_pex,
-            enable_lpd: config.enable_lpd,
-            seed_ratio: Some(config.seed_ratio),
-            max_upload_speed: config.global_upload_limit.unwrap_or(0),
-            max_download_speed: config.global_download_limit.unwrap_or(0),
-            ..TorrentConfig::default()
+        let torrent_config = self.build_torrent_runtime_config(&options);
+        let (webseed_config, encryption_config, transport_policy, tcp_fallback) = {
+            let config = self.config.read();
+            let encryption = if config.torrent.encryption.policy
+                == crate::config::EncryptionPolicy::Preferred
+                && config.torrent.encryption.allow_plaintext
+                && config.torrent.encryption.allow_rc4
+                && config.torrent.encryption.min_padding == 0
+                && config.torrent.encryption.max_padding == 512
+            {
+                crate::config::EncryptionConfig {
+                    policy: crate::config::EncryptionPolicy::Disabled,
+                    ..config.torrent.encryption.clone()
+                }
+            } else {
+                config.torrent.encryption.clone()
+            };
+            (
+                config.torrent.webseed.clone(),
+                encryption,
+                config.torrent.utp.policy,
+                config.torrent.utp.tcp_fallback,
+            )
         };
-        drop(config);
 
         let downloader = Arc::new(TorrentDownloader::from_magnet(
             id,
@@ -1523,6 +1582,13 @@ impl DownloadEngine {
             torrent_config,
             self.event_tx.clone(),
         )?);
+        downloader.set_webseed_config(webseed_config);
+        downloader.set_mse_config(encryption_config);
+        downloader.set_transport_policy(transport_policy, tcp_fallback);
+
+        if let Some(ref selected) = options.selected_files {
+            downloader.set_selected_files(Some(selected));
+        }
 
         // Apply sequential download mode if requested
         if let Some(sequential) = options.sequential {
@@ -1778,6 +1844,7 @@ impl DownloadEngine {
                 headers,
                 cookies,
                 checksum,
+                mirrors,
                 redirect_scope,
                 recursive_group_id,
             ) = {
@@ -1793,12 +1860,13 @@ impl DownloadEngine {
                     download.status.metadata.headers.clone(),
                     download.status.metadata.cookies.clone(),
                     download.status.metadata.checksum.clone(),
+                    download.status.metadata.mirrors.clone(),
                     download.redirect_scope.clone(),
                     download.recursive_group_id,
                 )
             };
             #[cfg(not(feature = "recursive-http"))]
-            let (save_dir, filename, user_agent, referer, headers, cookies, checksum) = {
+            let (save_dir, filename, user_agent, referer, headers, cookies, checksum, mirrors) = {
                 let downloads = engine.downloads.read();
                 let download = downloads
                     .get(&id)
@@ -1811,12 +1879,13 @@ impl DownloadEngine {
                     download.status.metadata.headers.clone(),
                     download.status.metadata.cookies.clone(),
                     download.status.metadata.checksum.clone(),
+                    download.status.metadata.mirrors.clone(),
                 )
             };
 
             // Create progress callback
             let engine_clone = Arc::clone(&engine);
-            let progress_callback = move |progress: DownloadProgress| {
+            let progress_callback = Arc::new(move |progress: DownloadProgress| {
                 // Update progress in download status
                 {
                     let mut downloads = engine_clone.downloads.write();
@@ -1830,12 +1899,17 @@ impl DownloadEngine {
                     .send(DownloadEvent::Progress { id, progress });
                 #[cfg(feature = "recursive-http")]
                 engine_clone.emit_recursive_job_updates_for_child(id);
-            };
+            });
 
             // Get config for segmented downloads
             let (max_connections, min_segment_size) = {
                 let config = engine.config.read();
-                (config.max_connections_per_download, config.min_segment_size)
+                (
+                    options
+                        .max_connections
+                        .unwrap_or(config.max_connections_per_download),
+                    config.min_segment_size,
+                )
             };
 
             // Perform the download (uses segmented if server supports it)
@@ -1844,26 +1918,56 @@ impl DownloadEngine {
             } else {
                 Some(cookies.as_slice())
             };
-            let result = http
-                .download_segmented_with_scope(
-                    &url,
-                    &save_dir,
-                    filename.as_deref(),
-                    user_agent.as_deref(),
-                    referer.as_deref(),
-                    &headers,
-                    cookies_opt,
-                    checksum.as_ref(),
-                    #[cfg(feature = "recursive-http")]
-                    redirect_scope,
-                    max_connections,
-                    min_segment_size,
-                    cancel_token_clone.clone(),
-                    saved_segments,
-                    progress_callback,
-                    Some(Arc::clone(&segmented_ref_for_task)),
-                )
-                .await;
+            let mirror_manager = MirrorManager::new(url.clone(), mirrors);
+            let mut active_url = mirror_manager.current_url().to_string();
+            let mut saved_segments = saved_segments;
+            let result = loop {
+                let attempt_url = active_url.clone();
+                let attempt_result = http
+                    .download_segmented_with_scope(
+                        &attempt_url,
+                        &save_dir,
+                        filename.as_deref(),
+                        user_agent.as_deref(),
+                        referer.as_deref(),
+                        &headers,
+                        cookies_opt,
+                        checksum.as_ref(),
+                        #[cfg(feature = "recursive-http")]
+                        redirect_scope.clone(),
+                        max_connections,
+                        min_segment_size,
+                        cancel_token_clone.clone(),
+                        saved_segments.take(),
+                        {
+                            let progress_callback = Arc::clone(&progress_callback);
+                            move |progress| progress_callback(progress)
+                        },
+                        Some(Arc::clone(&segmented_ref_for_task)),
+                    )
+                    .await;
+
+                match attempt_result {
+                    Ok(result) => break Ok(result),
+                    Err(err) => {
+                        if let Some(next_url) = mirror_manager.failover_from(&attempt_url) {
+                            if next_url != attempt_url {
+                                tracing::warn!(
+                                    "Download {} failed on {} ({}). Failing over to {}",
+                                    id,
+                                    attempt_url,
+                                    err,
+                                    next_url
+                                );
+                                active_url = next_url.to_string();
+                                saved_segments = None;
+                                continue;
+                            }
+                        }
+                        break Err(err);
+                    }
+                }
+            };
 
             match result {
                 Ok((final_path, _segmented_download)) => {
@@ -2116,6 +2220,7 @@ impl DownloadEngine {
             let has_torrent_handle = false;
 
             let options = DownloadOptions {
+                priority: download.status.priority,
                 save_dir: Some(download.status.metadata.save_dir.clone()),
                 filename: download.status.metadata.filename.clone(),
                 user_agent: download.status.metadata.user_agent.clone(),
@@ -2126,6 +2231,8 @@ impl DownloadEngine {
                 } else {
                     Some(download.status.metadata.cookies.clone())
                 },
+                checksum: download.status.metadata.checksum.clone(),
+                mirrors: download.status.metadata.mirrors.clone(),
                 ..Default::default()
             };
 
@@ -2279,7 +2386,7 @@ impl DownloadEngine {
                 #[cfg(all(feature = "http", feature = "recursive-http"))]
                 download.recursive_group_id,
                 #[cfg(not(all(feature = "http", feature = "recursive-http")))]
-                None,
+                None::<uuid::Uuid>,
             )
         };
 
@@ -2423,8 +2530,21 @@ impl DownloadEngine {
     pub fn set_config(&self, config: EngineConfig) -> Result<()> {
         config.validate()?;
 
-        // Update concurrent download limit
-        // Note: This doesn't affect currently running downloads
+        self.priority_queue
+            .set_max_concurrent(config.max_concurrent_downloads);
+
+        let mut scheduler = self.scheduler.write();
+        scheduler.set_defaults(BandwidthLimits {
+            download: config.global_download_limit,
+            upload: config.global_upload_limit,
+        });
+        scheduler.set_rules(config.schedule_rules.clone());
+        let limits = scheduler.get_limits();
+        drop(scheduler);
+
+        #[cfg(feature = "http")]
+        self.http
+            .set_bandwidth_limits(limits.download, limits.upload);
 
         *self.config.write() = config;
         Ok(())
@@ -2482,7 +2602,15 @@ impl DownloadEngine {
     ///
     /// The new rules take effect immediately after evaluation.
     pub fn set_schedule_rules(&self, rules: Vec<crate::scheduler::ScheduleRule>) {
-        self.scheduler.write().set_rules(rules);
+        self.config.write().schedule_rules = rules.clone();
+        let limits = {
+            let mut scheduler = self.scheduler.write();
+            scheduler.set_rules(rules);
+            scheduler.get_limits()
+        };
+        #[cfg(feature = "http")]
+        self.http
+            .set_bandwidth_limits(limits.download, limits.upload);
     }
 
     /// Get the current schedule rules
@@ -2527,13 +2655,16 @@ impl DownloadEngine {
 
     /// Helper to update download state
     fn update_state(&self, id: DownloadId, new_state: DownloadState) -> Result<()> {
-        let mut downloads = self.downloads.write();
-        let download = downloads
-            .get_mut(&id)
-            .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
+        let old_state = {
+            let mut downloads = self.downloads.write();
+            let download = downloads
+                .get_mut(&id)
+                .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
 
-        let old_state = download.status.state.clone();
-        download.status.state = new_state.clone();
+            let old_state = download.status.state.clone();
+            download.status.state = new_state.clone();
+            old_state
+        };
 
         let _ = self.event_tx.send(DownloadEvent::StateChanged {
             id,
@@ -2599,8 +2730,14 @@ mod tests {
             .await
             .expect_err("invalid child URL should fail recursive enqueue");
 
-        assert!(matches!(err, EngineError::InvalidInput { field: "url", .. }));
-        assert!(engine.list().is_empty(), "partial child downloads should be rolled back");
+        assert!(matches!(
+            err,
+            EngineError::InvalidInput { field: "url", .. }
+        ));
+        assert!(
+            engine.list().is_empty(),
+            "partial child downloads should be rolled back"
+        );
         assert!(
             engine.list_recursive_jobs().is_empty(),
             "tracked parent jobs should not be created on enqueue failure"

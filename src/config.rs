@@ -384,7 +384,7 @@ fn default_recv_window() -> u32 {
 impl Default for UtpConfigSettings {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             policy: TransportPolicy::PreferUtp,
             tcp_fallback: true,
             target_delay_us: 100_000,
