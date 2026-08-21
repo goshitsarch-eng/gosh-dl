@@ -24,7 +24,9 @@ const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
 const HANDSHAKE_SIZE: usize = 68; // 1 + 19 + 8 + 20 + 20
 
 /// Default timeout for operations
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+// Also the cadence at which an idle peer loop wakes to apply choking
+// decisions and send keep-alives; keep it well under the keep-alive interval.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout for initial TCP connection to a peer
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

@@ -302,7 +302,7 @@ impl Packet {
         let mut next_ext = ext_type;
 
         while next_ext != ExtensionType::None as u8 && offset + 2 <= data.len() {
-            let ext = ExtensionType::try_from(next_ext)?;
+            let ext = next_ext;
             next_ext = data[offset];
             let ext_len = data[offset + 1] as usize;
             offset += 2;
@@ -314,12 +314,10 @@ impl Packet {
                 ));
             }
 
-            match ext {
-                ExtensionType::SelectiveAck => {
-                    selective_ack =
-                        Some(SelectiveAck::new(data[offset..offset + ext_len].to_vec()));
-                }
-                ExtensionType::None => break,
+            // BEP 29 requires tolerating unknown extension types: the
+            // (type, length) framing lets us skip what we don't understand.
+            if ext == ExtensionType::SelectiveAck as u8 {
+                selective_ack = Some(SelectiveAck::new(data[offset..offset + ext_len].to_vec()));
             }
 
             offset += ext_len;

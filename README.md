@@ -64,6 +64,7 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | Local Peer Discovery | 14 | Implemented, disabled in CI tests |
 | Message Stream Encryption | MSE/PE | RC4 + DH key exchange, unit tests only |
 | WebSeeds | 17, 19 | Hoffman + GetRight, including cross-file pieces |
+| uTP transport | 29 | Driver-task architecture with LEDBAT, retransmission, selective ACK; loopback + packet-loss + full-torrent-transfer tests; opt-in |
 | Endgame mode | — | Duplicate requests to multiple peers with cancels on receipt; toggle via `enable_endgame` |
 | File preallocation | — | `allocation_mode` config, applied before torrent verification |
 | HTTP resume | — | ETag/Last-Modified validation |
@@ -78,7 +79,6 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | Feature | Notes |
 |---------|-------|
 | DHT IPv6 | Depends on upstream `mainline` crate |
-| uTP transport (BEP 29) | Experimental and currently non-functional for data transfer; disabled by default |
 | MSE responder (inbound encryption) | Outgoing MSE works (incl. PadB handling); inbound connections are plaintext-only for now |
 | Proxy support | Wired via reqwest, not covered by tests |
 

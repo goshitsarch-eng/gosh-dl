@@ -207,6 +207,7 @@ impl Storage for MemoryStorage {
     async fn delete_download(&self, id: DownloadId) -> Result<()> {
         self.downloads.write().remove(&id);
         self.segments.write().remove(&id);
+        self.torrent_data.write().remove(&id);
         self.runtime_metadata.write().remove(&id);
         Ok(())
     }
@@ -363,6 +364,34 @@ mod tests {
         storage.delete_segments(id).await.unwrap();
         let loaded = storage.load_segments(id).await.unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_download_removes_all_associated_data() {
+        let storage = MemoryStorage::new();
+        let status = create_test_status();
+        let id = status.id;
+
+        storage.save_download(&status).await.unwrap();
+        storage
+            .save_segments(id, &[Segment::new(0, 0, 999)])
+            .await
+            .unwrap();
+        storage
+            .save_torrent_data(id, b"torrent-bytes")
+            .await
+            .unwrap();
+        storage
+            .save_runtime_metadata(id, r#"{"key":"value"}"#)
+            .await
+            .unwrap();
+
+        storage.delete_download(id).await.unwrap();
+
+        assert!(storage.load_download(id).await.unwrap().is_none());
+        assert!(storage.load_segments(id).await.unwrap().is_empty());
+        assert!(storage.load_torrent_data(id).await.unwrap().is_none());
+        assert!(storage.load_runtime_metadata(id).await.unwrap().is_none());
     }
 
     #[tokio::test]

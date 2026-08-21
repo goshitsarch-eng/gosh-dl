@@ -591,10 +591,16 @@ impl Storage for SqliteStorage {
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = conn.blocking_lock();
-            conn.execute(
+            let updated = conn.execute(
                 "UPDATE downloads SET torrent_data = ?1 WHERE id = ?2",
                 params![data, id_str],
             )?;
+            // A bare UPDATE silently affects 0 rows when the download row
+            // doesn't exist; surface that instead of pretending the data
+            // was persisted.
+            if updated == 0 {
+                return Err(EngineError::NotFound(id.to_string()));
+            }
             Ok(())
         })
         .await
@@ -628,10 +634,16 @@ impl Storage for SqliteStorage {
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = conn.blocking_lock();
-            conn.execute(
+            let updated = conn.execute(
                 "UPDATE downloads SET runtime_metadata_json = ?1 WHERE id = ?2",
                 params![runtime_json, id_str],
             )?;
+            // A bare UPDATE silently affects 0 rows when the download row
+            // doesn't exist; surface that instead of pretending the data
+            // was persisted.
+            if updated == 0 {
+                return Err(EngineError::NotFound(id.to_string()));
+            }
             Ok(())
         })
         .await
@@ -1314,6 +1326,27 @@ mod tests {
         // Torrent data should still be there (save_download doesn't touch it)
         let loaded = storage.load_torrent_data(id).await.unwrap();
         assert_eq!(loaded.unwrap(), torrent_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_save_torrent_data_missing_download_errors() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let id = DownloadId::new();
+
+        let err = storage.save_torrent_data(id, b"data").await.unwrap_err();
+        assert!(matches!(err, EngineError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_save_runtime_metadata_missing_download_errors() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let id = DownloadId::new();
+
+        let err = storage
+            .save_runtime_metadata(id, r#"{"key":"value"}"#)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NotFound(_)));
     }
 
     #[tokio::test]

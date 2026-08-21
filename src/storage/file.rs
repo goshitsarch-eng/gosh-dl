@@ -291,12 +291,20 @@ impl Storage for FileStorage {
     async fn health_check(&self) -> Result<()> {
         // Recreate the directory if it disappeared and prove it is writable.
         tokio::fs::create_dir_all(&self.dir).await?;
+        // The probe deliberately runs without `write_lock`: a concurrent
+        // `compact` may sweep it up (its extension is `tmp`), but
+        // `remove_if_exists` tolerates the file already being gone, so the
+        // check cannot fail from that race.
         let probe = self.dir.join(".health-check.tmp");
         tokio::fs::write(&probe, b"ok").await?;
         Self::remove_if_exists(&probe).await
     }
 
     async fn compact(&self) -> Result<()> {
+        // Hold the write lock for the whole sweep so we never delete a temp
+        // file between another task's write and rename inside `write_atomic`,
+        // which would make that save fail.
+        let _guard = self.write_lock.lock().await;
         // Clean up temp files left behind by interrupted writes.
         let mut entries = tokio::fs::read_dir(&self.dir).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -507,5 +515,31 @@ mod tests {
         tokio::fs::write(&leftover, b"partial").await.unwrap();
         storage.compact().await.unwrap();
         assert!(!leftover.exists());
+    }
+
+    #[tokio::test]
+    async fn test_compact_waits_for_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(dir.path()).await.unwrap());
+
+        // Hold the write lock as `write_atomic` callers do mid-save, with a
+        // temp file present as if a write were in flight.
+        let guard = storage.write_lock.lock().await;
+        let in_flight = dir.path().join("garbage.json.tmp");
+        tokio::fs::write(&in_flight, b"partial").await.unwrap();
+
+        let compact_storage = storage.clone();
+        let compact = tokio::spawn(async move { compact_storage.compact().await });
+
+        // While the lock is held, compact must not delete the temp file out
+        // from under the in-flight writer.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!compact.is_finished());
+        assert!(in_flight.exists());
+
+        // Once the writer is done, compact proceeds and sweeps the leftover.
+        drop(guard);
+        compact.await.unwrap().unwrap();
+        assert!(!in_flight.exists());
     }
 }

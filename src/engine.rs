@@ -1576,6 +1576,12 @@ impl DownloadEngine {
                 && config.torrent.utp.policy != crate::config::TransportPolicy::TcpOnly,
             enable_endgame: config.torrent.enable_endgame,
             allocation_mode: config.torrent.allocation_mode,
+            utp_config: crate::torrent::utp::UtpConfig {
+                enable_sack: config.torrent.utp.enable_sack,
+                max_window_size: config.torrent.utp.max_window_size,
+                recv_window: config.torrent.utp.recv_window,
+                target_delay_us: config.torrent.utp.target_delay_us,
+            },
         }
     }
 

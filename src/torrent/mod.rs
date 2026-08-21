@@ -135,6 +135,8 @@ pub struct TorrentConfig {
     pub enable_utp: bool,
     /// Enable endgame mode (request remaining blocks from several peers)
     pub enable_endgame: bool,
+    /// uTP tuning applied when binding the multiplexer
+    pub utp_config: UtpConfig,
     /// File preallocation strategy applied before the download starts
     pub allocation_mode: crate::config::AllocationMode,
 }
@@ -166,6 +168,7 @@ impl Default for TorrentConfig {
             enable_utp: false,
             enable_endgame: true,
             allocation_mode: crate::config::AllocationMode::None,
+            utp_config: UtpConfig::default(),
         }
     }
 }
@@ -657,10 +660,19 @@ impl TorrentDownloader {
             let utp_addr: SocketAddr = format!("0.0.0.0:{}", self.config.listen_port_range.0)
                 .parse()
                 .unwrap();
-            match UtpMux::bind(utp_addr).await {
+            match UtpMux::bind_with_config(utp_addr, self.config.utp_config.clone()).await {
                 Ok(mux) => {
                     tracing::info!("uTP multiplexer bound to {}", mux.local_addr());
-                    *self.utp_mux.write() = Some(Arc::new(mux));
+                    let mux = Arc::new(mux);
+                    *self.utp_mux.write() = Some(Arc::clone(&mux));
+
+                    // Accept inbound uTP peers through the same connection
+                    // loop as TCP peers.
+                    let dl = Arc::clone(&self);
+                    let handle = tokio::spawn(async move {
+                        dl.run_utp_inbound(mux).await;
+                    });
+                    self.discovery_tasks.write().push(handle);
                 }
                 Err(e) => {
                     tracing::warn!("Failed to bind uTP multiplexer: {}", e);
@@ -969,6 +981,79 @@ impl TorrentDownloader {
         // Disconnect all peers and stop requesting
     }
 
+    /// Accept inbound uTP peer connections.
+    async fn run_utp_inbound(self: Arc<Self>, mux: Arc<UtpMux>) {
+        let max_pending = self.config.max_pending_requests;
+        loop {
+            let socket = match mux.accept().await {
+                Ok(socket) => socket,
+                Err(e) => {
+                    if self.shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tracing::debug!("uTP accept error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+
+            if self.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            let state = *self.state.read();
+            if state == TorrentState::Paused || state == TorrentState::Stopped {
+                continue;
+            }
+            // uTP carries no MSE; with encryption required, refuse inbound.
+            if self.mse_config.read().policy == EncryptionPolicy::Required {
+                continue;
+            }
+            if self.stats.peers_connected.load(Ordering::Relaxed) as usize >= self.config.max_peers
+            {
+                continue;
+            }
+            let num_pieces = match self.metainfo.read().as_ref() {
+                Some(metainfo) => metainfo.info.pieces.len(),
+                None => continue,
+            };
+
+            let downloader = Arc::clone(&self);
+            let shared_stats = Arc::clone(&self.shared_peer_stats);
+            let choking_decisions = Arc::clone(&self.choking_decisions);
+            let peer_id = *self.tracker_client.peer_id();
+            let info_hash = self.info_hash;
+            let handle = tokio::spawn(async move {
+                let addr = socket.peer_addr().ok();
+                match PeerConnection::connect_utp(socket, info_hash, peer_id, num_pieces).await {
+                    Ok(conn) => {
+                        let addr = conn.addr();
+                        tracing::info!("Accepted inbound uTP peer {}", addr);
+                        if let Err(e) = Self::run_connection_loop(
+                            downloader,
+                            conn,
+                            addr,
+                            max_pending,
+                            shared_stats,
+                            choking_decisions,
+                            false,
+                        )
+                        .await
+                        {
+                            tracing::debug!("Inbound uTP peer {} ended with error: {}", addr, e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Inbound uTP handshake with {:?} failed: {}", addr, e);
+                    }
+                }
+            });
+
+            let mut tasks = self.inbound_tasks.write();
+            tasks.retain(|h| !h.is_finished());
+            tasks.push(handle);
+        }
+    }
+
     /// Accept inbound peer connections and drive each through the same
     /// connection loop as outbound peers.
     async fn run_inbound_listener(self: Arc<Self>, listener: tokio::net::TcpListener) {
@@ -1050,6 +1135,11 @@ impl TorrentDownloader {
             tasks.retain(|h| !h.is_finished());
             tasks.push(handle);
         }
+    }
+
+    /// The UDP port the uTP multiplexer is bound to, if enabled.
+    pub fn utp_listen_port(&self) -> Option<u16> {
+        self.utp_mux.read().as_ref().map(|m| m.local_addr().port())
     }
 
     /// The TCP port actually bound for inbound peer connections, if any.
@@ -2080,10 +2170,12 @@ impl TorrentDownloader {
                     kind: NetworkErrorKind::Timeout,
                     ..
                 }) => {
-                    // The 30s receive timeout is not fatal: compliant clients
-                    // keep-alive only every ~120s. Send our own keep-alive so
-                    // the peer doesn't idle-kill us either, and disconnect
-                    // only after a prolonged silence.
+                    // The receive timeout is not fatal: compliant clients
+                    // keep-alive only every ~120s. Send our own keep-alive
+                    // (rate-limited) so the peer doesn't idle-kill us, apply
+                    // any pending choking decision so an idle-but-interested
+                    // peer still gets unchoked promptly, and disconnect only
+                    // after a prolonged silence.
                     const IDLE_DISCONNECT: Duration = Duration::from_secs(150);
                     if conn.idle_time() >= IDLE_DISCONNECT {
                         tracing::debug!(
@@ -2096,6 +2188,23 @@ impl TorrentDownloader {
                     if let Err(e) = conn.keep_alive().await {
                         tracing::debug!("Peer {} keep-alive failed: {}", addr, e);
                         break;
+                    }
+
+                    let choking_decision: Option<bool> = {
+                        let decisions = choking_decisions.read();
+                        decisions.get(&addr).copied()
+                    };
+                    if let Some(should_unchoke) = choking_decision {
+                        let currently_unchoked = !conn.am_choking();
+                        if should_unchoke && !currently_unchoked {
+                            if conn.unchoke().await.is_ok() {
+                                tracing::debug!("Unchoked idle peer {}", addr);
+                            }
+                        } else if !should_unchoke && currently_unchoked {
+                            if conn.choke().await.is_ok() {
+                                tracing::debug!("Choked idle peer {}", addr);
+                            }
+                        }
                     }
                     continue;
                 }

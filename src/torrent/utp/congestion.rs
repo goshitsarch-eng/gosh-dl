@@ -106,6 +106,12 @@ pub struct LedbatController {
 
     /// Last time we got an ACK
     last_ack_time: Option<Instant>,
+
+    /// Configured window ceiling (defaults to MAX_CWND)
+    max_cwnd: u32,
+
+    /// Configured LEDBAT target delay (defaults to TARGET_DELAY_US)
+    target_delay_us: u32,
 }
 
 impl Default for LedbatController {
@@ -131,7 +137,16 @@ impl LedbatController {
             rto_us: 3_000_000, // Initial 3 seconds
             in_slow_start: true,
             last_ack_time: None,
+            max_cwnd: MAX_CWND,
+            target_delay_us: TARGET_DELAY_US,
         }
+    }
+
+    /// Configure the window ceiling and LEDBAT target delay (from UtpConfig)
+    pub fn set_params(&mut self, max_cwnd: u32, target_delay_us: u32) {
+        self.max_cwnd = max_cwnd.max(MIN_CWND);
+        self.target_delay_us = target_delay_us.max(1_000);
+        self.cwnd = self.cwnd.min(self.max_cwnd);
     }
 
     /// Get current congestion window
@@ -217,7 +232,7 @@ impl LedbatController {
     fn adjust_window(&mut self, bytes_acked: u32, queuing_delay_us: u32) {
         if self.in_slow_start {
             // Slow start: exponential increase
-            if queuing_delay_us < TARGET_DELAY_US {
+            if queuing_delay_us < self.target_delay_us {
                 self.cwnd += bytes_acked;
             } else {
                 // Exit slow start
@@ -229,10 +244,11 @@ impl LedbatController {
             // off_target = (TARGET_DELAY - queuing_delay) / TARGET_DELAY
             // cwnd += GAIN * off_target * bytes_acked * MSS / cwnd
 
-            let off_target = if queuing_delay_us < TARGET_DELAY_US {
-                (TARGET_DELAY_US - queuing_delay_us) as f64 / TARGET_DELAY_US as f64
+            let target = self.target_delay_us;
+            let off_target = if queuing_delay_us < target {
+                (target - queuing_delay_us) as f64 / target as f64
             } else {
-                -((queuing_delay_us - TARGET_DELAY_US) as f64 / TARGET_DELAY_US as f64)
+                -((queuing_delay_us - target) as f64 / target as f64)
             };
 
             let cwnd_delta =
@@ -246,7 +262,7 @@ impl LedbatController {
         }
 
         // Clamp window
-        self.cwnd = self.cwnd.clamp(MIN_CWND, MAX_CWND);
+        self.cwnd = self.cwnd.clamp(MIN_CWND, self.max_cwnd);
     }
 
     /// Update RTT estimate using Jacobson/Karels algorithm

@@ -1201,3 +1201,108 @@ async fn test_verify_detects_corrupt_torrent_piece() {
 
     engine.shutdown().await.ok();
 }
+
+// =============================================================================
+// uTP Transport Tests
+// =============================================================================
+
+/// Full torrent transfer over uTP: a seeder accepts an inbound uTP
+/// connection and a uTP-only leecher downloads the complete torrent.
+#[tokio::test]
+async fn test_torrent_transfer_over_utp() {
+    use gosh_dl::config::TransportPolicy;
+
+    let piece_length = 16384;
+    let num_pieces = 4;
+    let (_torrent_data, metainfo, piece_data) =
+        build_test_torrent("utp-transfer", piece_length, num_pieces);
+    let content: Vec<u8> = piece_data.iter().flatten().copied().collect();
+
+    let mut seed_metainfo = metainfo.clone();
+    seed_metainfo.announce = None;
+    seed_metainfo.announce_list = vec![];
+    let mut leech_metainfo = metainfo;
+    leech_metainfo.announce = None;
+    leech_metainfo.announce_list = vec![];
+
+    // Seeder: complete file on disk, uTP enabled on an OS-assigned port.
+    let seed_dir = TempDir::new().unwrap();
+    tokio::fs::write(seed_dir.path().join("utp-transfer"), &content)
+        .await
+        .unwrap();
+    let seed_config = TorrentConfig {
+        listen_port_range: (0, 0),
+        enable_utp: true,
+        seed_ratio: None,
+        choking_interval_secs: 1,
+        ..test_torrent_config()
+    };
+    let (seed_tx, _seed_rx) = broadcast::channel(64);
+    let seeder = Arc::new(
+        TorrentDownloader::from_torrent(
+            DownloadId::new(),
+            seed_metainfo,
+            seed_dir.path().to_path_buf(),
+            seed_config,
+            seed_tx,
+        )
+        .unwrap(),
+    );
+    Arc::clone(&seeder).start().await.unwrap();
+    let seed_utp_port = seeder
+        .utp_listen_port()
+        .expect("seeder should bind a uTP port");
+    let seed_loop = tokio::spawn({
+        let seeder = Arc::clone(&seeder);
+        async move {
+            seeder.run_peer_loop().await.ok();
+        }
+    });
+
+    // Leecher: uTP only, no TCP fallback.
+    let leech_dir = TempDir::new().unwrap();
+    let leech_config = TorrentConfig {
+        listen_port_range: (0, 0),
+        enable_utp: true,
+        ..test_torrent_config()
+    };
+    let (leech_tx, _leech_rx) = broadcast::channel(64);
+    let leecher = Arc::new(
+        TorrentDownloader::from_torrent(
+            DownloadId::new(),
+            leech_metainfo,
+            leech_dir.path().to_path_buf(),
+            leech_config,
+            leech_tx,
+        )
+        .unwrap(),
+    );
+    leecher.set_transport_policy(TransportPolicy::UtpOnly, false);
+    Arc::clone(&leecher).start().await.unwrap();
+    leecher.add_known_peers([format!("127.0.0.1:{seed_utp_port}")
+        .parse::<SocketAddr>()
+        .unwrap()]);
+    let leech_loop = tokio::spawn({
+        let leecher = Arc::clone(&leecher);
+        async move {
+            leecher.run_peer_loop().await.ok();
+        }
+    });
+
+    // Wait for the leecher to finish.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !leecher.is_complete() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(leecher.is_complete(), "uTP download did not complete");
+
+    let downloaded = tokio::fs::read(leech_dir.path().join("utp-transfer"))
+        .await
+        .expect("downloaded file should exist");
+    assert_eq!(downloaded, content, "uTP-transferred data must match");
+
+    leech_loop.abort();
+    seed_loop.abort();
+    leecher.stop().await.ok();
+    seeder.stop().await.ok();
+}

@@ -5,6 +5,8 @@
 
 use std::time::Instant;
 
+use super::packet::PacketType;
+
 /// uTP connection states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -103,6 +105,9 @@ pub struct PendingPacket {
 
     /// Size for congestion control
     pub size: u32,
+
+    /// Original packet type — a retransmitted FIN must stay a FIN
+    pub packet_type: PacketType,
 }
 
 impl PendingPacket {
@@ -117,6 +122,7 @@ impl PendingPacket {
             last_sent: now,
             retransmits: 0,
             size,
+            packet_type: PacketType::Data,
         }
     }
 

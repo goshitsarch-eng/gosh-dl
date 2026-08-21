@@ -1,13 +1,18 @@
 //! uTP Socket Multiplexer
 //!
-//! This module manages a single UDP socket shared by multiple uTP connections.
-//! It demultiplexes incoming packets to the correct connection based on
-//! (remote_addr, connection_id).
+//! This module manages a single UDP socket shared by multiple uTP
+//! connections. It demultiplexes incoming packets to the correct connection
+//! based on (remote_addr, connection_id).
+//!
+//! Registration uses each socket's **receive** connection ID (see the
+//! connection-ID rules in [`super::socket`]): every non-SYN packet a peer
+//! sends carries the peer's send ID, which equals our receive ID, so routing
+//! is an exact-key lookup.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use parking_lot::RwLock;
 use tokio::net::UdpSocket;
@@ -15,7 +20,13 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::packet::{Packet, HEADER_SIZE};
-use super::socket::{PacketReceiver, PacketSender, UtpConfig, UtpSocket};
+use super::socket::{PacketSender, UtpConfig, UtpSocket};
+
+/// Bound on unaccepted incoming connections (SYN backlog)
+const MAX_PENDING_INCOMING: usize = 32;
+
+/// Per-connection inbound packet channel capacity
+const CONN_CHANNEL_CAPACITY: usize = 256;
 
 /// Key for identifying a connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,13 +39,16 @@ struct ConnectionKey {
 struct PendingConnection {
     remote_addr: SocketAddr,
     packet_tx: mpsc::Sender<Packet>,
-    packet_rx: Option<PacketReceiver>,
+    packet_rx: Option<mpsc::Receiver<Packet>>,
     syn_packet: Packet,
 }
 
+type ConnectionMap = Arc<RwLock<HashMap<ConnectionKey, mpsc::Sender<Packet>>>>;
+
 /// uTP Socket Multiplexer
 ///
-/// Manages a shared UDP socket and routes packets to individual uTP connections.
+/// Manages a shared UDP socket and routes packets to individual uTP
+/// connections.
 pub struct UtpMux {
     /// Bound UDP socket
     socket: Arc<UdpSocket>,
@@ -42,11 +56,12 @@ pub struct UtpMux {
     /// Local address
     local_addr: SocketAddr,
 
-    /// Active connections: key -> packet sender
-    connections: Arc<RwLock<HashMap<ConnectionKey, mpsc::Sender<Packet>>>>,
+    /// Active connections: (addr, our recv id) -> packet sender
+    connections: ConnectionMap,
 
-    /// Pending incoming connections waiting to be accepted
-    pending_incoming: Arc<RwLock<Vec<PendingConnection>>>,
+    /// Pending incoming connections waiting to be accepted,
+    /// keyed by (addr, SYN connection id) for retransmit dedupe
+    pending_incoming: Arc<RwLock<HashMap<ConnectionKey, PendingConnection>>>,
 
     /// Channel for sending packets from connections to the UDP socket
     send_tx: PacketSender,
@@ -65,34 +80,31 @@ pub struct UtpMux {
 impl UtpMux {
     /// Create a new multiplexer bound to the given address
     pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        Self::bind_with_config(addr, UtpConfig::default()).await
+    }
+
+    /// Create with custom config
+    pub async fn bind_with_config(addr: SocketAddr, config: UtpConfig) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
         let socket = Arc::new(socket);
 
-        let (send_tx, send_rx) = mpsc::channel(1000);
+        let (send_tx, send_rx) = mpsc::channel(1024);
 
         let mut mux = Self {
             socket,
             local_addr,
             connections: Arc::new(RwLock::new(HashMap::new())),
-            pending_incoming: Arc::new(RwLock::new(Vec::new())),
+            pending_incoming: Arc::new(RwLock::new(HashMap::new())),
             send_tx,
             next_conn_id: Arc::new(RwLock::new(rand::random())),
-            config: UtpConfig::default(),
+            config,
             recv_task: None,
             send_task: None,
         };
 
-        // Start background tasks
         mux.start_tasks(send_rx);
 
-        Ok(mux)
-    }
-
-    /// Create with custom config
-    pub async fn bind_with_config(addr: SocketAddr, config: UtpConfig) -> io::Result<Self> {
-        let mut mux = Self::bind(addr).await?;
-        mux.config = config;
         Ok(mux)
     }
 
@@ -108,7 +120,6 @@ impl UtpMux {
         let connections = self.connections.clone();
         let pending = self.pending_incoming.clone();
         let send_tx = self.send_tx.clone();
-        let config = self.config.clone();
 
         let recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
@@ -128,9 +139,7 @@ impl UtpMux {
                                     &connections,
                                     &pending,
                                     &send_tx,
-                                    &config,
-                                )
-                                .await;
+                                );
                             }
                             Err(e) => {
                                 tracing::debug!("Failed to decode uTP packet: {}", e);
@@ -159,73 +168,106 @@ impl UtpMux {
         self.send_task = Some(send_task);
     }
 
-    /// Route an incoming packet to the correct connection
-    async fn route_packet(
+    /// Route an incoming packet to the correct connection.
+    ///
+    /// Never blocks: per-connection channels use `try_send`, and a full
+    /// channel drops the packet — UDP semantics; retransmission recovers.
+    fn route_packet(
         pkt: Packet,
         remote_addr: SocketAddr,
-        connections: &RwLock<HashMap<ConnectionKey, mpsc::Sender<Packet>>>,
-        pending: &RwLock<Vec<PendingConnection>>,
+        connections: &ConnectionMap,
+        pending: &RwLock<HashMap<ConnectionKey, PendingConnection>>,
         send_tx: &PacketSender,
-        _config: &UtpConfig,
     ) {
-        // Try to find existing connection
-        // For SYN packets, the connection ID is the one we should use for recv
-        // For other packets, it's the send ID
-        let keys = if pkt.is_syn() {
-            vec![
-                ConnectionKey {
+        if pkt.is_syn() {
+            // The SYN carries the initiator's receive ID C; an accepted
+            // connection is registered under our receive ID C + 1.
+            let conn_key = ConnectionKey {
+                remote_addr,
+                conn_id: pkt.connection_id.wrapping_add(1),
+            };
+            if let Some(tx) = connections.read().get(&conn_key).cloned() {
+                // Retransmitted SYN for an accepted connection: forward so
+                // the socket can re-ack.
+                let _ = tx.try_send(pkt);
+                return;
+            }
+
+            let pending_key = ConnectionKey {
+                remote_addr,
+                conn_id: pkt.connection_id,
+            };
+            let mut pending = pending.write();
+            if pending.contains_key(&pending_key) {
+                return; // SYN retransmit while still in the backlog
+            }
+            if pending.len() >= MAX_PENDING_INCOMING {
+                tracing::debug!("uTP SYN backlog full, dropping SYN from {}", remote_addr);
+                return;
+            }
+            let (packet_tx, packet_rx) = mpsc::channel(CONN_CHANNEL_CAPACITY);
+            pending.insert(
+                pending_key,
+                PendingConnection {
                     remote_addr,
-                    conn_id: pkt.connection_id,
+                    packet_tx,
+                    packet_rx: Some(packet_rx),
+                    syn_packet: pkt,
                 },
-                ConnectionKey {
-                    remote_addr,
-                    conn_id: pkt.connection_id.wrapping_add(1),
-                },
+            );
+            return;
+        }
+
+        // Non-SYN packets carry the sender's send ID == our receive ID.
+        // A RESET echoes whatever ID the resetter last saw, which may be our
+        // send ID instead — try the neighbors for those.
+        let candidate_ids: &[u16] = if pkt.is_reset() {
+            &[
+                pkt.connection_id,
+                pkt.connection_id.wrapping_add(1),
+                pkt.connection_id.wrapping_sub(1),
             ]
         } else {
-            vec![
-                ConnectionKey {
-                    remote_addr,
-                    conn_id: pkt.connection_id,
-                },
-                ConnectionKey {
-                    remote_addr,
-                    conn_id: pkt.connection_id.wrapping_sub(1),
-                },
-            ]
+            &[pkt.connection_id]
         };
-
-        // Try to deliver to existing connection
-        for key in &keys {
-            let sender = connections.read().get(key).cloned();
-            if let Some(tx) = sender {
-                if tx.send(pkt.clone()).await.is_ok() {
-                    return;
+        for conn_id in candidate_ids {
+            let key = ConnectionKey {
+                remote_addr,
+                conn_id: *conn_id,
+            };
+            if let Some(tx) = connections.read().get(&key).cloned() {
+                if tx.try_send(pkt).is_err() {
+                    tracing::trace!(
+                        "uTP channel full/closed; dropping packet from {}",
+                        remote_addr
+                    );
                 }
+                return;
             }
         }
 
-        // New SYN - create pending incoming connection
-        if pkt.is_syn() {
-            let (packet_tx, packet_rx) = mpsc::channel(100);
-            let pending_conn = PendingConnection {
-                remote_addr,
-                packet_tx,
-                packet_rx: Some(packet_rx),
-                syn_packet: pkt,
-            };
-            pending.write().push(pending_conn);
-        } else if pkt.is_reset() {
-            // Ignore reset for unknown connection
-        } else {
-            // Unknown connection, send reset
-            let reset = Packet::reset(pkt.connection_id, 0, 0);
-            let _ = send_tx.send((reset.encode(), remote_addr)).await;
+        if !pkt.is_reset() {
+            // Unknown connection: tell the peer to go away
+            let reset = Packet::reset(pkt.connection_id, 0, pkt.seq_nr);
+            let _ = send_tx.try_send((reset.encode(), remote_addr));
         }
+    }
+
+    /// Build the cleanup hook that deregisters a connection when its driver
+    /// task ends.
+    fn cleanup_for(&self, key: ConnectionKey) -> Box<dyn FnOnce() + Send> {
+        let connections: Weak<RwLock<HashMap<ConnectionKey, mpsc::Sender<Packet>>>> =
+            Arc::downgrade(&self.connections);
+        Box::new(move || {
+            if let Some(connections) = connections.upgrade() {
+                connections.write().remove(&key);
+            }
+        })
     }
 
     /// Connect to a remote peer
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<UtpSocket> {
+        // Our receive ID; the SYN carries it and we send with +1.
         let conn_id = {
             let mut id = self.next_conn_id.write();
             let current = *id;
@@ -233,16 +275,12 @@ impl UtpMux {
             current
         };
 
-        let (packet_tx, packet_rx) = mpsc::channel(100);
-
-        // Register connection
-        {
-            let key = ConnectionKey {
-                remote_addr: addr,
-                conn_id: conn_id.wrapping_add(1), // We receive on conn_id + 1
-            };
-            self.connections.write().insert(key, packet_tx.clone());
-        }
+        let (packet_tx, packet_rx) = mpsc::channel(CONN_CHANNEL_CAPACITY);
+        let key = ConnectionKey {
+            remote_addr: addr,
+            conn_id,
+        };
+        self.connections.write().insert(key, packet_tx);
 
         let socket = UtpSocket::new_outgoing(
             addr,
@@ -250,51 +288,50 @@ impl UtpMux {
             self.send_tx.clone(),
             packet_rx,
             self.config.clone(),
+            Some(self.cleanup_for(key)),
         );
 
-        // Initiate connection
-        socket.connect().await?;
-
-        Ok(socket)
+        match socket.connect().await {
+            Ok(()) => Ok(socket),
+            Err(e) => {
+                self.connections.write().remove(&key);
+                Err(e)
+            }
+        }
     }
 
     /// Accept an incoming connection
     pub async fn accept(&self) -> io::Result<UtpSocket> {
         loop {
-            // Check for pending connections
             let pending_conn = {
                 let mut pending = self.pending_incoming.write();
-                if pending.is_empty() {
-                    None
-                } else {
-                    Some(pending.remove(0))
-                }
+                let key = pending.keys().next().copied();
+                key.and_then(|k| pending.remove(&k))
             };
 
             if let Some(mut conn) = pending_conn {
                 let syn = &conn.syn_packet;
-                let conn_id = syn.connection_id;
+                let syn_conn_id = syn.connection_id;
                 let peer_seq_nr = syn.seq_nr;
                 let remote_addr = conn.remote_addr;
 
                 let packet_rx = conn.packet_rx.take().unwrap();
 
-                // Register connection
-                {
-                    let key = ConnectionKey {
-                        remote_addr,
-                        conn_id,
-                    };
-                    self.connections.write().insert(key, conn.packet_tx);
-                }
+                // We receive on SYN id + 1 (the initiator's send id)
+                let key = ConnectionKey {
+                    remote_addr,
+                    conn_id: syn_conn_id.wrapping_add(1),
+                };
+                self.connections.write().insert(key, conn.packet_tx);
 
                 let socket = UtpSocket::new_incoming(
                     remote_addr,
-                    conn_id,
+                    syn_conn_id,
                     peer_seq_nr,
                     self.send_tx.clone(),
                     packet_rx,
                     self.config.clone(),
+                    Some(self.cleanup_for(key)),
                 );
 
                 socket.accept().await?;
@@ -303,13 +340,12 @@ impl UtpMux {
             }
 
             // Wait a bit before checking again
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
     /// Close the multiplexer
     pub async fn close(&mut self) {
-        // Abort background tasks
         if let Some(task) = self.recv_task.take() {
             task.abort();
         }
@@ -317,7 +353,6 @@ impl UtpMux {
             task.abort();
         }
 
-        // Clear connections
         self.connections.write().clear();
         self.pending_incoming.write().clear();
     }
@@ -346,47 +381,161 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_accept_preserves_remote_address() {
+    async fn test_syn_creates_single_pending_connection() {
         let mux = UtpMux::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let mux_addr = mux.local_addr();
 
-        // Send a SYN packet from a separate UDP socket
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sender_addr = sender.local_addr().unwrap();
 
+        // SYN plus a retransmit of the same SYN
         let syn = Packet::syn(100, 1);
         sender.send_to(&syn.encode(), mux_addr).await.unwrap();
+        sender.send_to(&syn.encode(), mux_addr).await.unwrap();
 
-        // Give the mux time to receive and route the packet
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
-        // accept() should return a socket with the correct remote address
-        let accept_result =
-            tokio::time::timeout(std::time::Duration::from_millis(200), mux.accept()).await;
-
-        match accept_result {
-            Ok(Ok(socket)) => {
-                let peer = socket.peer_addr().unwrap();
-                assert_eq!(
-                    peer, sender_addr,
-                    "accept() should preserve the remote address"
-                );
-            }
-            Ok(Err(_)) => {
-                // Connection handshake may fail (no SYN-ACK exchange),
-                // but the bug was about the address being UNSPECIFIED — that's fixed.
-                // The important thing is that the code path no longer uses 0.0.0.0:0.
-            }
-            Err(_) => {
-                // Timeout — check the pending connection directly
-                let pending = mux.pending_incoming.read();
-                if !pending.is_empty() {
-                    assert_eq!(
-                        pending[0].remote_addr, sender_addr,
-                        "PendingConnection should store the remote address"
-                    );
-                }
-            }
+        {
+            let pending = mux.pending_incoming.read();
+            assert_eq!(pending.len(), 1, "SYN retransmit must not duplicate");
+            let conn = pending.values().next().unwrap();
+            assert_eq!(conn.remote_addr, sender_addr);
         }
+    }
+
+    /// Full loopback: two muxes, connect, exchange data both ways.
+    #[tokio::test]
+    async fn test_loopback_bidirectional_transfer() {
+        let mux_a = Arc::new(UtpMux::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+        let mux_b = Arc::new(UtpMux::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+        let addr_b = mux_b.local_addr();
+
+        let payload_ab: Vec<u8> = (0..512 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let payload_ba: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 241) as u8).collect();
+
+        let expected_ab = payload_ab.clone();
+        let expected_ba = payload_ba.clone();
+
+        let server = {
+            let mux_b = Arc::clone(&mux_b);
+            tokio::spawn(async move {
+                let sock = tokio::time::timeout(std::time::Duration::from_secs(10), mux_b.accept())
+                    .await
+                    .expect("accept timed out")
+                    .expect("accept failed");
+
+                let mut received = vec![0u8; expected_ab.len()];
+                sock.read_exact(&mut received).await.expect("server read");
+                assert_eq!(received, expected_ab, "A->B data corrupted");
+
+                sock.write_all(&payload_ba).await.expect("server write");
+                // Keep the socket alive until the client is done reading
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            })
+        };
+
+        let sock = tokio::time::timeout(std::time::Duration::from_secs(10), mux_a.connect(addr_b))
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            sock.write_all(&payload_ab),
+        )
+        .await
+        .expect("client write stalled")
+        .expect("client write failed");
+
+        let mut received = vec![0u8; expected_ba.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            sock.read_exact(&mut received),
+        )
+        .await
+        .expect("client read stalled")
+        .expect("client read failed");
+        assert_eq!(received, expected_ba, "B->A data corrupted");
+
+        sock.shutdown().await.ok();
+        server.await.unwrap();
+    }
+
+    /// Transfer through a lossy UDP proxy: retransmissions must recover.
+    #[tokio::test]
+    async fn test_transfer_survives_packet_loss() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let mux_a = Arc::new(UtpMux::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+        let mux_b = Arc::new(UtpMux::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+        let addr_a = mux_a.local_addr();
+        let addr_b = mux_b.local_addr();
+
+        // Lossy proxy: forwards between A and B, dropping every 9th packet.
+        let proxy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let proxy_task = {
+            let dropped = Arc::clone(&dropped);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                let mut counter = 0u64;
+                loop {
+                    let Ok((len, from)) = proxy.recv_from(&mut buf).await else {
+                        break;
+                    };
+                    counter += 1;
+                    if counter % 9 == 0 {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        continue; // drop
+                    }
+                    // A's packets go to B, everything else back to A
+                    let target = if from == addr_a { addr_b } else { addr_a };
+                    let _ = proxy.send_to(&buf[..len], target).await;
+                }
+            })
+        };
+
+        let payload: Vec<u8> = (0..128 * 1024u32).map(|i| (i % 239) as u8).collect();
+        let expected = payload.clone();
+
+        let server = {
+            let mux_b = Arc::clone(&mux_b);
+            tokio::spawn(async move {
+                let sock = tokio::time::timeout(std::time::Duration::from_secs(15), mux_b.accept())
+                    .await
+                    .expect("accept timed out")
+                    .expect("accept failed");
+                let mut received = vec![0u8; expected.len()];
+                sock.read_exact(&mut received).await.expect("read");
+                received
+            })
+        };
+
+        // Connect to B *via the proxy*
+        let sock = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            mux_a.connect(proxy_addr),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect failed (SYN loss should be retransmitted)");
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), sock.write_all(&payload))
+            .await
+            .expect("write stalled under loss")
+            .expect("write failed");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(60), server)
+            .await
+            .expect("server stalled under loss")
+            .unwrap();
+        assert_eq!(received, payload, "data corrupted under packet loss");
+        assert!(
+            dropped.load(Ordering::Relaxed) > 0,
+            "proxy dropped nothing — test proved nothing"
+        );
+
+        proxy_task.abort();
     }
 }

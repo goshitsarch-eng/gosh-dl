@@ -4,7 +4,7 @@
 //! both HTTP (BEP 3) and UDP (BEP 15) protocols.
 
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures::{SinkExt, StreamExt};
@@ -23,6 +23,25 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Magic constant for UDP tracker protocol
 const UDP_PROTOCOL_ID: i64 = 0x41727101980;
+
+/// Per-attempt timeouts for UDP tracker requests (scaled-down BEP 15 schedule)
+///
+/// BEP 15 specifies retransmitting with a timeout of 15 * 2^n seconds
+/// (n = 0..=8). The full schedule is far too slow for an embedded engine, so
+/// we keep the doubling shape but bound it to 3 attempts: 5s, 10s, 20s.
+/// Each timeout applies to a full round-trip (connect or announce).
+const UDP_RETRY_TIMEOUTS: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+];
+
+/// Lifetime of a UDP tracker connection ID (BEP 15: one minute)
+///
+/// A connection ID obtained by a connect handshake may be reused for
+/// subsequent requests until it is this old, after which it must be
+/// re-requested.
+const UDP_CONNECTION_ID_EXPIRY: Duration = Duration::from_secs(60);
 
 /// Minimum allowed announce interval (60 seconds)
 /// Prevents aggressive tracker spam
@@ -570,6 +589,9 @@ impl TrackerClient {
     }
 
     /// Announce to a UDP tracker (BEP 15)
+    ///
+    /// Retries with the scaled-down BEP 15 schedule in [`UDP_RETRY_TIMEOUTS`]
+    /// (rather than the client-wide timeout used for HTTP/WS trackers).
     pub async fn announce_udp(
         &self,
         tracker_url: &str,
@@ -615,15 +637,65 @@ impl TrackerClient {
             )
         })?;
 
-        // Step 1: Connect
-        let connection_id = self.udp_connect(&socket).await?;
+        // Connect + announce with a bounded BEP 15 retry schedule: each entry
+        // in UDP_RETRY_TIMEOUTS is one attempt, and only timeouts are retried
+        // (other errors are returned immediately). A connection ID obtained by
+        // a previous attempt is reused while younger than
+        // UDP_CONNECTION_ID_EXPIRY and re-requested once it expires.
+        let mut cached_connection: Option<(i64, Instant)> = None;
+        let mut last_timeout_error = None;
 
-        // Step 2: Announce
-        self.udp_announce(&socket, connection_id, request).await
+        for &attempt_timeout in UDP_RETRY_TIMEOUTS.iter() {
+            // Step 1: Connect (or reuse a still-fresh connection ID)
+            let connection_id = match cached_connection {
+                Some((id, obtained_at)) if udp_connection_id_fresh(obtained_at, Instant::now()) => {
+                    id
+                }
+                _ => match self.udp_connect(&socket, attempt_timeout).await {
+                    Ok(id) => {
+                        cached_connection = Some((id, Instant::now()));
+                        id
+                    }
+                    Err(
+                        e @ EngineError::Network {
+                            kind: NetworkErrorKind::Timeout,
+                            ..
+                        },
+                    ) => {
+                        last_timeout_error = Some(e);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                },
+            };
+
+            // Step 2: Announce
+            match self
+                .udp_announce(&socket, connection_id, request, attempt_timeout)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(
+                    e @ EngineError::Network {
+                        kind: NetworkErrorKind::Timeout,
+                        ..
+                    },
+                ) => {
+                    last_timeout_error = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_timeout_error.unwrap_or_else(|| {
+            EngineError::network(NetworkErrorKind::Timeout, "UDP tracker retries exhausted")
+        }))
     }
 
     /// UDP connect request
-    async fn udp_connect(&self, socket: &UdpSocket) -> Result<i64> {
+    ///
+    /// `request_timeout` bounds the full connect round-trip.
+    async fn udp_connect(&self, socket: &UdpSocket, request_timeout: Duration) -> Result<i64> {
         let transaction_id: i32 = rand::rng().random();
 
         // Build connect request
@@ -638,15 +710,40 @@ impl TrackerClient {
             EngineError::network(NetworkErrorKind::Other, format!("UDP send failed: {}", e))
         })?;
 
-        let mut response = [0u8; 16];
-        let len = timeout(self.timeout, socket.recv(&mut response))
-            .await
-            .map_err(|_| {
-                EngineError::network(NetworkErrorKind::Timeout, "UDP tracker connect timeout")
-            })?
-            .map_err(|e| {
-                EngineError::network(NetworkErrorKind::Other, format!("UDP recv failed: {}", e))
-            })?;
+        // 16 bytes for a connect response; extra room for error messages
+        let mut response = [0u8; 512];
+        let deadline = Instant::now() + request_timeout;
+        let len = udp_recv_matching(
+            socket,
+            &mut response,
+            transaction_id,
+            deadline,
+            "UDP tracker connect timeout",
+        )
+        .await?;
+
+        // Transaction ID already verified; parse the action
+        let action = i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
+
+        if action == 3 {
+            // Error response - message starts at byte 8 (may be empty)
+            let error_msg = if len > 8 {
+                String::from_utf8_lossy(&response[8..len]).to_string()
+            } else {
+                String::from("(no message)")
+            };
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::TrackerError,
+                format!("UDP tracker error: {}", error_msg),
+            ));
+        }
+
+        if action != 0 {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::TrackerError,
+                format!("UDP connect error: action {}", action),
+            ));
+        }
 
         if len < 16 {
             return Err(EngineError::protocol(
@@ -655,10 +752,6 @@ impl TrackerClient {
             ));
         }
 
-        // Parse response
-        let action = i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
-        let resp_transaction_id =
-            i32::from_be_bytes([response[4], response[5], response[6], response[7]]);
         let connection_id = i64::from_be_bytes([
             response[8],
             response[9],
@@ -670,29 +763,18 @@ impl TrackerClient {
             response[15],
         ]);
 
-        if action != 0 {
-            return Err(EngineError::protocol(
-                ProtocolErrorKind::TrackerError,
-                format!("UDP connect error: action {}", action),
-            ));
-        }
-
-        if resp_transaction_id != transaction_id {
-            return Err(EngineError::protocol(
-                ProtocolErrorKind::TrackerError,
-                "UDP transaction ID mismatch",
-            ));
-        }
-
         Ok(connection_id)
     }
 
     /// UDP announce request
+    ///
+    /// `request_timeout` bounds the full announce round-trip.
     async fn udp_announce(
         &self,
         socket: &UdpSocket,
         connection_id: i64,
         request: &AnnounceRequest,
+        request_timeout: Duration,
     ) -> Result<AnnounceResponse> {
         let transaction_id: i32 = rand::rng().random();
 
@@ -723,28 +805,18 @@ impl TrackerClient {
         // Receive response (20 bytes header + 6 bytes per peer)
         // 4096 bytes supports ~678 peers ((4096 - 20) / 6), preventing silent truncation
         let mut response = [0u8; 4096];
-        let len = timeout(self.timeout, socket.recv(&mut response))
-            .await
-            .map_err(|_| {
-                EngineError::network(NetworkErrorKind::Timeout, "UDP tracker announce timeout")
-            })?
-            .map_err(|e| {
-                EngineError::network(NetworkErrorKind::Other, format!("UDP recv failed: {}", e))
-            })?;
+        let deadline = Instant::now() + request_timeout;
+        let len = udp_recv_matching(
+            socket,
+            &mut response,
+            transaction_id,
+            deadline,
+            "UDP tracker announce timeout",
+        )
+        .await?;
 
-        // Minimum response is 8 bytes (action + transaction_id) for error responses
-        // Announce responses need 20 bytes minimum
-        if len < 8 {
-            return Err(EngineError::protocol(
-                ProtocolErrorKind::TrackerError,
-                "UDP announce response too short (< 8 bytes)",
-            ));
-        }
-
-        // Parse response header
+        // Transaction ID already verified and len >= 8; parse the action
         let action = i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
-        let resp_transaction_id =
-            i32::from_be_bytes([response[4], response[5], response[6], response[7]]);
 
         if action == 3 {
             // Error response - message starts at byte 8 (may be empty)
@@ -771,13 +843,6 @@ impl TrackerClient {
             return Err(EngineError::protocol(
                 ProtocolErrorKind::TrackerError,
                 "UDP announce response too short (< 20 bytes)",
-            ));
-        }
-
-        if resp_transaction_id != transaction_id {
-            return Err(EngineError::protocol(
-                ProtocolErrorKind::TrackerError,
-                "UDP transaction ID mismatch",
             ));
         }
 
@@ -838,10 +903,19 @@ impl TrackerClient {
             })?;
 
         // Build JSON request
+        //
+        // The WebTorrent protocol requires info_hash and peer_id to be the
+        // raw 20 bytes encoded as a *binary string* (each byte mapped to the
+        // char with the same code point), not hex; serde_json escapes the
+        // result as needed when serializing.
+        //
+        // NOTE: Full WebTorrent interop additionally requires WebRTC offers
+        // in the announce, which this client does not implement. The
+        // binary-string encoding removes one of those two blockers.
         let ws_request = WsAnnounceRequest {
             action: "announce",
-            info_hash: hex::encode(request.info_hash),
-            peer_id: hex::encode(request.peer_id),
+            info_hash: binary_string(&request.info_hash),
+            peer_id: binary_string(&request.peer_id),
             uploaded: request.uploaded,
             downloaded: request.downloaded,
             left: request.left,
@@ -929,17 +1003,7 @@ impl TrackerClient {
                 .map(|p| PeerAddr {
                     ip: p.ip,
                     port: p.port,
-                    peer_id: p.peer_id.and_then(|s| {
-                        hex::decode(&s).ok().and_then(|b| {
-                            if b.len() == 20 {
-                                let mut arr = [0u8; 20];
-                                arr.copy_from_slice(&b);
-                                Some(arr)
-                            } else {
-                                None
-                            }
-                        })
-                    }),
+                    peer_id: p.peer_id.as_deref().and_then(decode_ws_peer_id),
                 })
                 .collect(),
             Some(WsPeers::Compact(encoded)) => {
@@ -1163,7 +1227,7 @@ impl TrackerClient {
         })?;
 
         // Connect
-        let connection_id = self.udp_connect(&socket).await?;
+        let connection_id = self.udp_connect(&socket, self.timeout).await?;
 
         // Scrape request
         let transaction_id: i32 = rand::rng().random();
@@ -1186,35 +1250,36 @@ impl TrackerClient {
 
         // Response: 8 bytes header + 12 bytes per torrent
         let mut response = [0u8; 1024];
-        let len = timeout(self.timeout, socket.recv(&mut response))
-            .await
-            .map_err(|_| EngineError::network(NetworkErrorKind::Timeout, "UDP scrape timeout"))?
-            .map_err(|e| {
-                EngineError::network(NetworkErrorKind::Other, format!("UDP recv failed: {}", e))
-            })?;
+        let deadline = Instant::now() + self.timeout;
+        let len = udp_recv_matching(
+            &socket,
+            &mut response,
+            transaction_id,
+            deadline,
+            "UDP scrape timeout",
+        )
+        .await?;
 
-        if len < 8 {
+        // Transaction ID already verified and len >= 8; parse the action
+        let action = i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
+
+        if action == 3 {
+            // Error response - message starts at byte 8 (may be empty)
+            let error_msg = if len > 8 {
+                String::from_utf8_lossy(&response[8..len]).to_string()
+            } else {
+                String::from("(no message)")
+            };
             return Err(EngineError::protocol(
                 ProtocolErrorKind::TrackerError,
-                "UDP scrape response too short",
+                format!("UDP tracker error: {}", error_msg),
             ));
         }
-
-        let action = i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
-        let resp_transaction_id =
-            i32::from_be_bytes([response[4], response[5], response[6], response[7]]);
 
         if action != 2 {
             return Err(EngineError::protocol(
                 ProtocolErrorKind::TrackerError,
                 format!("UDP scrape unexpected action: {}", action),
-            ));
-        }
-
-        if resp_transaction_id != transaction_id {
-            return Err(EngineError::protocol(
-                ProtocolErrorKind::TrackerError,
-                "UDP transaction ID mismatch",
             ));
         }
 
@@ -1248,6 +1313,89 @@ impl Default for TrackerClient {
     fn default() -> Self {
         Self::new().expect("Failed to create default TrackerClient (TLS initialization failed)")
     }
+}
+
+/// Whether a UDP tracker connection ID obtained at `obtained_at` is still
+/// usable at `now`
+///
+/// BEP 15 specifies that connection IDs expire after one minute
+/// ([`UDP_CONNECTION_ID_EXPIRY`]); an expired ID must be re-requested with a
+/// new connect handshake.
+fn udp_connection_id_fresh(obtained_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(obtained_at) < UDP_CONNECTION_ID_EXPIRY
+}
+
+/// Receive a UDP tracker datagram before `deadline`, returning its length
+///
+/// Per BEP 15, responses must be verified by transaction ID before parsing:
+/// datagrams that are too short to carry one (< 8 bytes) or whose transaction
+/// ID does not match `transaction_id` (e.g. stale responses to an earlier
+/// retransmission) are silently discarded and the wait continues. Returns a
+/// timeout error with `timeout_msg` once `deadline` passes.
+async fn udp_recv_matching(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+    transaction_id: i32,
+    deadline: Instant,
+    timeout_msg: &'static str,
+) -> Result<usize> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(EngineError::network(NetworkErrorKind::Timeout, timeout_msg));
+        }
+
+        let len = timeout(remaining, socket.recv(buf))
+            .await
+            .map_err(|_| EngineError::network(NetworkErrorKind::Timeout, timeout_msg))?
+            .map_err(|e| {
+                EngineError::network(NetworkErrorKind::Other, format!("UDP recv failed: {}", e))
+            })?;
+
+        // Every BEP 15 response carries action (bytes 0-3) and transaction ID
+        // (bytes 4-7); anything shorter cannot be identified
+        if len < 8 {
+            continue;
+        }
+
+        let resp_transaction_id = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        if resp_transaction_id != transaction_id {
+            continue;
+        }
+
+        return Ok(len);
+    }
+}
+
+/// Encode raw bytes as a WebTorrent "binary string"
+///
+/// The WebTorrent protocol represents raw hashes and peer IDs inside JSON as
+/// strings where each byte becomes the char with the same code point
+/// (latin-1/byte-to-char mapping).
+fn binary_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| char::from(b)).collect()
+}
+
+/// Decode a WebTorrent "binary string" back into raw bytes
+///
+/// Returns `None` if any char is outside the byte range (0..=255).
+fn binary_string_bytes(s: &str) -> Option<Vec<u8>> {
+    s.chars().map(|c| u8::try_from(u32::from(c)).ok()).collect()
+}
+
+/// Decode a peer ID from a WebSocket tracker response
+///
+/// The WebTorrent protocol sends peer IDs as binary strings (20 chars); some
+/// trackers send 40-char hex instead, so accept both.
+fn decode_ws_peer_id(s: &str) -> Option<[u8; 20]> {
+    let bytes = match binary_string_bytes(s) {
+        Some(b) if b.len() == 20 => b,
+        _ => hex::decode(s).ok().filter(|b| b.len() == 20)?,
+    };
+
+    let mut arr = [0u8; 20];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
 }
 
 /// Generate a random peer ID in Azureus-style
@@ -1354,5 +1502,201 @@ mod tests {
         assert_eq!(peers[0].port, 6881);
         assert_eq!(peers[1].ip, "192.168.1.1");
         assert_eq!(peers[1].port, 6882);
+    }
+
+    #[test]
+    fn test_udp_retry_schedule() {
+        // Scaled-down BEP 15 schedule: bounded attempts with doubling timeouts
+        assert_eq!(UDP_RETRY_TIMEOUTS.len(), 3);
+        assert_eq!(UDP_RETRY_TIMEOUTS[0], Duration::from_secs(5));
+        assert_eq!(UDP_RETRY_TIMEOUTS[1], Duration::from_secs(10));
+        assert_eq!(UDP_RETRY_TIMEOUTS[2], Duration::from_secs(20));
+
+        // Keep the BEP 15 doubling shape (15 * 2^n scaled down)
+        for pair in UDP_RETRY_TIMEOUTS.windows(2) {
+            assert_eq!(pair[1], pair[0] * 2);
+        }
+    }
+
+    #[test]
+    fn test_udp_connection_id_freshness() {
+        let obtained = Instant::now();
+
+        assert!(udp_connection_id_fresh(obtained, obtained));
+        assert!(udp_connection_id_fresh(
+            obtained,
+            obtained + Duration::from_secs(59)
+        ));
+        // BEP 15: connection IDs expire after one minute
+        assert!(!udp_connection_id_fresh(
+            obtained,
+            obtained + UDP_CONNECTION_ID_EXPIRY
+        ));
+        assert!(!udp_connection_id_fresh(
+            obtained,
+            obtained + Duration::from_secs(120)
+        ));
+        // A `now` before `obtained` must not underflow
+        assert!(udp_connection_id_fresh(
+            obtained + Duration::from_secs(1),
+            obtained
+        ));
+    }
+
+    #[test]
+    fn test_ws_announce_binary_string_encoding() {
+        // Known hash exercising the byte-to-char mapping: 0x00, control
+        // chars, JSON-escaped chars (quote, backslash), and bytes >= 0x80
+        let info_hash: [u8; 20] = [
+            0x01, 0xff, 0x00, 0x7f, 0x80, 0xab, 0x20, 0x22, 0x5c, 0x0a, 0x41, 0x42, 0x43, 0xfe,
+            0x10, 0x99, 0xc3, 0x00, 0x33, 0xf0,
+        ];
+        let peer_id = *b"-GD0001-abcdefghijkl";
+
+        let ws_request = WsAnnounceRequest {
+            action: "announce",
+            info_hash: binary_string(&info_hash),
+            peer_id: binary_string(&peer_id),
+            uploaded: 0,
+            downloaded: 0,
+            left: 42,
+            event: Some("started"),
+            numwant: Some(30),
+            port: 6881,
+            offers: None,
+        };
+
+        let json = serde_json::to_string(&ws_request).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // The JSON must contain the byte-mapped (binary) string, not hex
+        let expected: String = info_hash.iter().map(|&b| char::from(b)).collect();
+        assert_eq!(parsed["info_hash"].as_str().unwrap(), expected);
+        assert_eq!(parsed["peer_id"].as_str().unwrap(), "-GD0001-abcdefghijkl");
+        assert_ne!(
+            parsed["info_hash"].as_str().unwrap(),
+            hex::encode(info_hash)
+        );
+
+        // And it must round-trip back to the original raw bytes
+        assert_eq!(
+            binary_string_bytes(parsed["info_hash"].as_str().unwrap()).unwrap(),
+            info_hash
+        );
+    }
+
+    #[test]
+    fn test_binary_string_roundtrip_all_bytes() {
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        let s = binary_string(&bytes);
+        assert_eq!(binary_string_bytes(&s).unwrap(), bytes);
+    }
+
+    #[test]
+    fn test_binary_string_bytes_rejects_wide_chars() {
+        // U+0100 is outside the byte range
+        assert!(binary_string_bytes("abc\u{0100}").is_none());
+    }
+
+    #[test]
+    fn test_decode_ws_peer_id() {
+        let raw = *b"-GD0001-abcdefghijkl";
+
+        // Binary-string form (WebTorrent protocol)
+        assert_eq!(decode_ws_peer_id(&binary_string(&raw)), Some(raw));
+
+        // Binary-string form with non-ASCII bytes
+        let mut high = raw;
+        high[8] = 0xff;
+        high[9] = 0x00;
+        assert_eq!(decode_ws_peer_id(&binary_string(&high)), Some(high));
+
+        // 40-char hex form (some trackers)
+        assert_eq!(decode_ws_peer_id(&hex::encode(raw)), Some(raw));
+
+        // Wrong length
+        assert_eq!(decode_ws_peer_id("too short"), None);
+    }
+
+    #[tokio::test]
+    async fn test_udp_announce_against_local_tracker() {
+        // Minimal in-process BEP 15 tracker: replies to connect and announce,
+        // first sending a datagram with a wrong transaction ID that the
+        // client must discard. All replies are immediate, so no retry
+        // timeouts elapse.
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+
+            // Connect request: 16 bytes
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            assert_eq!(len, 16);
+            assert_eq!(&buf[0..8], &UDP_PROTOCOL_ID.to_be_bytes());
+            assert_eq!(&buf[8..12], &0u32.to_be_bytes()); // action: connect
+            let txid = buf[12..16].to_vec();
+
+            // A response with a mismatched transaction ID must be ignored
+            let mut wrong_txid = txid.clone();
+            wrong_txid[3] ^= 0xFF;
+            let mut junk = Vec::new();
+            junk.extend_from_slice(&0u32.to_be_bytes());
+            junk.extend_from_slice(&wrong_txid);
+            junk.extend_from_slice(&0u64.to_be_bytes());
+            server.send_to(&junk, peer).await.unwrap();
+
+            // Real connect response
+            let connection_id = 0x1234_5678_9ABC_DEF0u64;
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&0u32.to_be_bytes()); // action: connect
+            resp.extend_from_slice(&txid);
+            resp.extend_from_slice(&connection_id.to_be_bytes());
+            server.send_to(&resp, peer).await.unwrap();
+
+            // Announce request: 98 bytes
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            assert_eq!(len, 98);
+            assert_eq!(&buf[0..8], &connection_id.to_be_bytes());
+            assert_eq!(&buf[8..12], &1u32.to_be_bytes()); // action: announce
+            let txid = buf[12..16].to_vec();
+
+            // Announce response with one peer (10.0.0.1:6881)
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&1u32.to_be_bytes()); // action: announce
+            resp.extend_from_slice(&txid);
+            resp.extend_from_slice(&1800u32.to_be_bytes()); // interval
+            resp.extend_from_slice(&7u32.to_be_bytes()); // leechers
+            resp.extend_from_slice(&3u32.to_be_bytes()); // seeders
+            resp.extend_from_slice(&[10, 0, 0, 1, 0x1A, 0xE1]);
+            server.send_to(&resp, peer).await.unwrap();
+        });
+
+        let client = TrackerClient::new().unwrap();
+        let request = AnnounceRequest {
+            info_hash: [0xAB; 20],
+            peer_id: *client.peer_id(),
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: 1024,
+            event: AnnounceEvent::Started,
+            compact: true,
+            numwant: Some(50),
+            key: None,
+            tracker_id: None,
+        };
+
+        let url = format!("udp://{}", server_addr);
+        let response = client.announce_udp(&url, &request).await.unwrap();
+
+        assert_eq!(response.interval, 1800);
+        assert_eq!(response.complete, Some(3));
+        assert_eq!(response.incomplete, Some(7));
+        assert_eq!(response.peers.len(), 1);
+        assert_eq!(response.peers[0].ip, "10.0.0.1");
+        assert_eq!(response.peers[0].port, 6881);
+
+        server_task.await.unwrap();
     }
 }

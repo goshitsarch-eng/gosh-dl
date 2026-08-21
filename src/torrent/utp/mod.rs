@@ -39,8 +39,5 @@ pub mod socket;
 pub mod state;
 
 // Re-export commonly used types
-pub use congestion::LedbatController;
 pub use multiplexer::UtpMux;
-pub use packet::{Packet, PacketType, SelectiveAck, MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE};
-pub use socket::{UtpConfig, UtpSocket, UtpSocketInner};
-pub use state::{ConnectionState, ConnectionStats, PendingPacket};
+pub use socket::{UtpConfig, UtpSocket};
