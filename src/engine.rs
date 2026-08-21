@@ -33,7 +33,6 @@ use std::collections::HashMap;
 #[cfg(all(feature = "http", feature = "recursive-http"))]
 use std::collections::HashSet;
 use std::sync::{Arc, Weak};
-#[cfg(feature = "torrent")]
 use std::time::Duration;
 use tokio::sync::broadcast;
 #[cfg(feature = "http")]
@@ -281,7 +280,9 @@ impl DownloadEngine {
         let (global_download_limiter, global_upload_limiter) = http.limiters();
         #[cfg(not(feature = "http"))]
         let (global_download_limiter, global_upload_limiter) = (
-            Arc::new(crate::limiter::RateLimiter::new(config.global_download_limit)),
+            Arc::new(crate::limiter::RateLimiter::new(
+                config.global_download_limit,
+            )),
             Arc::new(crate::limiter::RateLimiter::new(config.global_upload_limit)),
         );
 
@@ -335,7 +336,11 @@ impl DownloadEngine {
         // to run before the crash, and nothing else would ever start them.
         for id in restored_queued {
             if let Err(e) = engine.resume(id).await {
-                tracing::warn!("Failed to auto-start restored queued download {}: {}", id, e);
+                tracing::warn!(
+                    "Failed to auto-start restored queued download {}: {}",
+                    id,
+                    e
+                );
             }
         }
 
@@ -488,7 +493,11 @@ impl DownloadEngine {
             // Refresh runtime metadata (torrent transfer totals)
             if let Some(json) = runtime_json {
                 if let Err(e) = storage.save_runtime_metadata(status.id, &json).await {
-                    tracing::debug!("Failed to persist runtime metadata for {}: {}", status.id, e);
+                    tracing::debug!(
+                        "Failed to persist runtime metadata for {}: {}",
+                        status.id,
+                        e
+                    );
                 }
             }
         }
@@ -535,15 +544,20 @@ impl DownloadEngine {
             restored_status.progress.upload_speed = 0;
             restored_status.progress.connections = 0;
 
-            let parsed_runtime = runtime_metadata.get(&status.id).and_then(|runtime_json| {
-                match self.parse_persisted_runtime_metadata(runtime_json) {
-                    Ok(runtime) => Some(runtime),
-                    Err(e) => {
-                        tracing::warn!("Failed to parse runtime metadata for {}: {}", status.id, e);
-                        None
+            let parsed_runtime =
+                runtime_metadata.get(&status.id).and_then(|runtime_json| {
+                    match self.parse_persisted_runtime_metadata(runtime_json) {
+                        Ok(runtime) => Some(runtime),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse runtime metadata for {}: {}",
+                                status.id,
+                                e
+                            );
+                            None
+                        }
                     }
-                }
-            });
+                });
             let restored_options = parsed_runtime.as_ref().and_then(|r| r.options.clone());
             let restored_totals = parsed_runtime.as_ref().and_then(|r| r.torrent_totals);
 
@@ -1616,7 +1630,9 @@ impl DownloadEngine {
         // restarts.
         if let Some((downloaded, uploaded)) = {
             let mut downloads = self.downloads.write();
-            downloads.get_mut(&id).and_then(|d| d.restored_totals.take())
+            downloads
+                .get_mut(&id)
+                .and_then(|d| d.restored_totals.take())
         } {
             downloader.set_transfer_totals(downloaded, uploaded);
         }
@@ -1814,7 +1830,9 @@ impl DownloadEngine {
         // restarts.
         if let Some((downloaded, uploaded)) = {
             let mut downloads = self.downloads.write();
-            downloads.get_mut(&id).and_then(|d| d.restored_totals.take())
+            downloads
+                .get_mut(&id)
+                .and_then(|d| d.restored_totals.take())
         } {
             downloader.set_transfer_totals(downloaded, uploaded);
         }
@@ -1999,8 +2017,7 @@ impl DownloadEngine {
                         && download.status.state == DownloadState::Downloading
                     {
                         download.status.state = DownloadState::Seeding;
-                        state_change =
-                            Some((DownloadState::Downloading, DownloadState::Seeding));
+                        state_change = Some((DownloadState::Downloading, DownloadState::Seeding));
                     }
 
                     let mut needs_persist = false;
@@ -2218,7 +2235,7 @@ impl DownloadEngine {
             } else {
                 Some(cookies.as_slice())
             };
-            let mirror_manager = MirrorManager::new(url.clone(), mirrors);
+            let mirror_manager = Arc::new(MirrorManager::new(url.clone(), mirrors));
             let mut active_url = mirror_manager.current_url().to_string();
             let mut saved_segments = saved_segments;
             let result = loop {
@@ -2241,6 +2258,7 @@ impl DownloadEngine {
                         saved_segments.take(),
                         Some(Arc::clone(&validators_cell)),
                         per_download_limiter.clone(),
+                        Some(Arc::clone(&mirror_manager)),
                         {
                             let progress_callback = Arc::clone(&progress_callback);
                             move |progress| progress_callback(progress)
@@ -2952,6 +2970,442 @@ impl DownloadEngine {
         self.event_tx.subscribe()
     }
 
+    /// Re-verify a download's on-disk data.
+    ///
+    /// - **HTTP**: recomputes the configured checksum over the completed
+    ///   file (or, with no checksum configured, checks presence and size).
+    /// - **Torrents**: re-hashes every piece on disk and rebuilds the piece
+    ///   bitmap, so corrupted or truncated pieces become wanted again.
+    ///
+    /// Not allowed while the download is actively transferring — pause it
+    /// first. Use [`repair`](Self::repair) to act on a failed verification.
+    pub async fn verify(&self, id: DownloadId) -> Result<VerifyReport> {
+        let (kind, state, path, checksum, total_size) = {
+            let downloads = self.downloads.read();
+            let download = downloads
+                .get(&id)
+                .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
+            (
+                download.status.kind,
+                download.status.state.clone(),
+                download.status.metadata.save_dir.join(
+                    download
+                        .status
+                        .metadata
+                        .filename
+                        .as_deref()
+                        .unwrap_or(&download.status.metadata.name),
+                ),
+                download.status.metadata.checksum.clone(),
+                download.status.progress.total_size,
+            )
+        };
+
+        if matches!(
+            state,
+            DownloadState::Downloading | DownloadState::Connecting
+        ) {
+            return Err(EngineError::InvalidState {
+                action: "verify",
+                current_state: format!("{:?}", state),
+            });
+        }
+
+        match kind {
+            #[cfg(feature = "http")]
+            DownloadKind::Http => {
+                let _ = total_size;
+                if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                    return Ok(VerifyReport {
+                        valid: false,
+                        bad_pieces: 0,
+                        detail: format!("file missing: {}", path.display()),
+                    });
+                }
+                match checksum {
+                    Some(expected) => {
+                        let valid = crate::http::verify_checksum(&path, &expected).await?;
+                        Ok(VerifyReport {
+                            valid,
+                            bad_pieces: 0,
+                            detail: if valid {
+                                format!("{} checksum matches", expected.algorithm)
+                            } else {
+                                format!("{} checksum mismatch", expected.algorithm)
+                            },
+                        })
+                    }
+                    None => {
+                        let on_disk = tokio::fs::metadata(&path).await.map(|m| m.len()).ok();
+                        let valid = match (on_disk, total_size) {
+                            (Some(actual), Some(expected)) => actual == expected,
+                            (Some(_), None) => true,
+                            _ => false,
+                        };
+                        Ok(VerifyReport {
+                            valid,
+                            bad_pieces: 0,
+                            detail: format!(
+                                "no checksum configured; size check: {:?} vs expected {:?}",
+                                on_disk, total_size
+                            ),
+                        })
+                    }
+                }
+            }
+            #[cfg(feature = "torrent")]
+            DownloadKind::Torrent | DownloadKind::Magnet => {
+                let pm = {
+                    let downloads = self.downloads.read();
+                    downloads.get(&id).and_then(|d| match &d.handle {
+                        Some(DownloadHandle::Torrent(h)) => h.downloader.piece_manager_handle(),
+                        _ => None,
+                    })
+                };
+                let Some(pm) = pm else {
+                    return Err(EngineError::InvalidState {
+                        action: "verify",
+                        current_state: "no live torrent handle (resume the download first)"
+                            .to_string(),
+                    });
+                };
+                let valid = pm.verify_existing().await?;
+                let total = pm.progress().total_pieces;
+                Ok(VerifyReport {
+                    valid: pm.is_complete(),
+                    bad_pieces: total.saturating_sub(valid),
+                    detail: format!("{}/{} pieces verified", valid, total),
+                })
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(EngineError::Internal(
+                "verify: unsupported download kind for this build".to_string(),
+            )),
+        }
+    }
+
+    /// Verify a download and, when the data is bad, put it back on the road
+    /// to health:
+    ///
+    /// - **HTTP**: the corrupt file and any partial state are removed and
+    ///   the download restarts from zero.
+    /// - **Torrents**: [`verify`](Self::verify) has already marked the bad
+    ///   pieces as missing; the download is resumed (or its live task simply
+    ///   continues) so they are re-fetched.
+    ///
+    /// Returns the pre-repair [`VerifyReport`].
+    pub async fn repair(&self, id: DownloadId) -> Result<VerifyReport> {
+        let report = self.verify(id).await?;
+        if report.valid {
+            return Ok(report);
+        }
+
+        let (kind, state) = {
+            let downloads = self.downloads.read();
+            let download = downloads
+                .get(&id)
+                .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
+            (download.status.kind, download.status.state.clone())
+        };
+
+        match kind {
+            #[cfg(feature = "http")]
+            DownloadKind::Http => {
+                // Remove the bad file and all partial state, reset progress,
+                // then resume from zero.
+                let path = {
+                    let mut downloads = self.downloads.write();
+                    let download = downloads
+                        .get_mut(&id)
+                        .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
+                    download.status.progress.completed_size = 0;
+                    download.status.state = DownloadState::Paused;
+                    download.status.completed_at = None;
+                    download.cached_segments = None;
+                    download.status.metadata.save_dir.join(
+                        download
+                            .status
+                            .metadata
+                            .filename
+                            .as_deref()
+                            .unwrap_or(&download.status.metadata.name),
+                    )
+                };
+                tokio::fs::remove_file(&path).await.ok();
+                tokio::fs::remove_file(crate::http::partial_path_for(&path))
+                    .await
+                    .ok();
+                if let Some(ref storage) = self.storage {
+                    storage.delete_segments(id).await.ok();
+                }
+                self.resume(id).await?;
+            }
+            #[cfg(feature = "torrent")]
+            DownloadKind::Torrent | DownloadKind::Magnet => {
+                match state {
+                    DownloadState::Paused | DownloadState::Error { .. } => {
+                        self.resume(id).await?;
+                    }
+                    DownloadState::Completed | DownloadState::Seeding => {
+                        // The live peer loop notices the incomplete bitmap by
+                        // itself; reflect that at the engine level.
+                        self.update_state(id, DownloadState::Downloading)?;
+                    }
+                    _ => {}
+                }
+            }
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+
+        Ok(report)
+    }
+
+    /// Open a streaming reader over an in-progress (or completed) download.
+    ///
+    /// The reader yields bytes from `offset` onward as they become available
+    /// on disk, waiting (not erroring) for data that hasn't arrived yet:
+    ///
+    /// - **HTTP**: bytes are served from the contiguous downloaded prefix
+    ///   (segmented downloads expose exactly the gap-free run from the file
+    ///   start; single-connection downloads are linear anyway).
+    /// - **Torrents**: bytes are served from verified pieces, and the read
+    ///   position is fed back into piece selection so the swarm fetches the
+    ///   pieces the reader needs next — streaming playback without manually
+    ///   enabling sequential mode.
+    ///
+    /// The stream ends (EOF) when the download completes and the last byte
+    /// has been read — or when the download fails, is cancelled, or is
+    /// removed, so a reader consuming a broken download sees a short read
+    /// rather than hanging. Compare bytes read against
+    /// [`DownloadReader::total_size`] to distinguish the two.
+    pub fn open_reader(&self, id: DownloadId, offset: u64) -> Result<DownloadReader> {
+        let engine = self.arc()?;
+        let total_size = {
+            let downloads = self.downloads.read();
+            let download = downloads
+                .get(&id)
+                .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
+            download.status.progress.total_size
+        };
+
+        const CHUNK: u64 = 64 * 1024;
+        let (reader_half, mut writer_half) = tokio::io::duplex(256 * 1024);
+
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+            let mut pos = offset;
+            'pump: loop {
+                // Snapshot the source under the lock, then do I/O outside it.
+                enum Source {
+                    #[cfg(feature = "http")]
+                    HttpFile {
+                        path: std::path::PathBuf,
+                        available_end: u64,
+                    },
+                    #[cfg(feature = "torrent")]
+                    Torrent {
+                        pm: Arc<crate::torrent::PieceManager>,
+                        available_end: u64,
+                    },
+                    Wait,
+                    Finished,
+                }
+
+                let source = {
+                    let downloads = engine.downloads.read();
+                    let Some(download) = downloads.get(&id) else {
+                        break 'pump; // removed
+                    };
+                    match &download.status.state {
+                        DownloadState::Error { .. } => Source::Finished,
+                        s => {
+                            let completed = matches!(s, DownloadState::Completed);
+                            match download.status.kind {
+                                #[cfg(feature = "http")]
+                                DownloadKind::Http => {
+                                    // Prefer the live segmented handle for the
+                                    // contiguous prefix; fall back to linear
+                                    // progress (single-connection) or the
+                                    // final file once completed.
+                                    let segmented = match &download.handle {
+                                        Some(DownloadHandle::Http(h)) => {
+                                            h.segmented_download.read().clone()
+                                        }
+                                        _ => None,
+                                    };
+                                    let final_path = download.status.metadata.save_dir.join(
+                                        download
+                                            .status
+                                            .metadata
+                                            .filename
+                                            .as_deref()
+                                            .unwrap_or("download"),
+                                    );
+                                    if completed {
+                                        let end = download
+                                            .status
+                                            .progress
+                                            .total_size
+                                            .unwrap_or(download.status.progress.completed_size);
+                                        Source::HttpFile {
+                                            path: final_path,
+                                            available_end: end,
+                                        }
+                                    } else if let Some(sd) = segmented {
+                                        Source::HttpFile {
+                                            path: crate::http::partial_path_for(sd.save_path()),
+                                            available_end: sd.contiguous_available(),
+                                        }
+                                    } else {
+                                        Source::HttpFile {
+                                            path: crate::http::partial_path_for(&final_path),
+                                            available_end: download.status.progress.completed_size,
+                                        }
+                                    }
+                                }
+                                #[cfg(feature = "torrent")]
+                                DownloadKind::Torrent | DownloadKind::Magnet => {
+                                    let pm = match &download.handle {
+                                        Some(DownloadHandle::Torrent(h)) => {
+                                            h.downloader.piece_manager_handle()
+                                        }
+                                        _ => None,
+                                    };
+                                    match pm {
+                                        Some(pm) => {
+                                            let available = pm.contiguous_available_from(pos);
+                                            Source::Torrent {
+                                                available_end: pos + available,
+                                                pm,
+                                            }
+                                        }
+                                        // Completed with the handle already
+                                        // torn down: nothing left to serve.
+                                        None if completed => Source::Finished,
+                                        // Magnet metadata not fetched yet, or
+                                        // paused with no live handle.
+                                        None => Source::Wait,
+                                    }
+                                }
+                                #[allow(unreachable_patterns)]
+                                _ => Source::Finished,
+                            }
+                        }
+                    }
+                };
+
+                match source {
+                    Source::Finished => break 'pump,
+                    Source::Wait => {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        continue 'pump;
+                    }
+                    #[cfg(feature = "http")]
+                    Source::HttpFile {
+                        path,
+                        available_end,
+                    } => {
+                        if available_end <= pos {
+                            // Nothing new. Completed + fully drained = EOF.
+                            let done = {
+                                let downloads = engine.downloads.read();
+                                match downloads.get(&id) {
+                                    Some(d) => {
+                                        matches!(d.status.state, DownloadState::Completed)
+                                    }
+                                    None => true,
+                                }
+                            };
+                            if done {
+                                break 'pump;
+                            }
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            continue 'pump;
+                        }
+                        let len = (available_end - pos).min(CHUNK) as usize;
+                        let mut buf = vec![0u8; len];
+                        // The .part may be renamed to the final name between
+                        // the snapshot and this read; the next iteration
+                        // re-resolves the path, so treat errors as transient.
+                        let read = async {
+                            let mut file = tokio::fs::File::open(&path).await?;
+                            file.seek(std::io::SeekFrom::Start(pos)).await?;
+                            file.read_exact(&mut buf).await?;
+                            std::io::Result::Ok(())
+                        }
+                        .await;
+                        match read {
+                            Ok(()) => {
+                                if writer_half.write_all(&buf).await.is_err() {
+                                    break 'pump; // reader dropped
+                                }
+                                pos += len as u64;
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Streaming read of {:?} at {} failed ({}); retrying",
+                                    path,
+                                    pos,
+                                    e
+                                );
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                            }
+                        }
+                    }
+                    #[cfg(feature = "torrent")]
+                    Source::Torrent { pm, available_end } => {
+                        let piece_len = pm.nominal_piece_length();
+                        // Keep piece selection pointed at the read head.
+                        if let Some(piece) = pos.checked_div(piece_len) {
+                            pm.set_stream_position(Some(piece as u32));
+                        }
+                        if available_end <= pos {
+                            if pos >= pm.total_size() {
+                                break 'pump; // fully drained
+                            }
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            continue 'pump;
+                        }
+                        let piece = (pos / piece_len) as u32;
+                        let begin = (pos % piece_len) as u32;
+                        let piece_end = ((piece as u64 + 1) * piece_len).min(pm.total_size());
+                        let len = (available_end.min(piece_end) - pos).min(CHUNK) as u32;
+                        match pm.read_block(piece, begin, len).await {
+                            Ok(data) => {
+                                if writer_half.write_all(&data).await.is_err() {
+                                    pm.set_stream_position(None);
+                                    break 'pump; // reader dropped
+                                }
+                                pos += data.len() as u64;
+                                if pos >= pm.total_size() {
+                                    pm.set_stream_position(None);
+                                    break 'pump; // EOF
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Streaming piece read {}@{} failed ({}); retrying",
+                                    piece,
+                                    begin,
+                                    e
+                                );
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                            }
+                        }
+                    }
+                }
+            }
+            // Dropping writer_half closes the stream: the reader sees EOF.
+        });
+
+        Ok(DownloadReader {
+            inner: reader_half,
+            total_size,
+        })
+    }
+
     /// Update engine configuration
     pub fn set_config(&self, config: EngineConfig) -> Result<()> {
         config.validate()?;
@@ -3124,6 +3578,46 @@ impl Drop for DownloadEngine {
     fn drop(&mut self) {
         // Signal shutdown on drop
         self.shutdown.cancel();
+    }
+}
+
+/// Result of [`DownloadEngine::verify`].
+#[derive(Debug, Clone)]
+pub struct VerifyReport {
+    /// Whether the on-disk data checked out completely.
+    pub valid: bool,
+    /// For torrents: pieces that failed re-verification (0 for HTTP).
+    pub bad_pieces: usize,
+    /// Human-readable description of what was checked.
+    pub detail: String,
+}
+
+/// Streaming reader over a download; see [`DownloadEngine::open_reader`].
+///
+/// Implements [`tokio::io::AsyncRead`]. Bytes arrive as the download makes
+/// them available; the stream ends when the download's data is fully read or
+/// the download stops existing (failed, cancelled, removed).
+pub struct DownloadReader {
+    inner: tokio::io::DuplexStream,
+    total_size: Option<u64>,
+}
+
+impl DownloadReader {
+    /// Total size of the underlying download, when known at open time.
+    /// Compare against bytes read to detect a stream cut short by a failed
+    /// or cancelled download.
+    pub fn total_size(&self) -> Option<u64> {
+        self.total_size
+    }
+}
+
+impl tokio::io::AsyncRead for DownloadReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
     }
 }
 

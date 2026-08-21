@@ -17,7 +17,7 @@ use bytes::Bytes;
 use futures::stream::StreamExt;
 use parking_lot::RwLock;
 use reqwest::Client;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -93,6 +93,8 @@ pub struct SegmentedDownload {
     last_modified: Option<String>,
     /// Shared state (wrapped in Arc for task sharing)
     state: Arc<SharedState>,
+    /// Mirror manager for striping segments across multiple URLs
+    mirrors: Option<Arc<super::MirrorManager>>,
 }
 
 /// Server capabilities determined from HEAD request
@@ -136,7 +138,17 @@ impl SegmentedDownload {
                 segment_progress: RwLock::new(Vec::new()),
                 last_persistence: RwLock::new(Instant::now()),
             }),
+            mirrors: None,
         }
+    }
+
+    /// Enable mirror striping: each segment is assigned one of the available
+    /// URLs round-robin, and a failing URL is retried against the others.
+    /// Only the primary URL's requests carry If-Range validators (mirrors
+    /// have their own ETags); non-primary responses are instead validated by
+    /// their Content-Range total against the expected file size.
+    pub fn set_mirror_manager(&mut self, mirrors: Arc<super::MirrorManager>) {
+        self.mirrors = Some(mirrors);
     }
 
     /// Initialize segments for a new download
@@ -281,6 +293,7 @@ impl SegmentedDownload {
         for (segment_idx, start, end, already_downloaded) in segments_data {
             let client = client.clone();
             let url = self.url.clone();
+            let mirrors = self.mirrors.clone();
             let user_agent = user_agent.to_string();
             let headers = headers.to_vec();
             let file = Arc::clone(&file);
@@ -340,14 +353,32 @@ impl SegmentedDownload {
                         break 'retry Ok(());
                     }
 
+                    // Choose the URL: stripe across available mirrors when
+                    // configured (rotating on retries), else the primary.
+                    let (request_url, is_primary) = match mirrors.as_ref() {
+                        Some(m) => {
+                            let candidate = m
+                                .url_for_segment(segment_idx + attempt as usize)
+                                .to_string();
+                            let is_primary = candidate == url;
+                            (candidate, is_primary)
+                        }
+                        None => (url.clone(), true),
+                    };
+
                     // Build request with Range header
-                    let mut request = client.get(&url);
+                    let mut request = client.get(&request_url);
                     request = request.header("User-Agent", &user_agent);
                     request = request.header("Range", format!("bytes={}-{}", resume_start, end));
 
-                    // Add ETag for validation if available
-                    if let Some(if_range_val) = etag.as_deref().or(last_modified.as_deref()) {
-                        request = request.header("If-Range", if_range_val);
+                    // Add ETag for validation if available. Only the primary
+                    // URL: mirrors have their own validators, and a mismatched
+                    // If-Range would silently return 200 (full body).
+                    let send_if_range = is_primary;
+                    if send_if_range {
+                        if let Some(if_range_val) = etag.as_deref().or(last_modified.as_deref()) {
+                            request = request.header("If-Range", if_range_val);
+                        }
                     }
 
                     // Add custom headers
@@ -360,6 +391,9 @@ impl SegmentedDownload {
                     let response = match request.send().await {
                         Ok(r) => r,
                         Err(e) => {
+                            if let Some(m) = mirrors.as_ref() {
+                                m.report_url_failure(&request_url);
+                            }
                             let err: EngineError = e.into();
                             attempt += 1;
                             if retry_policy.should_retry(attempt - 1, &err) {
@@ -401,6 +435,9 @@ impl SegmentedDownload {
 
                     // Handle server errors (5xx) with retry
                     if status.is_server_error() {
+                        if let Some(m) = mirrors.as_ref() {
+                            m.report_url_failure(&request_url);
+                        }
                         let err = EngineError::network(
                             NetworkErrorKind::HttpStatus(status.as_u16()),
                             format!("Segment {} server error: {}", segment_idx, status),
@@ -429,18 +466,26 @@ impl SegmentedDownload {
                         ));
                     }
 
+                    let content_range = response
+                        .headers()
+                        .get("content-range")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+
                     if let Err(e) = validate_ranged_response(
                         resume_start,
                         Some(end),
                         status,
-                        response
-                            .headers()
-                            .get("content-range")
-                            .and_then(|v| v.to_str().ok()),
+                        content_range.as_deref(),
                         RangedResponseContext {
-                            sent_if_range: etag.is_some() || last_modified.is_some(),
-                            expected_etag: etag.as_deref(),
-                            expected_last_modified: last_modified.as_deref(),
+                            sent_if_range: send_if_range
+                                && (etag.is_some() || last_modified.is_some()),
+                            expected_etag: if is_primary { etag.as_deref() } else { None },
+                            expected_last_modified: if is_primary {
+                                last_modified.as_deref()
+                            } else {
+                                None
+                            },
                             response_etag: response
                                 .headers()
                                 .get("etag")
@@ -451,7 +496,46 @@ impl SegmentedDownload {
                                 .and_then(|v| v.to_str().ok()),
                         },
                     ) {
+                        if !is_primary {
+                            // A misbehaving mirror shouldn't fail the download:
+                            // penalize it and retry against another URL.
+                            if let Some(m) = mirrors.as_ref() {
+                                m.report_url_failure(&request_url);
+                            }
+                            attempt += 1;
+                            if attempt < retry_policy.max_attempts {
+                                continue 'retry;
+                            }
+                        }
                         break 'retry Err(e);
+                    }
+
+                    // Cross-mirror sanity: without shared validators, the one
+                    // thing every mirror must agree on is the file size.
+                    if let Some(total) = content_range
+                        .as_deref()
+                        .and_then(|cr| cr.rsplit('/').next())
+                        .and_then(|t| t.parse::<u64>().ok())
+                    {
+                        if total != total_size {
+                            if let Some(m) = mirrors.as_ref() {
+                                m.report_url_failure(&request_url);
+                            }
+                            let err = EngineError::protocol(
+                                ProtocolErrorKind::InvalidResponse,
+                                format!(
+                                    "Mirror {} reports size {} but expected {}",
+                                    request_url, total, total_size
+                                ),
+                            );
+                            if !is_primary {
+                                attempt += 1;
+                                if attempt < retry_policy.max_attempts {
+                                    continue 'retry;
+                                }
+                            }
+                            break 'retry Err(err);
+                        }
                     }
 
                     // Stream data to file
@@ -724,6 +808,32 @@ impl SegmentedDownload {
         }
 
         Ok(())
+    }
+
+    /// Number of bytes available as one contiguous run from the start of the
+    /// file: segments write sequentially within their ranges, so this is the
+    /// first incomplete segment's start plus its progress. Used by streaming
+    /// readers to know how far they can safely read.
+    pub fn contiguous_available(&self) -> u64 {
+        let progress = self.state.segment_progress.read();
+        let mut ordered: Vec<&Segment> = self.segments.iter().collect();
+        ordered.sort_by_key(|s| s.start);
+        for segment in ordered {
+            let downloaded = progress
+                .get(segment.index)
+                .copied()
+                .unwrap_or(segment.downloaded);
+            let size = segment.end - segment.start + 1;
+            if downloaded < size {
+                return segment.start + downloaded;
+            }
+        }
+        self.total_size
+    }
+
+    /// The final save path for this download.
+    pub fn save_path(&self) -> &Path {
+        &self.save_path
     }
 
     /// Check if persistence is due based on the time interval.

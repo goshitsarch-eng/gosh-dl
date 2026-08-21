@@ -47,6 +47,10 @@ pub struct PieceManager {
 
     /// Sequential download mode - download pieces in order for streaming
     sequential_mode: RwLock<bool>,
+    /// Streaming read position (piece index); u32::MAX = no active stream.
+    /// When set, piece selection prioritizes pieces at/after this position so
+    /// the reader is never starved.
+    stream_position: std::sync::atomic::AtomicU32,
 }
 
 /// A piece being downloaded
@@ -164,16 +168,13 @@ impl PendingPiece {
         Some(data)
     }
 
-    /// Get blocks that haven't been requested yet
     /// Whether the block starting at `offset` has been received
     pub fn has_block_at(&self, offset: u32) -> bool {
         let index = (offset / self.block_size) as usize;
-        self.blocks
-            .get(index)
-            .map(|b| b.is_some())
-            .unwrap_or(false)
+        self.blocks.get(index).map(|b| b.is_some()).unwrap_or(false)
     }
 
+    /// Get blocks that haven't been requested yet
     pub fn unrequested_blocks(&self) -> Vec<(u32, u32)> {
         let mut blocks = Vec::new();
         let num_blocks = self.blocks.len();
@@ -227,12 +228,52 @@ impl PieceManager {
             piece_availability: RwLock::new(vec![0; num_pieces]),
             wanted_pieces: RwLock::new(None),
             sequential_mode: RwLock::new(false),
+            stream_position: std::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 
     /// Enable or disable sequential download mode
     pub fn set_sequential(&self, sequential: bool) {
         *self.sequential_mode.write() = sequential;
+    }
+
+    /// Bytes readable as one contiguous run starting at byte `offset`: the
+    /// run extends to the end of the last consecutive verified piece.
+    pub fn contiguous_available_from(&self, offset: u64) -> u64 {
+        let piece_len = self.metainfo.info.piece_length;
+        let total = self.metainfo.info.total_size;
+        if offset >= total || piece_len == 0 {
+            return 0;
+        }
+        let have = self.have.read();
+        let first_piece = (offset / piece_len) as usize;
+        let mut end = offset;
+        for i in first_piece..self.num_pieces() {
+            if have.get(i).map(|b| *b).unwrap_or(false) {
+                end = ((i as u64 + 1) * piece_len).min(total);
+            } else {
+                break;
+            }
+        }
+        end.saturating_sub(offset)
+    }
+
+    /// Total torrent size in bytes.
+    pub fn total_size(&self) -> u64 {
+        self.metainfo.info.total_size
+    }
+
+    /// Nominal piece length in bytes.
+    pub fn nominal_piece_length(&self) -> u64 {
+        self.metainfo.info.piece_length
+    }
+
+    /// Set (or clear, with None) the streaming read position. Pieces at or
+    /// after this index are prioritized by `select_piece` so a streaming
+    /// reader is served before the rest of the torrent.
+    pub fn set_stream_position(&self, piece: Option<u32>) {
+        self.stream_position
+            .store(piece.unwrap_or(u32::MAX), Ordering::Relaxed);
     }
 
     /// Check if sequential mode is enabled
@@ -508,6 +549,21 @@ impl PieceManager {
 
         if candidates.is_empty() {
             return None;
+        }
+
+        // An active streaming reader overrides the normal strategy: serve
+        // pieces in order from the read position first, so playback is never
+        // starved; pieces before the read position come after, then by rarity.
+        let stream_pos = self.stream_position.load(Ordering::Relaxed);
+        if stream_pos != u32::MAX {
+            candidates.sort_by_key(|&(index, count)| {
+                if index >= stream_pos {
+                    (0u8, index, count)
+                } else {
+                    (1u8, 0, count)
+                }
+            });
+            return Some(candidates[0].0);
         }
 
         if sequential {
@@ -811,18 +867,24 @@ impl PieceManager {
     /// Returns number of valid pieces found
     pub async fn verify_existing(&self) -> Result<usize> {
         let mut valid_count = 0;
+        let mut verified_bytes = 0u64;
 
         for index in 0..self.num_pieces() {
-            if self.verify_piece_on_disk(index as u32).await? {
+            let valid = self.verify_piece_on_disk(index as u32).await?;
+            {
                 let mut have = self.have.write();
-                have.set(index, true);
+                // Also CLEAR the bit on failure: on a re-verify (repair
+                // flow), a piece that has become corrupt on disk must go
+                // back to "missing", not stay marked as held.
+                have.set(index, valid);
+            }
+            if valid {
                 valid_count += 1;
-
-                let piece_len = self.metainfo.piece_length(index).unwrap_or(0);
-                self.verified_bytes.fetch_add(piece_len, Ordering::Relaxed);
+                verified_bytes += self.metainfo.piece_length(index).unwrap_or(0);
             }
         }
 
+        self.verified_bytes.store(verified_bytes, Ordering::Relaxed);
         self.verified_count
             .store(valid_count as u64, Ordering::Relaxed);
 

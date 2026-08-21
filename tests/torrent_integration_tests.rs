@@ -1010,9 +1010,7 @@ async fn test_inbound_peer_downloads_from_seeder() {
 
 /// Read one length-prefixed wire message; returns (message id, full payload
 /// after the id byte). A keep-alive returns (None, empty).
-async fn read_wire_message(
-    sock: &mut tokio::net::TcpStream,
-) -> (Option<u8>, Vec<u8>) {
+async fn read_wire_message(sock: &mut tokio::net::TcpStream) -> (Option<u8>, Vec<u8>) {
     use tokio::io::AsyncReadExt;
 
     let mut len_buf = [0u8; 4];
@@ -1024,4 +1022,182 @@ async fn read_wire_message(
     let mut body = vec![0u8; len];
     sock.read_exact(&mut body).await.expect("read body");
     (Some(body[0]), body[1..].to_vec())
+}
+
+// =============================================================================
+// Streaming Reader Tests
+// =============================================================================
+
+/// Contiguous availability follows verified pieces, stopping at gaps.
+#[tokio::test]
+async fn test_contiguous_available_from() {
+    let piece_length = 16384;
+    let num_pieces = 4;
+    let (_torrent_data, metainfo, piece_data) =
+        build_test_torrent("contig-test", piece_length, num_pieces);
+
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join(&metainfo.info.name);
+    let mut content: Vec<u8> = piece_data.iter().flatten().copied().collect();
+    // Corrupt piece 2 so verification rejects it: pieces 0,1,3 verified.
+    content[2 * piece_length] ^= 0xFF;
+    tokio::fs::write(&file_path, &content).await.unwrap();
+
+    let pm = PieceManager::new(Arc::new(metainfo), temp_dir.path().to_path_buf());
+    let valid = pm.verify_existing().await.unwrap();
+    assert_eq!(valid, 3, "pieces 0, 1, 3 should verify");
+
+    let plen = piece_length as u64;
+    assert_eq!(pm.contiguous_available_from(0), 2 * plen);
+    assert_eq!(pm.contiguous_available_from(plen), plen);
+    assert_eq!(pm.contiguous_available_from(plen + 100), plen - 100);
+    assert_eq!(pm.contiguous_available_from(2 * plen), 0, "gap at piece 2");
+    assert_eq!(pm.contiguous_available_from(3 * plen), plen);
+    assert_eq!(pm.contiguous_available_from(4 * plen), 0, "past the end");
+}
+
+/// An active stream position overrides rarest-first so the reader's next
+/// pieces are fetched first.
+#[tokio::test]
+async fn test_stream_position_prioritizes_pieces() {
+    use bitvec::prelude::*;
+
+    let piece_length = 16384;
+    let num_pieces = 4;
+    let (_torrent_data, metainfo, _piece_data) =
+        build_test_torrent("stream-prio", piece_length, num_pieces);
+
+    let temp_dir = TempDir::new().unwrap();
+    let pm = PieceManager::new(Arc::new(metainfo), temp_dir.path().to_path_buf());
+
+    let peer_has: BitVec<u8, Msb0> = bitvec![u8, Msb0; 1; num_pieces];
+
+    // Without a stream position, ties break by index → piece 0.
+    assert_eq!(pm.select_piece(&peer_has), Some(0));
+
+    // With the reader at piece 2, pieces 2.. come first.
+    pm.set_stream_position(Some(2));
+    assert_eq!(pm.select_piece(&peer_has), Some(2));
+
+    // Clearing restores normal selection.
+    pm.set_stream_position(None);
+    assert_eq!(pm.select_piece(&peer_has), Some(0));
+}
+
+/// The engine-level reader streams a torrent's full content.
+#[tokio::test]
+async fn test_reader_streams_completed_torrent() {
+    use tokio::io::AsyncReadExt;
+
+    let piece_length = 16384;
+    let num_pieces = 3;
+    let (torrent_data, metainfo, piece_data) =
+        build_test_torrent("reader-torrent", piece_length, num_pieces);
+    let content: Vec<u8> = piece_data.iter().flatten().copied().collect();
+
+    let temp_dir = TempDir::new().unwrap();
+    // Pre-place the complete file so the torrent verifies as complete.
+    tokio::fs::write(temp_dir.path().join(&metainfo.info.name), &content)
+        .await
+        .unwrap();
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        enable_dht: false,
+        enable_pex: false,
+        enable_lpd: false,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config).await.unwrap();
+    let id = engine
+        .add_torrent(&torrent_data, DownloadOptions::default())
+        .await
+        .unwrap();
+
+    let mut reader = engine.open_reader(id, 0).expect("open reader");
+    let mut streamed = Vec::new();
+    tokio::time::timeout(Duration::from_secs(15), reader.read_to_end(&mut streamed))
+        .await
+        .expect("stream should not stall")
+        .expect("stream read should succeed");
+
+    assert_eq!(streamed, content, "streamed bytes should match the torrent");
+
+    // Offset reads work too.
+    let mut reader = engine
+        .open_reader(id, 20000)
+        .expect("open reader at offset");
+    let mut tail = Vec::new();
+    tokio::time::timeout(Duration::from_secs(15), reader.read_to_end(&mut tail))
+        .await
+        .expect("offset stream should not stall")
+        .expect("offset read should succeed");
+    assert_eq!(tail, &content[20000..]);
+
+    engine.shutdown().await.ok();
+}
+
+/// verify() re-hashes torrent pieces and reports corruption; the piece
+/// bitmap is rebuilt so the bad piece becomes wanted again.
+#[tokio::test]
+async fn test_verify_detects_corrupt_torrent_piece() {
+    let piece_length = 16384;
+    let num_pieces = 3;
+    let (torrent_data, metainfo, piece_data) =
+        build_test_torrent("verify-torrent", piece_length, num_pieces);
+    let content: Vec<u8> = piece_data.iter().flatten().copied().collect();
+
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join(&metainfo.info.name);
+    tokio::fs::write(&file_path, &content).await.unwrap();
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        enable_dht: false,
+        enable_pex: false,
+        enable_lpd: false,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config).await.unwrap();
+    let id = engine
+        .add_torrent(&torrent_data, DownloadOptions::default())
+        .await
+        .unwrap();
+
+    // Wait for the torrent to finish startup verification and settle into
+    // Seeding (verify() refuses while actively downloading).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = engine.status(id).map(|s| s.state);
+        if matches!(
+            state,
+            Some(gosh_dl::DownloadState::Seeding) | Some(gosh_dl::DownloadState::Completed)
+        ) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "torrent never reached Seeding, state: {state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let report = engine.verify(id).await.expect("verify should run");
+    assert!(
+        report.valid,
+        "intact torrent should verify: {}",
+        report.detail
+    );
+    assert_eq!(report.bad_pieces, 0);
+
+    // Corrupt the middle piece on disk.
+    let mut bad = tokio::fs::read(&file_path).await.unwrap();
+    bad[piece_length + 5] ^= 0xFF;
+    tokio::fs::write(&file_path, &bad).await.unwrap();
+
+    let report = engine.verify(id).await.expect("verify should run");
+    assert!(!report.valid, "corrupt piece must fail verification");
+    assert_eq!(report.bad_pieces, 1, "exactly one piece should be bad");
+
+    engine.shutdown().await.ok();
 }

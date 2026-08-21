@@ -29,6 +29,10 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | Concurrent download management | Priority queue (Critical/High/Normal/Low) |
 | Pause / resume / cancel | Full lifecycle control, per download or in batch (`pause_all` / `resume_all` / `cancel_all`) |
 | Rate limiting | Global + per-download byte-rate limits covering segmented HTTP, single-stream HTTP, torrent peers, and webseeds |
+| Streaming read API | `open_reader(id, offset)` yields an `AsyncRead` over an in-progress download; torrent piece selection follows the read head |
+| Mirror segment striping | Segments download from multiple mirrors in parallel, with per-URL health tracking and size cross-checks |
+| Verify / repair | `verify(id)` re-checks checksums (HTTP) or re-hashes pieces (torrent); `repair(id)` re-downloads what's bad |
+| Metalink (RFC 5854) | `add_metalink` expands `.meta4` documents into downloads with mirrors and checksums (feature `metalink`) |
 | Cross-restart resume validation | ETag/Last-Modified persisted and checked on resume; changed remote files restart from zero |
 | Event system | Broadcast channels for progress, state changes |
 | Global statistics | Active count, aggregate speeds |
@@ -63,7 +67,7 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | Endgame mode | — | Duplicate requests to multiple peers with cancels on receipt; toggle via `enable_endgame` |
 | File preallocation | — | `allocation_mode` config, applied before torrent verification |
 | HTTP resume | — | ETag/Last-Modified validation |
-| Mirror/failover | — | Automatic failover to alternate URLs |
+| Mirror/failover | — | Automatic failover to alternate URLs, plus per-segment mirror striping |
 | Bandwidth scheduling | — | Time-of-day rules with live runtime limit updates |
 | Recursive HTTP mirroring | — | Feature-gated via `recursive-http`; crawls HTML directory indexes with bounded-concurrency discovery and expands into ordinary HTTP downloads |
 | Private torrent handling | 27 | Disables DHT/PEX/LPD |

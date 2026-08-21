@@ -572,17 +572,17 @@ mod tests {
         // Head of the waiting queue, which we will remove.
         let id_head = DownloadId::new();
         let queue_clone = queue.clone();
-        let head_handle = tokio::spawn(async move {
-            queue_clone.acquire(id_head, DownloadPriority::High).await
-        });
+        let head_handle =
+            tokio::spawn(async move { queue_clone.acquire(id_head, DownloadPriority::High).await });
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         // Second waiter, behind the head.
         let id_second = DownloadId::new();
         let queue_clone = queue.clone();
-        let second_handle = tokio::spawn(async move {
-            queue_clone.acquire(id_second, DownloadPriority::Low).await
-        });
+        let second_handle =
+            tokio::spawn(
+                async move { queue_clone.acquire(id_second, DownloadPriority::Low).await },
+            );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert_eq!(queue.waiting_count(), 2);
 
@@ -591,11 +591,10 @@ mod tests {
         queue.remove(id_head);
         drop(permit);
 
-        let _second_permit =
-            tokio::time::timeout(std::time::Duration::from_secs(5), second_handle)
-                .await
-                .expect("second waiter never woke after head removal")
-                .expect("join error");
+        let _second_permit = tokio::time::timeout(std::time::Duration::from_secs(5), second_handle)
+            .await
+            .expect("second waiter never woke after head removal")
+            .expect("join error");
         assert_eq!(queue.active_count(), 1);
         assert_eq!(queue.waiting_count(), 0);
     }

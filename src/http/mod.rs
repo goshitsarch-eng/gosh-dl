@@ -799,6 +799,7 @@ impl HttpDownloader {
             saved_segments,
             None,
             None,
+            None,
             progress_callback,
             segmented_ref,
         )
@@ -825,6 +826,7 @@ impl HttpDownloader {
         saved_segments: Option<Vec<Segment>>,
         validators: Option<SharedValidators>,
         download_limiter: Option<Arc<crate::limiter::RateLimiter>>,
+        mirror_manager: Option<Arc<MirrorManager>>,
         progress_callback: F,
         segmented_ref: Option<Arc<RwLock<Option<Arc<SegmentedDownload>>>>>,
     ) -> Result<(PathBuf, Option<Arc<SegmentedDownload>>)>
@@ -919,6 +921,13 @@ impl HttpDownloader {
                 capabilities.etag,
                 capabilities.last_modified,
             );
+
+            // Stripe segments across mirrors when more than one URL exists.
+            if let Some(mirrors) = mirror_manager {
+                if mirrors.available_count() > 1 {
+                    download.set_mirror_manager(mirrors);
+                }
+            }
 
             // Restore or initialize segments. Saved segments are only valid
             // if the partial file still exists: restoring progress against a

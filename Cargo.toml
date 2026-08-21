@@ -29,6 +29,9 @@ urlencoding = "2"
 # HTTP client (optional — enabled by "http" feature)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli"], optional = true }
 
+# Metalink XML parsing (optional — enabled by "metalink" feature)
+quick-xml = { version = "0.39", optional = true }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -89,6 +92,7 @@ tracing-subscriber = "0.3"
 default = ["http", "torrent", "storage"]
 http = ["dep:reqwest"]
 recursive-http = ["http", "dep:scraper"]
+metalink = ["http", "dep:quick-xml"]
 torrent = [
     "dep:reqwest",
     "dep:serde_bencode", "dep:bitvec",

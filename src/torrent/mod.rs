@@ -1071,6 +1071,12 @@ impl TorrentDownloader {
         }
     }
 
+    /// The piece manager, once metadata is available (immediately for
+    /// .torrent downloads; after metadata fetch for magnets).
+    pub fn piece_manager_handle(&self) -> Option<Arc<PieceManager>> {
+        self.piece_manager.read().clone()
+    }
+
     /// Lifetime transfer totals (downloaded, uploaded) in bytes.
     pub fn transfer_totals(&self) -> (u64, u64) {
         (
@@ -1880,8 +1886,7 @@ impl TorrentDownloader {
                                 Some(Ok(block)) => {
                                     // Book the payload against the upload
                                     // budget before sending.
-                                    let limiters =
-                                        downloader.upload_limiters.read().clone();
+                                    let limiters = downloader.upload_limiters.read().clone();
                                     for limiter in limiters {
                                         limiter.acquire(block.len() as u64).await;
                                     }

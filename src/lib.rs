@@ -44,6 +44,8 @@ pub mod error;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod limiter;
+#[cfg(feature = "metalink")]
+pub mod metalink;
 pub(crate) mod priority_queue;
 pub mod protocol;
 pub(crate) mod scheduler;
@@ -54,7 +56,7 @@ pub(crate) mod types;
 
 // Re-exports for convenience
 pub use config::{AllocationMode, EngineConfig, HttpConfig, TorrentConfig};
-pub use engine::{BatchResult, DownloadEngine};
+pub use engine::{BatchResult, DownloadEngine, DownloadReader, VerifyReport};
 pub use error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result, StorageErrorKind};
 pub use protocol::{ProtocolError, ProtocolResult};
 pub use types::{
@@ -68,6 +70,10 @@ pub use types::{
     RecursiveEntry, RecursiveJob, RecursiveJobEvent, RecursiveJobProgress, RecursiveJobState,
     RecursiveJobStatus, RecursiveManifest, RecursiveOptions, TrackedRecursiveJob,
 };
+
+// Metalink exports
+#[cfg(feature = "metalink")]
+pub use metalink::{parse_metalink, MetalinkFile};
 
 // Storage exports
 #[cfg(feature = "storage")]

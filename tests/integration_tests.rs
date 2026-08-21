@@ -4031,3 +4031,293 @@ async fn test_global_download_limit_throttles() {
 
     engine.shutdown().await.ok();
 }
+
+/// The streaming reader yields HTTP bytes while the download is still in
+/// flight, and ends exactly at the full content.
+#[tokio::test]
+async fn test_http_streaming_reader_mid_download() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let content: Vec<u8> = (0..256 * 1024).map(|i| (i % 249) as u8).collect();
+
+    // Hand-rolled HTTP server that trickles the body in 16 KiB chunks with
+    // delays, so the download is genuinely in progress while we read.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = content.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let body = served.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let Ok(n) = sock.read(&mut buf).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if sock.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                if request.starts_with("HEAD") {
+                    return;
+                }
+                for chunk in body.chunks(16 * 1024) {
+                    if sock.write_all(chunk).await.is_err() {
+                        return;
+                    }
+                    let _ = sock.flush().await;
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                }
+            });
+        }
+    });
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        min_segment_size: 1024 * 1024, // force single-connection
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+
+    let url = format!("http://{}/stream.bin", addr);
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let mut reader = engine.open_reader(id, 0).expect("open reader");
+    let mut streamed = Vec::new();
+    let mut first_bytes_at = None;
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(20), reader.read(&mut buf))
+            .await
+            .expect("stream should not stall")
+            .expect("stream read should succeed");
+        if n == 0 {
+            break;
+        }
+        if first_bytes_at.is_none() {
+            first_bytes_at = Some(start.elapsed());
+        }
+        streamed.extend_from_slice(&buf[..n]);
+    }
+
+    assert_eq!(streamed, content, "streamed bytes must match the source");
+    // 16 chunks × 60ms ≈ 1s of trickle: the first bytes must arrive well
+    // before the download can have finished.
+    let first = first_bytes_at.expect("should have streamed something");
+    assert!(
+        first < Duration::from_millis(700),
+        "first streamed bytes arrived only after {first:?} — reader not streaming mid-download"
+    );
+
+    server.abort();
+    engine.shutdown().await.ok();
+}
+
+/// Segmented downloads stripe across mirrors: with two URLs serving the same
+/// content, both servers receive range requests and the result is intact.
+#[tokio::test]
+async fn test_segments_stripe_across_mirrors() {
+    use wiremock::Respond;
+
+    struct RangeResponder(Vec<u8>);
+    impl Respond for RangeResponder {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let range = request
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|r| r.strip_prefix("bytes="))
+                .and_then(|r| {
+                    let (start, end) = r.split_once('-')?;
+                    let start: usize = start.parse().ok()?;
+                    let end: usize = end.parse().ok().unwrap_or(self.0.len() - 1);
+                    Some((start, end.min(self.0.len() - 1)))
+                });
+            match range {
+                Some((start, end)) => ResponseTemplate::new(206)
+                    .insert_header(
+                        "Content-Range",
+                        format!("bytes {}-{}/{}", start, end, self.0.len()),
+                    )
+                    .insert_header("Accept-Ranges", "bytes")
+                    .set_body_bytes(self.0[start..=end].to_vec()),
+                None => ResponseTemplate::new(200)
+                    .insert_header("Accept-Ranges", "bytes")
+                    .set_body_bytes(self.0.clone()),
+            }
+        }
+    }
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let content: Vec<u8> = (0..256 * 1024).map(|i| (i % 239) as u8).collect();
+
+    let primary = MockServer::start().await;
+    let mirror = MockServer::start().await;
+    for server in [&primary, &mirror] {
+        Mock::given(method("HEAD"))
+            .and(path("/striped.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", content.len().to_string())
+                    .insert_header("Accept-Ranges", "bytes"),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/striped.bin"))
+            .respond_with(RangeResponder(content.clone()))
+            .mount(server)
+            .await;
+    }
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        max_connections_per_download: 4,
+        min_segment_size: 32 * 1024,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/striped.bin", primary.uri());
+    let options = DownloadOptions {
+        mirrors: vec![format!("{}/striped.bin", mirror.uri())],
+        ..Default::default()
+    };
+    let id = engine
+        .add_http(&url, options)
+        .await
+        .expect("Failed to add download");
+
+    let completed = wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Completed { id: eid } if *eid == id),
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(completed.is_some(), "Striped download should complete");
+
+    let downloaded = tokio::fs::read(temp_dir.path().join("striped.bin"))
+        .await
+        .expect("Failed to read downloaded file");
+    assert_eq!(downloaded, content, "striped download must be byte-perfect");
+
+    // Both servers must have served ranged GETs — that's the striping.
+    for (name, server) in [("primary", &primary), ("mirror", &mirror)] {
+        let ranged_gets = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "GET" && r.headers.contains_key("range"))
+            .count();
+        assert!(
+            ranged_gets > 0,
+            "{name} server received no ranged GETs — segments were not striped"
+        );
+    }
+
+    engine.shutdown().await.ok();
+}
+
+/// verify() detects a corrupted completed download; repair() re-downloads it.
+#[tokio::test]
+async fn test_verify_and_repair_http() {
+    use sha2::Digest;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let content: Vec<u8> = (0..32 * 1024).map(|i| (i % 245) as u8).collect();
+    let sha256 = hex::encode(sha2::Sha256::digest(&content));
+
+    Mock::given(method("GET"))
+        .and(path("/verify.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path("/verify.bin"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", content.len().to_string()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let engine = create_test_engine(&temp_dir).await;
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/verify.bin", mock_server.uri());
+    let options = DownloadOptions {
+        checksum: Some(gosh_dl::http::ExpectedChecksum {
+            algorithm: gosh_dl::http::ChecksumAlgorithm::Sha256,
+            value: sha256,
+        }),
+        ..Default::default()
+    };
+    let id = engine.add_http(&url, options).await.expect("add");
+    wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Completed { id: eid } if *eid == id),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("should complete");
+
+    // Pristine file verifies.
+    let report = engine.verify(id).await.expect("verify should run");
+    assert!(
+        report.valid,
+        "fresh download should verify: {}",
+        report.detail
+    );
+
+    // Corrupt the file on disk.
+    let file_path = temp_dir.path().join("verify.bin");
+    let mut bad = tokio::fs::read(&file_path).await.unwrap();
+    bad[1000] ^= 0xFF;
+    tokio::fs::write(&file_path, &bad).await.unwrap();
+
+    let report = engine.verify(id).await.expect("verify should run");
+    assert!(!report.valid, "corrupted file must fail verification");
+
+    // Repair restarts the download; wait for it to complete again.
+    let report = engine.repair(id).await.expect("repair should run");
+    assert!(
+        !report.valid,
+        "repair returns the failing pre-repair report"
+    );
+    wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Completed { id: eid } if *eid == id),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("repair should re-download to completion");
+
+    let repaired = tokio::fs::read(&file_path).await.unwrap();
+    assert_eq!(repaired, content, "repaired file must match the source");
+    let report = engine.verify(id).await.expect("verify should run");
+    assert!(report.valid, "repaired file should verify");
+
+    engine.shutdown().await.ok();
+}
