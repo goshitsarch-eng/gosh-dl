@@ -522,10 +522,56 @@ async fn receive_crypto_response(
     mut decrypt_cipher: Rc4Cipher,
     _config: &MseConfig,
 ) -> Result<(u32, Rc4Cipher)> {
-    // Read enough to find VC and crypto_select
-    // Format: encrypted(VC (8) + crypto_select (4) + len(PadD) (2) + PadD)
-    let mut buf = [0u8; 14]; // VC + crypto_select + len(PadD)
+    // Format on the wire: PadB (0..=512 plaintext bytes, sent by mainstream
+    // clients) followed by encrypted(VC (8) + crypto_select (4) + len(PadD)
+    // (2) + PadD). The responder's RC4 keystream starts at VC, so the
+    // encrypted VC is a fixed 8-byte pattern we can scan for to skip PadB.
+    const MAX_PADB: usize = 512;
+    let expected_vc = {
+        let mut probe = decrypt_cipher.clone();
+        let mut vc = VC;
+        probe.process(&mut vc);
+        vc
+    };
 
+    // Scan byte-by-byte (bounded, once per connection) so no bytes beyond
+    // the VC marker are consumed from the stream.
+    let mut window: Vec<u8> = Vec::with_capacity(expected_vc.len());
+    let mut skipped = 0usize;
+    loop {
+        if window.len() == expected_vc.len() && window == expected_vc {
+            break;
+        }
+        if skipped > MAX_PADB {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::PeerProtocol,
+                "Invalid VC in response (not found within PadB window)",
+            ));
+        }
+        let mut byte = [0u8; 1];
+        timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut byte))
+            .await
+            .map_err(|_| {
+                EngineError::network(NetworkErrorKind::Timeout, "Timeout reading response")
+            })?
+            .map_err(|e| {
+                EngineError::network(
+                    NetworkErrorKind::ConnectionReset,
+                    format!("Failed to read response: {}", e),
+                )
+            })?;
+        if window.len() == expected_vc.len() {
+            window.remove(0);
+            skipped += 1;
+        }
+        window.push(byte[0]);
+    }
+
+    // Advance our cipher past the VC bytes we just matched.
+    decrypt_cipher.process(&mut window);
+
+    // Read and decrypt crypto_select (4) + len(PadD) (2)
+    let mut buf = [0u8; 6];
     timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut buf))
         .await
         .map_err(|_| EngineError::network(NetworkErrorKind::Timeout, "Timeout reading response"))?
@@ -535,23 +581,13 @@ async fn receive_crypto_response(
                 format!("Failed to read response: {}", e),
             )
         })?;
-
-    // Decrypt
     decrypt_cipher.process(&mut buf);
 
-    // Verify VC
-    if buf[..8] != VC {
-        return Err(EngineError::protocol(
-            ProtocolErrorKind::PeerProtocol,
-            "Invalid VC in response",
-        ));
-    }
-
     // Parse crypto_select
-    let crypto_select = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let crypto_select = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
 
     // Parse PadD length
-    let padd_len = u16::from_be_bytes([buf[12], buf[13]]) as usize;
+    let padd_len = u16::from_be_bytes([buf[4], buf[5]]) as usize;
 
     // Read and discard PadD
     if padd_len > 0 {
@@ -658,12 +694,7 @@ pub async fn connect_with_mse(
 ) -> Result<PeerStream> {
     match config.policy {
         EncryptionPolicy::Disabled => Ok(PeerStream::Plain(stream)),
-        EncryptionPolicy::Allowed => {
-            // TODO: Attempt MSE handshake and fall back to plaintext on failure,
-            // rather than always using plaintext. For now, just use plaintext.
-            Ok(PeerStream::Plain(stream))
-        }
-        EncryptionPolicy::Preferred | EncryptionPolicy::Required => {
+        EncryptionPolicy::Allowed | EncryptionPolicy::Preferred | EncryptionPolicy::Required => {
             match mse_handshake_outgoing(stream, info_hash, config).await {
                 MseHandshakeResult::Encrypted(enc) => Ok(PeerStream::Encrypted(enc)),
                 MseHandshakeResult::Plaintext(stream, _) => {
@@ -677,13 +708,9 @@ pub async fn connect_with_mse(
                     }
                 }
                 MseHandshakeResult::Failed(e) => {
-                    if config.policy == EncryptionPolicy::Required {
-                        Err(e)
-                    } else {
-                        // TODO: Reconnect without encryption instead of failing.
-                        // For now, just fail -- caller can retry with plaintext.
-                        Err(e)
-                    }
+                    // Non-Required policies fall back to a fresh plaintext
+                    // connection one level up (PeerConnection::connect).
+                    Err(e)
                 }
             }
         }
@@ -902,5 +929,85 @@ mod tests {
         enc_b.process(&mut encrypted);
         dec_a.process(&mut encrypted);
         assert_eq!(&encrypted[..], msg_b_to_a);
+    }
+
+    /// Full outgoing handshake against a mock responder that sends PadB —
+    /// the random plaintext padding mainstream clients put between Yb and
+    /// the encrypted response, which the initiator previously choked on
+    /// with "Invalid VC".
+    #[tokio::test]
+    async fn test_outgoing_handshake_with_padb() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let info_hash: Sha1Hash = [0x42u8; 20];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let responder = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+
+            // Read Ya (initiator configured with zero padding below)
+            let mut ya = [0u8; 96];
+            sock.read_exact(&mut ya).await.unwrap();
+
+            let keypair = DhKeyPair::generate();
+            let shared = keypair.compute_shared_secret(&ya);
+
+            // Send Yb followed by PadB (137 arbitrary plaintext bytes)
+            sock.write_all(keypair.public_bytes()).await.unwrap();
+            let padb = vec![0x5Au8; 137];
+            sock.write_all(&padb).await.unwrap();
+
+            // Read req1/skey hashes and the initiator's encrypted request
+            let mut hashes = [0u8; 40];
+            sock.read_exact(&mut hashes).await.unwrap();
+            let (mut enc_b, mut dec_a) = derive_rc4_keys(&shared, &info_hash, false);
+            let mut head = [0u8; 14]; // VC + crypto_provide + len(PadC)
+            sock.read_exact(&mut head).await.unwrap();
+            dec_a.process(&mut head);
+            assert_eq!(&head[..8], &VC, "responder saw bad VC from initiator");
+            let padc_len = u16::from_be_bytes([head[12], head[13]]) as usize;
+            let mut padc = vec![0u8; padc_len];
+            sock.read_exact(&mut padc).await.unwrap();
+            dec_a.process(&mut padc);
+            let mut ia_len = [0u8; 2];
+            sock.read_exact(&mut ia_len).await.unwrap();
+            dec_a.process(&mut ia_len);
+
+            // Reply: ENCRYPTED(VC + crypto_select(RC4) + len(PadD) + PadD)
+            let mut reply = Vec::new();
+            reply.extend_from_slice(&VC);
+            reply.extend_from_slice(&CRYPTO_RC4.to_be_bytes());
+            let padd = [0x77u8; 21];
+            reply.extend_from_slice(&(padd.len() as u16).to_be_bytes());
+            reply.extend_from_slice(&padd);
+            enc_b.process(&mut reply);
+            sock.write_all(&reply).await.unwrap();
+
+            // Send one encrypted payload so the test proves stream sync
+            let mut payload = b"ping".to_vec();
+            enc_b.process(&mut payload);
+            sock.write_all(&payload).await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = MseConfig {
+            policy: EncryptionPolicy::Required,
+            allow_rc4: true,
+            allow_plaintext: false,
+            min_padding: 0,
+            max_padding: 0,
+        };
+        let result = mse_handshake_outgoing(stream, info_hash, &config).await;
+        let MseHandshakeResult::Encrypted(mut enc_stream) = result else {
+            panic!("handshake did not produce an encrypted stream");
+        };
+
+        let mut buf = [0u8; 4];
+        enc_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping", "encrypted stream out of sync after PadB");
+
+        responder.await.unwrap();
     }
 }

@@ -20,7 +20,7 @@ pub(crate) mod segment;
 pub use checksum::{compute_checksum, verify_checksum, ChecksumAlgorithm, ExpectedChecksum};
 pub use connection::{ConnectionPool, RetryPolicy, SpeedCalculator};
 pub use mirror::MirrorManager;
-pub use resume::{check_resume, ResumeInfo};
+pub use resume::{check_resume, ResumeInfo, ResumeValidators};
 pub use segment::{calculate_segment_count, probe_server, SegmentedDownload, ServerCapabilities};
 
 use crate::config::EngineConfig;
@@ -40,6 +40,12 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const ACCEPT_ENCODING_IDENTITY: &str = "identity";
+
+/// Shared cell for resume validators: the caller seeds it with the validators
+/// saved from a previous session, and the download path replaces them with the
+/// server's current values once probed, so they can be persisted for the next
+/// session.
+pub(crate) type SharedValidators = Arc<RwLock<ResumeValidators>>;
 
 fn log_progress_invariant(context: &str, progress: &DownloadProgress) {
     if let Some(total_size) = progress.total_size {
@@ -61,13 +67,43 @@ fn log_progress_invariant(context: &str, progress: &DownloadProgress) {
     }
 }
 
-fn partial_path_for(save_path: &Path) -> PathBuf {
+pub(crate) fn partial_path_for(save_path: &Path) -> PathBuf {
     save_path.with_extension(
         save_path
             .extension()
             .map(|e| format!("{}.part", e.to_string_lossy()))
             .unwrap_or_else(|| "part".to_string()),
     )
+}
+
+/// Reject filenames that would escape the save directory.
+///
+/// Filenames can come from untrusted sources (Content-Disposition headers,
+/// percent-decoded URL segments), so every download path must run this before
+/// joining the name onto `save_dir`. Relative subpaths (`sub/file.bin`) are
+/// allowed; `..`, absolute paths, and Windows prefixes are not.
+pub(crate) fn validate_filename_components(final_filename: &str) -> Result<()> {
+    use std::path::Component;
+    for component in Path::new(final_filename).components() {
+        match component {
+            Component::ParentDir => {
+                return Err(EngineError::storage(
+                    StorageErrorKind::PathTraversal,
+                    Path::new(final_filename),
+                    "Invalid filename: contains parent directory reference (..)",
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(EngineError::storage(
+                    StorageErrorKind::PathTraversal,
+                    Path::new(final_filename),
+                    "Invalid filename: contains absolute path",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// HTTP Downloader
@@ -131,6 +167,17 @@ impl HttpDownloader {
         self.pool.set_upload_limit(upload_limit);
     }
 
+    /// The shared global (download, upload) limiters. The engine hands these
+    /// to the torrent paths so a single global limit covers all traffic.
+    pub fn limiters(
+        &self,
+    ) -> (
+        Arc<crate::limiter::RateLimiter>,
+        Arc<crate::limiter::RateLimiter>,
+    ) {
+        self.pool.limiters()
+    }
+
     /// Download a file from a URL
     ///
     /// Returns the final path of the downloaded file
@@ -162,6 +209,8 @@ impl HttpDownloader {
             checksum,
             #[cfg(feature = "recursive-http")]
             None,
+            None,
+            None,
             cancel_token,
             progress_callback,
         )
@@ -182,6 +231,8 @@ impl HttpDownloader {
         #[cfg(feature = "recursive-http")] redirect_scope: Option<
             crate::http::crawl::RedirectScope,
         >,
+        validators: Option<SharedValidators>,
+        download_limiter: Option<Arc<crate::limiter::RateLimiter>>,
         cancel_token: CancellationToken,
         progress_callback: F,
     ) -> Result<PathBuf>
@@ -189,6 +240,9 @@ impl HttpDownloader {
         F: Fn(DownloadProgress) + Send + Sync + 'static,
     {
         let progress_callback = Arc::new(progress_callback);
+        // Validators saved from a previous session, for cross-restart resume
+        // validation against the server's current ones.
+        let saved_validators = validators.as_ref().map(|cell| cell.read().clone());
         // Build the request
         let mut request = self.client().get(url);
 
@@ -272,6 +326,17 @@ impl HttpDownloader {
                 }
             };
 
+        // Publish the server's current validators so the caller can persist
+        // them for the next session. (On HEAD failure both stay None; the
+        // saved copy taken above is what we validate against.)
+        let current_validators = ResumeValidators {
+            etag: etag.clone(),
+            last_modified: last_modified.clone(),
+        };
+        if let Some(cell) = validators.as_ref() {
+            *cell.write() = current_validators.clone();
+        }
+
         // Check for cancellation
         if cancel_token.is_cancelled() {
             return Err(EngineError::Shutdown);
@@ -296,27 +361,7 @@ impl HttpDownloader {
         }
 
         // Validate filename for path traversal attacks (security)
-        // Check each path component to prevent directory traversal
-        use std::path::Component;
-        for component in Path::new(&final_filename).components() {
-            match component {
-                Component::ParentDir => {
-                    return Err(EngineError::storage(
-                        StorageErrorKind::PathTraversal,
-                        Path::new(&final_filename),
-                        "Invalid filename: contains parent directory reference (..)",
-                    ));
-                }
-                Component::RootDir | Component::Prefix(_) => {
-                    return Err(EngineError::storage(
-                        StorageErrorKind::PathTraversal,
-                        Path::new(&final_filename),
-                        "Invalid filename: contains absolute path",
-                    ));
-                }
-                _ => {}
-            }
-        }
+        validate_filename_components(&final_filename)?;
 
         let save_path = save_dir.join(&final_filename);
 
@@ -334,10 +379,42 @@ impl HttpDownloader {
         };
 
         let mut allow_resume = existing_size > 0;
+
+        // Cross-restart validation: a partial file left by a previous session
+        // must not be resumed if the remote file changed in the meantime —
+        // If-Range against a *fresh* probe can't catch that, because the fresh
+        // validator always matches the current remote file.
+        if allow_resume {
+            if let Some(saved) = saved_validators.as_ref() {
+                if !resume::validators_match(saved, &current_validators) {
+                    tracing::warn!(
+                        "Remote file {} changed since the partial file was written \
+                         (saved validators {:?}, current {:?}); restarting from byte 0",
+                        url,
+                        saved,
+                        current_validators
+                    );
+                    allow_resume = false;
+                }
+            }
+        }
+
         let mut stream_attempt = 0u32;
 
         loop {
-            let resume_from = if allow_resume { existing_size } else { 0 };
+            // Re-measure the partial file on every attempt: a mid-stream
+            // failure leaves more bytes on disk than the pre-loop measurement
+            // saw, and requesting a Range from a stale offset while appending
+            // would silently corrupt the file.
+            let on_disk_size = if supports_range && part_path.exists() {
+                tokio::fs::metadata(&part_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let resume_from = if allow_resume { on_disk_size } else { 0 };
             let if_range = if resume_from > 0 {
                 etag.as_deref().or(last_modified.as_deref())
             } else {
@@ -467,6 +544,7 @@ impl HttpDownloader {
                     file,
                     downloaded.clone(),
                     total_size,
+                    download_limiter.clone(),
                     cancel_token.clone(),
                     {
                         let progress_callback = Arc::clone(&progress_callback);
@@ -558,12 +636,14 @@ impl HttpDownloader {
     }
 
     /// Stream response body to file with progress tracking
+    #[allow(clippy::too_many_arguments)]
     async fn stream_to_file<F>(
         &self,
         response: Response,
         mut file: File,
         downloaded: Arc<AtomicU64>,
         total_size: Option<u64>,
+        extra_limiter: Option<Arc<crate::limiter::RateLimiter>>,
         cancel_token: CancellationToken,
         progress_callback: F,
     ) -> Result<()>
@@ -586,8 +666,11 @@ impl HttpDownloader {
 
             let chunk_len = chunk.len() as u64;
 
-            // Apply rate limiting if configured
+            // Apply rate limiting if configured (global, then per-download)
             self.pool.acquire_download(chunk_len).await;
+            if let Some(limiter) = extra_limiter.as_ref() {
+                limiter.acquire(chunk_len).await;
+            }
 
             // Write chunk to file
             file.write_all(&chunk).await.map_err(|e| {
@@ -714,6 +797,8 @@ impl HttpDownloader {
             min_segment_size,
             cancel_token,
             saved_segments,
+            None,
+            None,
             progress_callback,
             segmented_ref,
         )
@@ -738,6 +823,8 @@ impl HttpDownloader {
         min_segment_size: u64,
         cancel_token: CancellationToken,
         saved_segments: Option<Vec<Segment>>,
+        validators: Option<SharedValidators>,
+        download_limiter: Option<Arc<crate::limiter::RateLimiter>>,
         progress_callback: F,
         segmented_ref: Option<Arc<RwLock<Option<Arc<SegmentedDownload>>>>>,
     ) -> Result<(PathBuf, Option<Arc<SegmentedDownload>>)>
@@ -746,9 +833,42 @@ impl HttpDownloader {
     {
         let progress_callback = Arc::new(progress_callback);
         let ua = user_agent.unwrap_or(&self.config.default_user_agent);
+        let mut saved_segments = saved_segments;
+
+        // Validators saved from a previous session, for cross-restart resume
+        // validation against the server's current ones.
+        let saved_validators = validators.as_ref().map(|cell| cell.read().clone());
 
         // Probe server capabilities
         let capabilities = probe_server(self.client(), url, ua).await?;
+
+        // NOTE: the shared cell must keep the *saved* validators until the
+        // segmented-vs-single decision below — the single-connection fallback
+        // re-reads the cell as its saved values, and publishing the fresh
+        // probe here would make its comparison vacuously succeed.
+        let current_validators = ResumeValidators {
+            etag: capabilities.etag.clone(),
+            last_modified: capabilities.last_modified.clone(),
+        };
+
+        // Cross-restart validation: saved segments describe bytes written by a
+        // previous session; if the remote file changed since then, resuming
+        // them would merge two versions of the file. If-Range with a freshly
+        // probed validator cannot detect this.
+        if saved_segments.is_some() {
+            if let Some(saved) = saved_validators.as_ref() {
+                if !resume::validators_match(saved, &current_validators) {
+                    tracing::warn!(
+                        "Remote file {} changed since segments were saved \
+                         (saved validators {:?}, current {:?}); discarding saved segments",
+                        url,
+                        saved,
+                        current_validators
+                    );
+                    saved_segments = None;
+                }
+            }
+        }
 
         // Determine filename
         let final_filename = filename
@@ -756,6 +876,9 @@ impl HttpDownloader {
             .or(capabilities.suggested_filename.clone())
             .or_else(|| extract_filename_from_url(url))
             .unwrap_or_else(|| "download".to_string());
+
+        // Validate filename for path traversal attacks (security)
+        validate_filename_components(&final_filename)?;
 
         // Ensure save directory exists
         if !save_dir.exists() {
@@ -778,6 +901,13 @@ impl HttpDownloader {
                 .unwrap_or(false);
 
         if use_segmented {
+            // Publish the server's current validators so the caller can
+            // persist them for the next session. (The single-connection
+            // fallback below publishes its own from its own HEAD probe.)
+            if let Some(cell) = validators.as_ref() {
+                *cell.write() = current_validators.clone();
+            }
+
             let total_size = capabilities.content_length.unwrap();
 
             // Create segmented download
@@ -790,12 +920,28 @@ impl HttpDownloader {
                 capabilities.last_modified,
             );
 
-            // Restore or initialize segments
-            if let Some(segments) = saved_segments {
-                tracing::debug!("Restoring {} saved segments", segments.len());
-                download.restore_segments(segments);
-            } else {
-                download.init_segments(max_connections, min_segment_size);
+            // Restore or initialize segments. Saved segments are only valid
+            // if the partial file still exists: restoring progress against a
+            // fresh preallocated file would leave zero-filled holes for every
+            // range the segments claim to have downloaded.
+            let part_exists = tokio::fs::try_exists(partial_path_for(&save_path))
+                .await
+                .unwrap_or(false);
+            match saved_segments {
+                Some(segments) if part_exists => {
+                    tracing::debug!("Restoring {} saved segments", segments.len());
+                    download.restore_segments(segments);
+                }
+                Some(_) => {
+                    tracing::warn!(
+                        "Partial file for {} is missing; discarding saved segments and restarting",
+                        url
+                    );
+                    download.init_segments(max_connections, min_segment_size);
+                }
+                None => {
+                    download.init_segments(max_connections, min_segment_size);
+                }
             }
 
             // Wrap in Arc for sharing
@@ -819,7 +965,12 @@ impl HttpDownloader {
                 }
             }
 
-            // Start download
+            // Start download. Segment tasks draw from the global limiter and
+            // (if configured) the per-download one.
+            let mut limiters = vec![self.pool.limiters().0];
+            if let Some(l) = download_limiter.clone() {
+                limiters.push(l);
+            }
             let segmented_result = download
                 .start_with_scope(
                     self.client(),
@@ -829,6 +980,7 @@ impl HttpDownloader {
                     &self.retry_policy,
                     #[cfg(feature = "recursive-http")]
                     redirect_scope.clone(),
+                    limiters,
                     cancel_token.clone(),
                     {
                         let progress_callback = Arc::clone(&progress_callback);
@@ -860,6 +1012,8 @@ impl HttpDownloader {
                             checksum,
                             #[cfg(feature = "recursive-http")]
                             redirect_scope,
+                            validators,
+                            download_limiter.clone(),
                             cancel_token,
                             {
                                 let progress_callback = Arc::clone(&progress_callback);
@@ -897,6 +1051,8 @@ impl HttpDownloader {
                     checksum,
                     #[cfg(feature = "recursive-http")]
                     redirect_scope,
+                    validators,
+                    download_limiter,
                     cancel_token,
                     {
                         let progress_callback = Arc::clone(&progress_callback);
@@ -959,6 +1115,23 @@ fn extract_filename_from_url(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_filename_components() {
+        assert!(validate_filename_components("file.zip").is_ok());
+        assert!(validate_filename_components("sub/dir/file.zip").is_ok());
+        assert!(validate_filename_components("./file.zip").is_ok());
+
+        // Traversal and absolute paths must be rejected — these arrive from
+        // Content-Disposition headers and percent-decoded URL segments.
+        assert!(validate_filename_components("../evil").is_err());
+        assert!(validate_filename_components("a/../../evil").is_err());
+        assert!(validate_filename_components("/etc/passwd").is_err());
+
+        // Percent-decoded traversal from a URL segment (`..%2F..%2Fevil`).
+        let decoded = urlencoding::decode("..%2F..%2Fevil").unwrap();
+        assert!(validate_filename_components(&decoded).is_err());
+    }
 
     #[test]
     fn test_parse_content_disposition() {

@@ -42,7 +42,10 @@ impl PartialOrd for QueueEntry {
 /// A permit that allows a download to proceed
 /// When dropped, releases the slot back to the queue
 pub struct PriorityPermit {
-    _permit: OwnedSemaphorePermit,
+    // Option so Drop can release the semaphore permit *before* notifying:
+    // fields drop after the Drop body, and a waiter woken before the permit
+    // returns would fail try_acquire and sleep with no further notification.
+    permit: Option<OwnedSemaphorePermit>,
     id: DownloadId,
     queue: Arc<PriorityQueue>,
 }
@@ -51,6 +54,8 @@ impl Drop for PriorityPermit {
     fn drop(&mut self) {
         // Remove from active set
         self.queue.inner.lock().active.remove(&self.id);
+        // Return the slot to the semaphore before waking waiters
+        drop(self.permit.take());
         // Notify all waiting downloads so the highest priority can acquire
         self.queue.notify.notify_waiters();
     }
@@ -133,26 +138,31 @@ impl PriorityQueue {
         }
 
         loop {
+            // Register for notifications BEFORE checking the condition:
+            // `notify_waiters` only wakes futures that are already enabled, so a
+            // permit released between the check and the await would otherwise be
+            // lost and this task could hang forever.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             // Check if we're next in line
             {
-                let inner = self.inner.lock();
+                let mut inner = self.inner.lock();
                 if let Some(next) = inner.waiting.peek() {
                     if next.id == id
                         && inner.active.len() < self.max_concurrent.load(Ordering::Relaxed)
                     {
-                        // We're next, try to acquire semaphore
-                        drop(inner); // Release lock before async operation
-
-                        // Try to acquire permit
+                        // `try_acquire_owned` is synchronous, so we hold the lock
+                        // across it: peek and pop stay atomic, and a concurrent
+                        // higher-priority push can't make us pop the wrong entry.
                         if let Ok(permit) = self.semaphore.clone().try_acquire_owned() {
-                            // Got permit, remove from waiting and add to active
-                            let mut inner = self.inner.lock();
                             inner.waiting.pop();
                             inner.waiting_priorities.remove(&id);
                             inner.active.insert(id, priority);
 
                             return PriorityPermit {
-                                _permit: permit,
+                                permit: Some(permit),
                                 id,
                                 queue: Arc::clone(self),
                             };
@@ -162,7 +172,7 @@ impl PriorityQueue {
             }
 
             // Wait for notification (either slot freed or priority changed)
-            self.notify.notified().await;
+            notified.await;
         }
     }
 
@@ -209,7 +219,7 @@ impl PriorityQueue {
             Ok(permit) => {
                 inner.active.insert(id, priority);
                 Some(PriorityPermit {
-                    _permit: permit,
+                    permit: Some(permit),
                     id,
                     queue: Arc::clone(self),
                 })
@@ -268,6 +278,10 @@ impl PriorityQueue {
         for entry in entries {
             inner.waiting.push(entry);
         }
+        drop(inner);
+        // The removed entry may have been at the head of the queue; wake the
+        // remaining waiters so the new head can re-check its position.
+        self.notify.notify_waiters();
     }
 
     /// Get the priority of a download (waiting or active)
@@ -516,6 +530,74 @@ mod tests {
 
         assert_eq!(queue.waiting_count(), 0);
         assert_eq!(queue.get_priority(id), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_acquire_release_stress_no_lost_wakeup() {
+        // Many tasks contending for one slot: a lost wakeup or a wrong-entry
+        // pop wedges the queue and this test times out.
+        let queue = PriorityQueue::new(1);
+        let mut handles = Vec::new();
+        for i in 0..50 {
+            let queue = queue.clone();
+            let priority = match i % 3 {
+                0 => DownloadPriority::Low,
+                1 => DownloadPriority::Normal,
+                _ => DownloadPriority::High,
+            };
+            handles.push(tokio::spawn(async move {
+                let permit = queue.acquire(DownloadId::new(), priority).await;
+                tokio::task::yield_now().await;
+                drop(permit);
+            }));
+        }
+        for handle in handles {
+            tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+                .await
+                .expect("queue wedged: waiter never acquired")
+                .expect("join error");
+        }
+        assert_eq!(queue.active_count(), 0);
+        assert_eq!(queue.waiting_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_remove_head_wakes_waiters() {
+        let queue = PriorityQueue::new(1);
+        let permit = queue
+            .clone()
+            .acquire(DownloadId::new(), DownloadPriority::Normal)
+            .await;
+
+        // Head of the waiting queue, which we will remove.
+        let id_head = DownloadId::new();
+        let queue_clone = queue.clone();
+        let head_handle = tokio::spawn(async move {
+            queue_clone.acquire(id_head, DownloadPriority::High).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Second waiter, behind the head.
+        let id_second = DownloadId::new();
+        let queue_clone = queue.clone();
+        let second_handle = tokio::spawn(async move {
+            queue_clone.acquire(id_second, DownloadPriority::Low).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(queue.waiting_count(), 2);
+
+        // Cancel the head; free the slot; the second waiter must proceed.
+        head_handle.abort();
+        queue.remove(id_head);
+        drop(permit);
+
+        let _second_permit =
+            tokio::time::timeout(std::time::Duration::from_secs(5), second_handle)
+                .await
+                .expect("second waiter never woke after head removal")
+                .expect("join error");
+        assert_eq!(queue.active_count(), 1);
+        assert_eq!(queue.waiting_count(), 0);
     }
 
     #[test]

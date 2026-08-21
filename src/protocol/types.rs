@@ -184,7 +184,9 @@ mod hex {
     }
 
     pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
-        if s.len() % 2 != 0 {
+        // Reject non-ASCII up front: byte-indexed slicing below panics on
+        // multi-byte UTF-8, and GIDs arrive from untrusted callers.
+        if s.len() % 2 != 0 || !s.is_ascii() {
             return Err(());
         }
         (0..s.len())

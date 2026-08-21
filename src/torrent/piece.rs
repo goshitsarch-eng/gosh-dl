@@ -165,6 +165,15 @@ impl PendingPiece {
     }
 
     /// Get blocks that haven't been requested yet
+    /// Whether the block starting at `offset` has been received
+    pub fn has_block_at(&self, offset: u32) -> bool {
+        let index = (offset / self.block_size) as usize;
+        self.blocks
+            .get(index)
+            .map(|b| b.is_some())
+            .unwrap_or(false)
+    }
+
     pub fn unrequested_blocks(&self) -> Vec<(u32, u32)> {
         let mut blocks = Vec::new();
         let num_blocks = self.blocks.len();
@@ -413,6 +422,38 @@ impl PieceManager {
     /// Get set of piece indices currently being downloaded
     pub fn pending_pieces(&self) -> HashSet<u32> {
         self.pending.read().keys().copied().collect()
+    }
+
+    /// Update availability for a single piece (from a Have message)
+    pub fn update_piece_availability(&self, index: u32, add: bool) {
+        let mut availability = self.piece_availability.write();
+        if let Some(slot) = availability.get_mut(index as usize) {
+            *slot = if add {
+                slot.saturating_add(1)
+            } else {
+                slot.saturating_sub(1)
+            };
+        }
+    }
+
+    /// Whether a block has already been received (its piece is complete, or
+    /// the block is present in the pending piece). Used to cancel duplicate
+    /// in-flight requests in endgame mode.
+    pub fn is_block_received(&self, piece: u32, offset: u32) -> bool {
+        if self
+            .have
+            .read()
+            .get(piece as usize)
+            .map(|b| *b)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.pending
+            .read()
+            .get(&piece)
+            .map(|p| p.has_block_at(offset))
+            .unwrap_or(false)
     }
 
     /// Update piece availability from a peer's bitfield

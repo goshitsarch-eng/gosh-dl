@@ -19,6 +19,11 @@ use crate::torrent::metainfo::{Metainfo, Sha1Hash};
 /// Size of metadata pieces (16KB).
 pub const METADATA_PIECE_SIZE: usize = 16 * 1024;
 
+/// Upper bound on peer-claimed metadata size. Info dicts for even enormous
+/// multi-file torrents are a few MB; an unbounded claim lets one malicious
+/// Data message drive allocations of billions of piece indices.
+pub const MAX_METADATA_SIZE: usize = 16 * 1024 * 1024;
+
 /// Extension name for ut_metadata in BEP 10 handshake.
 pub const METADATA_EXTENSION_NAME: &str = "ut_metadata";
 
@@ -269,6 +274,28 @@ impl MetadataFetcher {
                     ));
                 };
 
+                if total_size == 0 || total_size > MAX_METADATA_SIZE {
+                    return Err(EngineError::protocol(
+                        ProtocolErrorKind::MetadataError,
+                        format!(
+                            "Peer-claimed metadata size {} outside allowed range 1..={}",
+                            total_size, MAX_METADATA_SIZE
+                        ),
+                    ));
+                }
+
+                // Reject out-of-range piece indices: junk indices would count
+                // toward the completion check and wedge metadata assembly.
+                if msg.piece >= total_size.div_ceil(METADATA_PIECE_SIZE) {
+                    return Err(EngineError::protocol(
+                        ProtocolErrorKind::MetadataError,
+                        format!(
+                            "Metadata piece index {} out of range for size {}",
+                            msg.piece, total_size
+                        ),
+                    ));
+                }
+
                 // Validate piece size
                 let expected_size = if msg.piece < (total_size / METADATA_PIECE_SIZE) {
                     METADATA_PIECE_SIZE
@@ -486,6 +513,27 @@ mod tests {
 
         assert_eq!(parsed.msg_type, MetadataMessageType::Reject);
         assert_eq!(parsed.piece, 3);
+    }
+
+    #[tokio::test]
+    async fn test_metadata_rejects_huge_claimed_size() {
+        let fetcher = MetadataFetcher::new([0u8; 20]);
+        let msg = MetadataMessage::data(0, MAX_METADATA_SIZE + 1, vec![0u8; METADATA_PIECE_SIZE]);
+        assert!(fetcher.process_message(msg).await.is_err());
+        // A rejected size must not poison the fetcher's known size
+        assert!(fetcher.num_pieces().await.is_none());
+
+        let msg = MetadataMessage::data(0, 0, Vec::new());
+        assert!(fetcher.process_message(msg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_metadata_rejects_out_of_range_piece_index() {
+        let fetcher = MetadataFetcher::new([0u8; 20]);
+        // total_size 5 => exactly 1 piece; index 7 is junk that previously
+        // counted toward the completion check.
+        let msg = MetadataMessage::data(7, 5, vec![0u8; 5]);
+        assert!(fetcher.process_message(msg).await.is_err());
     }
 
     #[tokio::test]

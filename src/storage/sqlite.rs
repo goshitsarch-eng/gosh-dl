@@ -156,6 +156,23 @@ CREATE INDEX IF NOT EXISTS idx_segments_download ON segments(download_id);
 /// The function is idempotent — calling it on an already-current database is a
 /// no-op.
 fn migrate(conn: &Connection) -> std::result::Result<(), rusqlite::Error> {
+    // Run every step inside one transaction: a crash between an ALTER TABLE
+    // and its user_version bump would otherwise make all future migrations
+    // fail with "duplicate column name" — permanently.
+    let tx = conn.unchecked_transaction()?;
+    migrate_steps(&tx)?;
+    tx.commit()?;
+
+    debug_assert_eq!(
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        CURRENT_SCHEMA_VERSION
+    );
+
+    Ok(())
+}
+
+fn migrate_steps(conn: &Connection) -> std::result::Result<(), rusqlite::Error> {
     let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
     if version < 1 {
@@ -203,12 +220,6 @@ fn migrate(conn: &Connection) -> std::result::Result<(), rusqlite::Error> {
         )?;
         conn.pragma_update(None, "user_version", 4)?;
     }
-
-    debug_assert_eq!(
-        conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-            .unwrap(),
-        CURRENT_SCHEMA_VERSION
-    );
 
     Ok(())
 }
@@ -296,7 +307,15 @@ impl Storage for SqliteStorage {
                     seeders = excluded.seeders,
                     peers = excluded.peers,
                     priority = excluded.priority,
+                    name = excluded.name,
+                    url = excluded.url,
+                    magnet_uri = excluded.magnet_uri,
+                    info_hash = excluded.info_hash,
+                    save_dir = excluded.save_dir,
                     filename = excluded.filename,
+                    user_agent = excluded.user_agent,
+                    referer = excluded.referer,
+                    headers_json = excluded.headers_json,
                     cookies_json = excluded.cookies_json,
                     checksum_json = excluded.checksum_json,
                     mirrors_json = excluded.mirrors_json,

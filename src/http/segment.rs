@@ -226,6 +226,7 @@ impl SegmentedDownload {
             retry_policy,
             #[cfg(feature = "recursive-http")]
             None,
+            Vec::new(),
             cancel_token,
             progress_callback,
         )
@@ -241,12 +242,14 @@ impl SegmentedDownload {
         max_connections: usize,
         retry_policy: &RetryPolicy,
         #[cfg(feature = "recursive-http")] redirect_scope: Option<super::crawl::RedirectScope>,
+        limiters: Vec<Arc<crate::limiter::RateLimiter>>,
         cancel_token: CancellationToken,
         progress_callback: F,
     ) -> Result<()>
     where
         F: Fn(DownloadProgress) + Send + Sync + 'static,
     {
+        let limiters: Arc<[Arc<crate::limiter::RateLimiter>]> = limiters.into();
         // Create/open the file and pre-allocate space
         let file = self.prepare_file().await?;
         let file = Arc::new(tokio::sync::Mutex::new(file));
@@ -291,6 +294,7 @@ impl SegmentedDownload {
             let bytes_since_progress = Arc::clone(&bytes_since_progress);
             let total_size = self.total_size;
             let retry_policy = retry_policy.clone();
+            let limiters = Arc::clone(&limiters);
             #[cfg(feature = "recursive-http")]
             let redirect_scope = redirect_scope.clone();
 
@@ -316,8 +320,6 @@ impl SegmentedDownload {
                 // Persistent state across retries
                 let mut segment_bytes: u64 = already_downloaded;
                 let expected_segment_size = end - start + 1;
-                let mut last_speed_update = Instant::now();
-                let mut bytes_for_speed: u64 = 0;
                 let mut attempt = 0u32;
 
                 // Check if already complete before entering retry loop
@@ -540,25 +542,27 @@ impl SegmentedDownload {
                             ));
                         }
                         bytes_since_progress.fetch_add(chunk_len, Ordering::Relaxed);
-                        bytes_for_speed += chunk_len;
 
-                        // Update speed calculation
-                        let now = Instant::now();
-                        let speed_elapsed = now.duration_since(last_speed_update);
-                        if speed_elapsed >= Duration::from_millis(500) {
-                            let current_speed =
-                                (bytes_for_speed as f64 / speed_elapsed.as_secs_f64()) as u64;
-                            state.speed.store(current_speed, Ordering::Relaxed);
-                            bytes_for_speed = 0;
-                            last_speed_update = now;
+                        // Rate limiting: draw this chunk from every configured
+                        // budget (global engine limit, then per-download).
+                        for limiter in limiters.iter() {
+                            limiter.acquire(chunk_len).await;
                         }
 
-                        // Emit progress at intervals
+                        // Emit progress at intervals. Speed is computed here
+                        // from the shared byte counter so it reflects ALL
+                        // segments; a per-task rate would report ~1/N of the
+                        // real throughput (whichever task stored last).
+                        let now = Instant::now();
                         let should_emit = {
                             let mut last = last_progress.write();
-                            if now.duration_since(*last) >= PROGRESS_INTERVAL {
+                            let elapsed = now.duration_since(*last);
+                            if elapsed >= PROGRESS_INTERVAL {
                                 *last = now;
-                                bytes_since_progress.store(0, Ordering::Relaxed);
+                                let bytes = bytes_since_progress.swap(0, Ordering::Relaxed);
+                                let aggregate =
+                                    (bytes as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
+                                state.speed.store(aggregate, Ordering::Relaxed);
                                 true
                             } else {
                                 false
@@ -685,6 +689,13 @@ impl SegmentedDownload {
         // Final progress update
         let total_downloaded = self.state.downloaded.load(Ordering::Relaxed);
         if total_downloaded != self.total_size {
+            // A pause or cancel makes segment tasks return early with Ok, so
+            // an incomplete total here is the *expected* outcome of those —
+            // report it as Shutdown, not as a scary protocol error that the
+            // engine would feed into mirror failover.
+            if cancel_token.is_cancelled() || self.state.paused.load(Ordering::Relaxed) {
+                return Err(EngineError::Shutdown);
+            }
             return Err(EngineError::protocol(
                 ProtocolErrorKind::InvalidResponse,
                 format!(
@@ -753,7 +764,7 @@ impl SegmentedDownload {
 
         // Check if file exists (for resume)
         let file = if part_path.exists() {
-            OpenOptions::new()
+            let file = OpenOptions::new()
                 .write(true)
                 .read(true)
                 .open(&part_path)
@@ -764,7 +775,20 @@ impl SegmentedDownload {
                         &part_path,
                         format!("Open failed: {}", e),
                     )
-                })?
+                })?;
+
+            // Force the reopened partial to exactly total_size: stale bytes
+            // past the end (e.g. from a previous, larger version of the file)
+            // would otherwise survive into the renamed final file.
+            file.set_len(self.total_size).await.map_err(|e| {
+                EngineError::storage(
+                    StorageErrorKind::Io,
+                    &part_path,
+                    format!("Truncate failed: {}", e),
+                )
+            })?;
+
+            file
         } else {
             // Create new file and pre-allocate
             let file = File::create(&part_path).await.map_err(|e| {

@@ -887,3 +887,141 @@ async fn test_resume_partial_download() {
     let expected: Vec<u8> = piece_data.into_iter().flatten().collect();
     assert_eq!(content, expected, "Final content should match");
 }
+
+// =============================================================================
+// Inbound Seeding Tests
+// =============================================================================
+
+/// A raw inbound leecher can connect to the seeder's listener, handshake,
+/// get unchoked, and download a block — end-to-end proof that the advertised
+/// port actually accepts and serves peers.
+#[tokio::test]
+async fn test_inbound_peer_downloads_from_seeder() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let piece_length = 16384;
+    let (_torrent_data, mut metainfo, piece_data) =
+        build_test_torrent("inbound-seed", piece_length, 1);
+    let info_hash = metainfo.info_hash;
+    metainfo.announce = None;
+    metainfo.announce_list = vec![];
+
+    // Pre-place the complete file so the downloader starts as a seeder
+    let temp_dir = TempDir::new().unwrap();
+    tokio::fs::write(temp_dir.path().join("inbound-seed"), &piece_data[0])
+        .await
+        .unwrap();
+
+    let config = TorrentConfig {
+        // Port 0: let the OS pick a free port
+        listen_port_range: (0, 0),
+        seed_ratio: None,
+        choking_interval_secs: 2,
+        ..test_torrent_config()
+    };
+    let (event_tx, _event_rx) = broadcast::channel(64);
+    let downloader = Arc::new(
+        TorrentDownloader::from_torrent(
+            DownloadId::new(),
+            metainfo,
+            temp_dir.path().to_path_buf(),
+            config,
+            event_tx,
+        )
+        .unwrap(),
+    );
+    Arc::clone(&downloader).start().await.unwrap();
+    let port = downloader
+        .bound_listen_port()
+        .expect("inbound listener should be bound");
+
+    // The peer loop computes choking decisions
+    let loop_handle = tokio::spawn(Arc::clone(&downloader).run_peer_loop());
+
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to seeder listener");
+
+        // BitTorrent handshake
+        let mut hs = Vec::with_capacity(68);
+        hs.push(19u8);
+        hs.extend_from_slice(b"BitTorrent protocol");
+        hs.extend_from_slice(&[0u8; 8]);
+        hs.extend_from_slice(&info_hash);
+        hs.extend_from_slice(b"-TEST01-121212121212");
+        sock.write_all(&hs).await.unwrap();
+
+        let mut resp = [0u8; 68];
+        sock.read_exact(&mut resp).await.unwrap();
+        assert_eq!(&resp[28..48], &info_hash, "handshake info_hash mismatch");
+
+        // Tell the seeder we're interested
+        sock.write_all(&[0, 0, 0, 1, 2]).await.unwrap();
+
+        // Read messages until Unchoke (id 1), sending keep-alives to drive
+        // the seeder's per-peer loop.
+        let mut unchoked = false;
+        while !unchoked {
+            let msg =
+                tokio::time::timeout(Duration::from_secs(3), read_wire_message(&mut sock)).await;
+            match msg {
+                Ok((id, _payload)) => {
+                    if id == Some(1) {
+                        unchoked = true;
+                    }
+                }
+                Err(_) => {
+                    // Idle: nudge the seeder's loop with a keep-alive
+                    sock.write_all(&[0, 0, 0, 0]).await.unwrap();
+                }
+            }
+        }
+
+        // Request piece 0, offset 0, full block
+        let mut req = Vec::with_capacity(17);
+        req.extend_from_slice(&13u32.to_be_bytes());
+        req.push(6);
+        req.extend_from_slice(&0u32.to_be_bytes());
+        req.extend_from_slice(&0u32.to_be_bytes());
+        req.extend_from_slice(&(piece_length as u32).to_be_bytes());
+        sock.write_all(&req).await.unwrap();
+
+        // Read until the Piece message (id 7) arrives
+        loop {
+            let (id, payload) = read_wire_message(&mut sock).await;
+            if id == Some(7) {
+                assert_eq!(payload.len(), 8 + piece_length, "piece payload size");
+                assert_eq!(
+                    &payload[8..],
+                    &piece_data[0][..],
+                    "served block should match the seeded content"
+                );
+                break;
+            }
+        }
+    })
+    .await;
+
+    loop_handle.abort();
+    downloader.stop().await.ok();
+    result.expect("inbound download should complete within the timeout");
+}
+
+/// Read one length-prefixed wire message; returns (message id, full payload
+/// after the id byte). A keep-alive returns (None, empty).
+async fn read_wire_message(
+    sock: &mut tokio::net::TcpStream,
+) -> (Option<u8>, Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+
+    let mut len_buf = [0u8; 4];
+    sock.read_exact(&mut len_buf).await.expect("read length");
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 {
+        return (None, Vec::new());
+    }
+    let mut body = vec![0u8; len];
+    sock.read_exact(&mut body).await.expect("read body");
+    (Some(body[0]), body[1..].to_vec())
+}

@@ -68,7 +68,7 @@ use crate::config::{
     EncryptionConfig as EngineEncryptionConfig, EncryptionPolicy as EngineEncryptionPolicy,
     TransportPolicy, WebSeedConfig as EngineWebSeedConfig,
 };
-use crate::error::Result;
+use crate::error::{EngineError, NetworkErrorKind, Result};
 use crate::types::{DownloadEvent, DownloadId, DownloadProgress};
 use pex::parse_extension_handshake;
 
@@ -133,6 +133,10 @@ pub struct TorrentConfig {
     /// Enable uTP (Micro Transport Protocol) transport for peer connections.
     /// When enabled, peers are tried via uTP first, falling back to TCP.
     pub enable_utp: bool,
+    /// Enable endgame mode (request remaining blocks from several peers)
+    pub enable_endgame: bool,
+    /// File preallocation strategy applied before the download starts
+    pub allocation_mode: crate::config::AllocationMode,
 }
 
 impl Default for TorrentConfig {
@@ -160,6 +164,8 @@ impl Default for TorrentConfig {
             connect_interval_secs: 5,
             choking_interval_secs: 10,
             enable_utp: false,
+            enable_endgame: true,
+            allocation_mode: crate::config::AllocationMode::None,
         }
     }
 }
@@ -247,6 +253,20 @@ pub struct TorrentDownloader {
     /// uTP multiplexer for UDP-based peer connections (BEP 29).
     /// Initialized in `start()` when `config.enable_utp` is true.
     utp_mux: RwLock<Option<Arc<UtpMux>>>,
+    /// Rate limiters drawn from for received piece payloads (global engine
+    /// limiter plus optional per-download limiter)
+    download_limiters: RwLock<Vec<Arc<crate::limiter::RateLimiter>>>,
+    /// Rate limiters drawn from for sent piece payloads
+    upload_limiters: RwLock<Vec<Arc<crate::limiter::RateLimiter>>>,
+    /// Failed-peer backoff: consecutive failures and last attempt time.
+    /// Without it the same dead candidates are re-dialed every connect tick,
+    /// starving untried peers.
+    peer_backoff: RwLock<HashMap<SocketAddr, (u32, Instant)>>,
+    /// The TCP port we actually listen on for inbound peers (0 = not bound).
+    /// This — not the configured range start — is what gets advertised.
+    listen_port: std::sync::atomic::AtomicU16,
+    /// Tasks driving inbound peer connections, aborted on stop().
+    inbound_tasks: RwLock<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// Information about a connected peer
@@ -332,7 +352,10 @@ impl TorrentDownloader {
             peer_semaphore: Semaphore::new(config.max_peers),
             metadata_fetcher: None, // Not needed for .torrent files
             discovery_tasks: RwLock::new(Vec::new()),
-            choking_manager: RwLock::new(ChokingManager::new(ChokingConfig::default())),
+            choking_manager: RwLock::new(ChokingManager::new(ChokingConfig {
+                recalculate_interval: Duration::from_secs(config.choking_interval_secs.max(1)),
+                ..ChokingConfig::default()
+            })),
             shared_peer_stats: Arc::new(RwLock::new(HashMap::new())),
             choking_decisions: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "http")]
@@ -350,6 +373,11 @@ impl TorrentDownloader {
             transport_policy: RwLock::new(TransportPolicy::PreferTcp),
             tcp_fallback: AtomicBool::new(true),
             utp_mux: RwLock::new(None),
+            download_limiters: RwLock::new(Vec::new()),
+            upload_limiters: RwLock::new(Vec::new()),
+            peer_backoff: RwLock::new(HashMap::new()),
+            listen_port: std::sync::atomic::AtomicU16::new(0),
+            inbound_tasks: RwLock::new(Vec::new()),
         })
     }
 
@@ -381,7 +409,10 @@ impl TorrentDownloader {
             peer_semaphore: Semaphore::new(config.max_peers),
             metadata_fetcher: Some(Arc::new(MetadataFetcher::new(info_hash))),
             discovery_tasks: RwLock::new(Vec::new()),
-            choking_manager: RwLock::new(ChokingManager::new(ChokingConfig::default())),
+            choking_manager: RwLock::new(ChokingManager::new(ChokingConfig {
+                recalculate_interval: Duration::from_secs(config.choking_interval_secs.max(1)),
+                ..ChokingConfig::default()
+            })),
             shared_peer_stats: Arc::new(RwLock::new(HashMap::new())),
             choking_decisions: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "http")]
@@ -399,6 +430,11 @@ impl TorrentDownloader {
             transport_policy: RwLock::new(TransportPolicy::PreferTcp),
             tcp_fallback: AtomicBool::new(true),
             utp_mux: RwLock::new(None),
+            download_limiters: RwLock::new(Vec::new()),
+            upload_limiters: RwLock::new(Vec::new()),
+            peer_backoff: RwLock::new(HashMap::new()),
+            listen_port: std::sync::atomic::AtomicU16::new(0),
+            inbound_tasks: RwLock::new(Vec::new()),
         })
     }
 
@@ -593,6 +629,15 @@ impl TorrentDownloader {
         if let Some(pm) = pm_clone {
             *self.state.write() = TorrentState::Checking;
 
+            // Preallocate output files per the configured strategy
+            if let Err(e) = pm.preallocate_files(self.config.allocation_mode).await {
+                tracing::warn!(
+                    "File preallocation failed for {}: {}",
+                    self.info_hash_hex(),
+                    e
+                );
+            }
+
             let valid = pm.verify_existing().await?;
             tracing::info!(
                 "Verified {} existing pieces for torrent {}",
@@ -623,8 +668,61 @@ impl TorrentDownloader {
             }
         }
 
+        // Bind the inbound peer listener on the configured port range,
+        // walking the range if ports are taken. Without a listener the
+        // advertised port accepts nothing and this client can only reach
+        // peers it dialed itself. Bound BEFORE the first announce so the
+        // advertised port is the real one.
+        {
+            let (start_port, end_port) = self.config.listen_port_range;
+            let mut bound = None;
+            for port in start_port..=end_port {
+                match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+                    Ok(listener) => {
+                        // Use the OS-reported port: with port 0 the kernel
+                        // picks one, and that's what must be advertised.
+                        let actual = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+                        bound = Some((listener, actual));
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Port {} unavailable for inbound peers: {}", port, e);
+                    }
+                }
+            }
+            match bound {
+                Some((listener, port)) => {
+                    self.listen_port.store(port, Ordering::Relaxed);
+                    tracing::info!("Listening for inbound peers on TCP port {}", port);
+                    let dl = Arc::clone(&self);
+                    let handle = tokio::spawn(async move {
+                        dl.run_inbound_listener(listener).await;
+                    });
+                    self.discovery_tasks.write().push(handle);
+                }
+                None => {
+                    tracing::warn!(
+                        "No free port in {:?} for inbound peers; running outbound-only",
+                        self.config.listen_port_range
+                    );
+                }
+            }
+        }
+
         // Announce to trackers
         self.announce_to_trackers(AnnounceEvent::Started).await?;
+
+        // Spawn periodic tracker re-announce: without it the tracker drops
+        // this client from the swarm after one interval.
+        {
+            let dl = Arc::clone(&self);
+            let handle = tokio::spawn(async move {
+                if let Err(e) = dl.run_tracker_reannounce().await {
+                    tracing::debug!("Tracker re-announce loop ended with error: {}", e);
+                }
+            });
+            self.discovery_tasks.write().push(handle);
+        }
 
         // Spawn DHT discovery loop
         if self.dht_enabled() {
@@ -721,6 +819,7 @@ impl TorrentDownloader {
         let piece_manager_clone = piece_manager.clone();
         let _event_tx = self.event_tx.clone(); // For future progress events
         let _info_hash_hex = self.info_hash_hex();
+        let download_limiters = self.download_limiters.read().clone();
         let event_handle = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 match event {
@@ -729,6 +828,11 @@ impl TorrentDownloader {
                         data,
                         source_url,
                     } => {
+                        // Webseed traffic draws from the same download budget
+                        // as peer traffic.
+                        for limiter in download_limiters.iter() {
+                            limiter.acquire(data.len() as u64).await;
+                        }
                         // Write piece to disk (already verified in webseed manager)
                         match piece_manager_clone
                             .write_piece_from_webseed(piece_index, &data)
@@ -800,7 +904,7 @@ impl TorrentDownloader {
         let request = AnnounceRequest {
             info_hash: self.info_hash,
             peer_id: *self.tracker_client.peer_id(),
-            port: self.config.listen_port_range.0,
+            port: self.advertised_port(),
             uploaded: self.stats.uploaded.load(Ordering::Relaxed),
             downloaded,
             left,
@@ -865,6 +969,138 @@ impl TorrentDownloader {
         // Disconnect all peers and stop requesting
     }
 
+    /// Accept inbound peer connections and drive each through the same
+    /// connection loop as outbound peers.
+    async fn run_inbound_listener(self: Arc<Self>, listener: tokio::net::TcpListener) {
+        let max_pending = self.config.max_pending_requests;
+        loop {
+            let (stream, addr) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    if self.shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tracing::debug!("Inbound accept error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+
+            if self.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            let state = *self.state.read();
+            if state == TorrentState::Paused || state == TorrentState::Stopped {
+                continue;
+            }
+            // No MSE responder role yet: with encryption required we must not
+            // accept a plaintext inbound connection.
+            if self.mse_config.read().policy == EncryptionPolicy::Required {
+                tracing::debug!(
+                    "Rejecting inbound peer {} (encryption required, no MSE responder yet)",
+                    addr
+                );
+                continue;
+            }
+            if self.stats.peers_connected.load(Ordering::Relaxed) as usize >= self.config.max_peers
+            {
+                tracing::debug!("Rejecting inbound peer {} (at max_peers)", addr);
+                continue;
+            }
+            // The handshake needs the piece count; without metadata (fresh
+            // magnet) we can't serve inbound peers yet.
+            let num_pieces = match self.metainfo.read().as_ref() {
+                Some(metainfo) => metainfo.info.pieces.len(),
+                None => {
+                    tracing::debug!("Rejecting inbound peer {} (no metadata yet)", addr);
+                    continue;
+                }
+            };
+
+            let downloader = Arc::clone(&self);
+            let shared_stats = Arc::clone(&self.shared_peer_stats);
+            let choking_decisions = Arc::clone(&self.choking_decisions);
+            let peer_id = *self.tracker_client.peer_id();
+            let info_hash = self.info_hash;
+            let handle = tokio::spawn(async move {
+                match PeerConnection::accept(stream, addr, info_hash, peer_id, num_pieces).await {
+                    Ok(conn) => {
+                        tracing::info!("Accepted inbound peer {}", addr);
+                        if let Err(e) = Self::run_connection_loop(
+                            downloader,
+                            conn,
+                            addr,
+                            max_pending,
+                            shared_stats,
+                            choking_decisions,
+                            false,
+                        )
+                        .await
+                        {
+                            tracing::debug!("Inbound peer {} ended with error: {}", addr, e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Inbound handshake with {} failed: {}", addr, e);
+                    }
+                }
+            });
+
+            let mut tasks = self.inbound_tasks.write();
+            tasks.retain(|h| !h.is_finished());
+            tasks.push(handle);
+        }
+    }
+
+    /// The TCP port actually bound for inbound peer connections, if any.
+    pub fn bound_listen_port(&self) -> Option<u16> {
+        match self.listen_port.load(Ordering::Relaxed) {
+            0 => None,
+            port => Some(port),
+        }
+    }
+
+    /// The port to advertise to trackers/DHT/LPD: the actually-bound inbound
+    /// listener port when available, else the configured range start.
+    fn advertised_port(&self) -> u16 {
+        let bound = self.listen_port.load(Ordering::Relaxed);
+        if bound != 0 {
+            bound
+        } else {
+            self.config.listen_port_range.0
+        }
+    }
+
+    /// Lifetime transfer totals (downloaded, uploaded) in bytes.
+    pub fn transfer_totals(&self) -> (u64, u64) {
+        (
+            self.stats.downloaded.load(Ordering::Relaxed),
+            self.stats.uploaded.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Seed the transfer counters from persisted lifetime totals, so
+    /// seed-ratio decisions survive restarts instead of restarting from a
+    /// zero denominator.
+    pub fn set_transfer_totals(&self, downloaded: u64, uploaded: u64) {
+        self.stats.downloaded.store(downloaded, Ordering::Relaxed);
+        self.stats.uploaded.store(uploaded, Ordering::Relaxed);
+    }
+
+    /// Install the rate limiters this torrent's transfers draw from.
+    ///
+    /// `download` / `upload` each usually contain the engine's global limiter
+    /// plus an optional per-download one; every received or sent piece
+    /// payload is booked against every limiter in the list.
+    pub fn set_rate_limiters(
+        &self,
+        download: Vec<Arc<crate::limiter::RateLimiter>>,
+        upload: Vec<Arc<crate::limiter::RateLimiter>>,
+    ) {
+        *self.download_limiters.write() = download;
+        *self.upload_limiters.write() = upload;
+    }
+
     /// Resume the download
     pub fn resume(&self) {
         let current = *self.state.read();
@@ -892,6 +1128,22 @@ impl TorrentDownloader {
             for handle in tasks.drain(..) {
                 handle.abort();
             }
+        }
+
+        // Shut down webseed downloads
+        #[cfg(feature = "http")]
+        {
+            if let Some(ref ws) = *self.webseed_manager.read() {
+                ws.shutdown();
+            }
+            if let Some(handle) = self.webseed_task.write().take() {
+                handle.abort();
+            }
+        }
+
+        // Abort inbound peer connection tasks
+        for handle in self.inbound_tasks.write().drain(..) {
+            handle.abort();
         }
 
         // Announce stopped
@@ -1020,6 +1272,14 @@ impl TorrentDownloader {
                 }
 
                 _ = connect_interval.tick() => {
+                    // Don't dial new peers while paused or stopped — a paused
+                    // torrent churning through handshakes wastes everyone's
+                    // sockets.
+                    let state = *self.state.read();
+                    if state == TorrentState::Paused || state == TorrentState::Stopped {
+                        continue;
+                    }
+
                     // Try to connect to more peers if below max
                     let current_count = active_connections.read().len();
                     if current_count < self.config.max_peers {
@@ -1060,9 +1320,23 @@ impl TorrentDownloader {
                         let uploaded = self.stats.uploaded.load(Ordering::Relaxed);
                         let downloaded = self.stats.downloaded.load(Ordering::Relaxed);
 
+                        // A resumed already-complete torrent has no session
+                        // downloads; use the torrent size as the denominator
+                        // so the ratio doesn't jump to infinity after the
+                        // first uploaded block and kill seeding instantly.
+                        let denominator = if downloaded > 0 {
+                            downloaded
+                        } else {
+                            self.metainfo
+                                .read()
+                                .as_ref()
+                                .map(|m| m.info.total_size)
+                                .unwrap_or(0)
+                        };
+
                         // Calculate current ratio (avoid division by zero)
-                        let current_ratio = if downloaded > 0 {
-                            uploaded as f64 / downloaded as f64
+                        let current_ratio = if denominator > 0 {
+                            uploaded as f64 / denominator as f64
                         } else if uploaded > 0 {
                             f64::INFINITY
                         } else {
@@ -1136,13 +1410,26 @@ impl TorrentDownloader {
     ) {
         const MAX_CONNECT_PER_ROUND: usize = 5;
 
-        // Get peers we're not connected to
+        // Get peers we're not connected to, skipping ones in failure backoff
+        let now = Instant::now();
         let candidates: Vec<SocketAddr> = {
             let known = self.known_peers.read();
             let active = active_connections.read();
+            let backoff = self.peer_backoff.read();
             known
                 .iter()
                 .filter(|addr| !active.contains_key(*addr))
+                .filter(|addr| match backoff.get(*addr) {
+                    Some((failures, last_attempt)) => {
+                        // 60s doubling per consecutive failure, capped at 15min
+                        let delay = Duration::from_secs(
+                            60u64.saturating_mul(1 << (*failures).min(4).saturating_sub(1)),
+                        )
+                        .min(Duration::from_secs(900));
+                        now.duration_since(*last_attempt) >= delay
+                    }
+                    None => true,
+                })
                 .take(MAX_CONNECT_PER_ROUND)
                 .cloned()
                 .collect()
@@ -1175,7 +1462,7 @@ impl TorrentDownloader {
 
             let task = tokio::spawn(async move {
                 match Self::run_single_peer_connection(
-                    downloader,
+                    Arc::clone(&downloader),
                     addr,
                     info_hash,
                     peer_id,
@@ -1188,9 +1475,14 @@ impl TorrentDownloader {
                 {
                     Ok(()) => {
                         tracing::debug!("Peer connection {} ended normally", addr);
+                        downloader.peer_backoff.write().remove(&addr);
                     }
                     Err(e) => {
                         tracing::debug!("Peer connection {} failed: {}", addr, e);
+                        let mut backoff = downloader.peer_backoff.write();
+                        let entry = backoff.entry(addr).or_insert((0, Instant::now()));
+                        entry.0 = entry.0.saturating_add(1);
+                        entry.1 = Instant::now();
                     }
                 }
 
@@ -1220,7 +1512,7 @@ impl TorrentDownloader {
         let transport_policy = *downloader.transport_policy.read();
         let tcp_fallback = downloader.tcp_fallback.load(Ordering::Relaxed);
         let mse_config = downloader.mse_config.read().clone();
-        let mut conn = match transport_policy {
+        let conn = match transport_policy {
             TransportPolicy::TcpOnly => {
                 PeerConnection::connect_with_encryption(
                     addr,
@@ -1342,6 +1634,31 @@ impl TorrentDownloader {
         };
         tracing::info!("Connected to peer {}", addr);
 
+        Self::run_connection_loop(
+            downloader,
+            conn,
+            addr,
+            max_pending,
+            shared_stats,
+            choking_decisions,
+            metadata_only,
+        )
+        .await
+    }
+
+    /// Drive an established peer connection (outbound or inbound): extension
+    /// handshake, bitfield exchange, and the message loop, until shutdown,
+    /// pause/stop, or a connection error.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_connection_loop(
+        downloader: Arc<Self>,
+        mut conn: PeerConnection,
+        addr: SocketAddr,
+        max_pending: usize,
+        shared_stats: Arc<RwLock<HashMap<SocketAddr, PeerStats>>>,
+        choking_decisions: Arc<RwLock<HashMap<SocketAddr, bool>>>,
+        metadata_only: bool,
+    ) -> Result<()> {
         downloader
             .stats
             .peers_connected
@@ -1431,8 +1748,12 @@ impl TorrentDownloader {
                             tracing::debug!("[{}] Peer unchoked us", addr);
                         }
 
-                        PeerMessage::Have { piece_index: _ } => {
-                            // Peer has a new piece - already handled internally by conn
+                        PeerMessage::Have { piece_index } => {
+                            // Conn tracks the peer's pieces internally; feed
+                            // the availability counter so rarest-first works.
+                            if let Some(ref pm) = *downloader.piece_manager.read() {
+                                pm.update_piece_availability(piece_index, true);
+                            }
                         }
 
                         PeerMessage::Bitfield { bitfield } => {
@@ -1443,11 +1764,17 @@ impl TorrentDownloader {
                                 addr,
                                 has_count
                             );
+                            if let Some(ref pm) = *downloader.piece_manager.read() {
+                                pm.update_availability(conn.peer_pieces(), true);
+                            }
                         }
 
                         PeerMessage::HaveAll => {
                             // BEP 6: Peer has all pieces - handled internally by conn
                             tracing::debug!("[{}] Peer has all pieces (HaveAll)", addr);
+                            if let Some(ref pm) = *downloader.piece_manager.read() {
+                                pm.update_availability(conn.peer_pieces(), true);
+                            }
                         }
 
                         PeerMessage::HaveNone => {
@@ -1462,6 +1789,13 @@ impl TorrentDownloader {
                         } => {
                             // Remove from pending
                             pending_requests.remove(&(index, begin, block.len() as u32));
+
+                            // Book the payload against the download budget
+                            // (delays further requests once over the limit).
+                            let limiters = downloader.download_limiters.read().clone();
+                            for limiter in limiters {
+                                limiter.acquire(block.len() as u64).await;
+                            }
 
                             // Add block to piece manager
                             let add_result = {
@@ -1544,6 +1878,14 @@ impl TorrentDownloader {
 
                             match block_result {
                                 Some(Ok(block)) => {
+                                    // Book the payload against the upload
+                                    // budget before sending.
+                                    let limiters =
+                                        downloader.upload_limiters.read().clone();
+                                    for limiter in limiters {
+                                        limiter.acquire(block.len() as u64).await;
+                                    }
+
                                     // Send the piece to the peer
                                     match conn.send_piece(index, begin, block.clone()).await {
                                         Ok(()) => {
@@ -1729,6 +2071,29 @@ impl TorrentDownloader {
                     }
                 }
 
+                Err(EngineError::Network {
+                    kind: NetworkErrorKind::Timeout,
+                    ..
+                }) => {
+                    // The 30s receive timeout is not fatal: compliant clients
+                    // keep-alive only every ~120s. Send our own keep-alive so
+                    // the peer doesn't idle-kill us either, and disconnect
+                    // only after a prolonged silence.
+                    const IDLE_DISCONNECT: Duration = Duration::from_secs(150);
+                    if conn.idle_time() >= IDLE_DISCONNECT {
+                        tracing::debug!(
+                            "Peer {} idle for {:?}, disconnecting",
+                            addr,
+                            conn.idle_time()
+                        );
+                        break;
+                    }
+                    if let Err(e) = conn.keep_alive().await {
+                        tracing::debug!("Peer {} keep-alive failed: {}", addr, e);
+                        break;
+                    }
+                    continue;
+                }
                 Err(e) => {
                     // Connection error from recv
                     tracing::debug!("Peer {} recv error: {}", addr, e);
@@ -1748,6 +2113,7 @@ impl TorrentDownloader {
             // Request more blocks if we have capacity and peer is unchoked
             if !conn.peer_choking() && pending_requests.len() < max_pending {
                 // Get all blocks to request in one pass
+                let mut in_endgame = false;
                 let blocks_to_request: Vec<BlockRequest> = {
                     let pm_guard = downloader.piece_manager.read();
                     if let Some(ref pm) = *pm_guard {
@@ -1755,7 +2121,12 @@ impl TorrentDownloader {
                         let slots_available = max_pending - pending_requests.len();
 
                         // Check for endgame mode (10 or fewer pieces remaining)
-                        let endgame_pieces = pm.endgame_pieces();
+                        let endgame_pieces = if downloader.config.enable_endgame {
+                            pm.endgame_pieces()
+                        } else {
+                            Vec::new()
+                        };
+                        in_endgame = !endgame_pieces.is_empty();
                         if !endgame_pieces.is_empty() {
                             let mut pending = pm.pending_pieces();
                             for piece_idx in endgame_pieces {
@@ -1825,6 +2196,36 @@ impl TorrentDownloader {
                             .is_ok()
                     {
                         pending_requests.insert(key);
+                        // Record the request so other peers aren't handed the
+                        // same block (outside endgame). Marks are cleared on
+                        // block receipt and by stale-piece cleanup.
+                        if !in_endgame {
+                            if let Some(ref pm) = *downloader.piece_manager.read() {
+                                pm.mark_block_requested(
+                                    block.piece,
+                                    block.offset / crate::torrent::peer::BLOCK_SIZE,
+                                    addr.port() as usize,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // In endgame every remaining block is requested from several
+                // peers; cancel our copy of any request another peer already
+                // satisfied so the duplicate bytes never hit the wire.
+                if in_endgame && !pending_requests.is_empty() {
+                    let pm_opt = downloader.piece_manager.read().clone();
+                    if let Some(ref pm) = pm_opt {
+                        let satisfied: Vec<(u32, u32, u32)> = pending_requests
+                            .iter()
+                            .filter(|(piece, offset, _)| pm.is_block_received(*piece, *offset))
+                            .copied()
+                            .collect();
+                        for (piece, offset, length) in satisfied {
+                            let _ = conn.cancel_request(piece, offset, length).await;
+                            pending_requests.remove(&(piece, offset, length));
+                        }
                     }
                 }
             }
@@ -1913,6 +2314,12 @@ impl TorrentDownloader {
         shared_stats.write().remove(&addr);
         choking_decisions.write().remove(&addr);
 
+        // Remove this peer's pieces from the availability counters so
+        // rarest-first reflects the live swarm.
+        if let Some(ref pm) = *downloader.piece_manager.read() {
+            pm.update_availability(conn.peer_pieces(), false);
+        }
+
         downloader
             .stats
             .peers_connected
@@ -1929,7 +2336,7 @@ impl TorrentDownloader {
             return Ok(());
         }
 
-        let listen_port = self.config.listen_port_range.0;
+        let listen_port = self.advertised_port();
         let bootstrap_nodes = &self.config.dht_bootstrap_nodes;
 
         // Use custom bootstrap nodes if configured, otherwise use defaults
@@ -2009,7 +2416,7 @@ impl TorrentDownloader {
             return Ok(());
         }
 
-        let listen_port = self.config.listen_port_range.0;
+        let listen_port = self.advertised_port();
         let lpd_service = match LpdService::new(listen_port).await {
             Ok(service) => Arc::new(service),
             Err(e) => {

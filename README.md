@@ -28,6 +28,8 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | Checksum verification | MD5, SHA-256 |
 | Concurrent download management | Priority queue (Critical/High/Normal/Low) |
 | Pause / resume / cancel | Full lifecycle control, per download or in batch (`pause_all` / `resume_all` / `cancel_all`) |
+| Rate limiting | Global + per-download byte-rate limits covering segmented HTTP, single-stream HTTP, torrent peers, and webseeds |
+| Cross-restart resume validation | ETag/Last-Modified persisted and checked on resume; changed remote files restart from zero |
 | Event system | Broadcast channels for progress, state changes |
 | Global statistics | Active count, aggregate speeds |
 | SQLite persistence | WAL mode, schema versioning, crash recovery |
@@ -45,6 +47,9 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | Sequential download | — | For streaming playback |
 | Torrent crash recovery | — | Resume from SQLite-stored torrent data |
 | IPv6 tracker peers | 7 | Compact `peers6` parsing |
+| Inbound peer connections | 3 | TCP listener on the configured port range; serves peers while downloading and seeding |
+| Keep-alive & re-announce | 3 | Idle peers kept alive; periodic tracker re-announce honoring the announce interval |
+| Rarest-first piece selection | — | Live availability tracking from bitfields/have messages |
 
 ### Implemented, Lightly Tested
 
@@ -55,7 +60,8 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | Local Peer Discovery | 14 | Implemented, disabled in CI tests |
 | Message Stream Encryption | MSE/PE | RC4 + DH key exchange, unit tests only |
 | WebSeeds | 17, 19 | Hoffman + GetRight, including cross-file pieces |
-| uTP transport | 29 | LEDBAT congestion control, wired into peer connections (opt-in) |
+| Endgame mode | — | Duplicate requests to multiple peers with cancels on receipt; toggle via `enable_endgame` |
+| File preallocation | — | `allocation_mode` config, applied before torrent verification |
 | HTTP resume | — | ETag/Last-Modified validation |
 | Mirror/failover | — | Automatic failover to alternate URLs |
 | Bandwidth scheduling | — | Time-of-day rules with live runtime limit updates |
@@ -68,8 +74,9 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | Feature | Notes |
 |---------|-------|
 | DHT IPv6 | Depends on upstream `mainline` crate |
-| Proxy support | Config field exists, not tested |
-| File preallocation | Config field exists, not tested |
+| uTP transport (BEP 29) | Experimental and currently non-functional for data transfer; disabled by default |
+| MSE responder (inbound encryption) | Outgoing MSE works (incl. PadB handling); inbound connections are plaintext-only for now |
+| Proxy support | Wired via reqwest, not covered by tests |
 
 ## Quick Start
 

@@ -15,6 +15,10 @@ use std::collections::BTreeMap;
 /// Maximum allowed length for a bencode string (100 MiB)
 /// This prevents malicious torrents from causing memory exhaustion
 const MAX_STRING_LENGTH: usize = 100 * 1024 * 1024;
+
+/// Maximum nesting depth for lists/dicts. Real BitTorrent structures nest a
+/// handful of levels; deeply nested input is a stack-overflow attack.
+const MAX_PARSE_DEPTH: usize = 64;
 use std::fmt;
 
 use crate::error::{EngineError, ProtocolErrorKind, Result};
@@ -42,7 +46,10 @@ impl fmt::Debug for BencodeValue {
                     if s.len() <= 50 {
                         write!(f, "Bytes(\"{}\")", s)
                     } else {
-                        write!(f, "Bytes(\"{}...\" [{} bytes])", &s[..50], b.len())
+                        // Truncate on a char boundary; byte 50 may fall inside
+                        // a multi-byte character in untrusted input.
+                        let cut = (0..=50).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+                        write!(f, "Bytes(\"{}...\" [{} bytes])", &s[..cut], b.len())
                     }
                 } else {
                     write!(f, "Bytes([{} bytes])", b.len())
@@ -76,6 +83,21 @@ impl BencodeValue {
     ///
     /// Returns the parsed value and remaining unparsed bytes.
     pub fn parse(data: &[u8]) -> Result<ParseResult<'_>> {
+        Self::parse_at_depth(data, 0)
+    }
+
+    /// Parse bencode with nesting-depth tracking.
+    ///
+    /// Bencode arrives from untrusted sources (trackers, peers, .torrent
+    /// files); without a depth limit, input like `"l" * 100_000` overflows
+    /// the stack and aborts the process.
+    fn parse_at_depth(data: &[u8], depth: usize) -> Result<ParseResult<'_>> {
+        if depth > MAX_PARSE_DEPTH {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::BencodeParse,
+                format!("Nesting depth exceeds maximum of {MAX_PARSE_DEPTH}"),
+            ));
+        }
         if data.is_empty() {
             return Err(EngineError::protocol(
                 ProtocolErrorKind::BencodeParse,
@@ -85,8 +107,8 @@ impl BencodeValue {
 
         match data[0] {
             b'i' => Self::parse_integer(data),
-            b'l' => Self::parse_list(data),
-            b'd' => Self::parse_dict(data),
+            b'l' => Self::parse_list(data, depth),
+            b'd' => Self::parse_dict(data, depth),
             b'0'..=b'9' => Self::parse_bytes(data),
             c => Err(EngineError::protocol(
                 ProtocolErrorKind::BencodeParse,
@@ -203,7 +225,7 @@ impl BencodeValue {
     }
 
     /// Parse a list: l<items>e
-    fn parse_list(data: &[u8]) -> Result<ParseResult<'_>> {
+    fn parse_list(data: &[u8], depth: usize) -> Result<ParseResult<'_>> {
         if data.is_empty() || data[0] != b'l' {
             return Err(EngineError::protocol(
                 ProtocolErrorKind::BencodeParse,
@@ -215,7 +237,7 @@ impl BencodeValue {
         let mut remaining = &data[1..]; // Skip 'l'
 
         while !remaining.is_empty() && remaining[0] != b'e' {
-            let result = Self::parse(remaining)?;
+            let result = Self::parse_at_depth(remaining, depth + 1)?;
             items.push(result.value);
             remaining = result.remaining;
         }
@@ -234,7 +256,7 @@ impl BencodeValue {
     }
 
     /// Parse a dictionary: d<pairs>e
-    fn parse_dict(data: &[u8]) -> Result<ParseResult<'_>> {
+    fn parse_dict(data: &[u8], depth: usize) -> Result<ParseResult<'_>> {
         if data.is_empty() || data[0] != b'd' {
             return Err(EngineError::protocol(
                 ProtocolErrorKind::BencodeParse,
@@ -273,7 +295,7 @@ impl BencodeValue {
             remaining = key_result.remaining;
 
             // Parse value
-            let value_result = Self::parse(remaining)?;
+            let value_result = Self::parse_at_depth(remaining, depth + 1)?;
             items.insert(key, value_result.value);
             remaining = value_result.remaining;
         }
@@ -481,6 +503,35 @@ pub fn find_info_dict_bytes(data: &[u8]) -> Result<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_depth_limit() {
+        // Deeply nested lists must error, not overflow the stack.
+        let mut evil = vec![b'l'; 100_000];
+        evil.extend(vec![b'e'; 100_000]);
+        assert!(BencodeValue::parse(&evil).is_err());
+
+        // Same for dicts nested inside lists.
+        let mut evil = Vec::new();
+        for _ in 0..50_000 {
+            evil.extend_from_slice(b"d1:a");
+        }
+        assert!(BencodeValue::parse(&evil).is_err());
+
+        // Nesting within the limit still parses.
+        let mut ok = vec![b'l'; 32];
+        ok.extend(vec![b'e'; 32]);
+        assert!(BencodeValue::parse(&ok).is_ok());
+    }
+
+    #[test]
+    fn test_debug_truncates_on_char_boundary() {
+        // 48 ASCII bytes then a multi-byte char straddling byte 50.
+        let mut s = "a".repeat(48);
+        s.push('€'); // 3 bytes: 48..51
+        let value = BencodeValue::Bytes(s.into_bytes());
+        let _ = format!("{value:?}"); // must not panic
+    }
 
     #[test]
     fn test_parse_integer() {

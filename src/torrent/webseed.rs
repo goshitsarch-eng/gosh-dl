@@ -7,6 +7,7 @@
 //! WebSeeds download pieces in parallel with BitTorrent peers for maximum throughput.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -294,16 +295,7 @@ impl WebSeedManager {
             })?;
 
         // Initialize seeds from metainfo
-        let seeds: Vec<Arc<WebSeed>> = metainfo
-            .all_webseeds()
-            .into_iter()
-            .map(|url| {
-                // Determine type based on URL pattern
-                // Hoffman-style seeds typically end with specific paths
-                let seed_type = WebSeedType::GetRight;
-                Arc::new(WebSeed::new(url, seed_type))
-            })
-            .collect();
+        let seeds = Self::seeds_from_metainfo(&metainfo);
 
         tracing::info!("WebSeedManager initialized with {} seeds", seeds.len());
         for seed in &seeds {
@@ -324,6 +316,27 @@ impl WebSeedManager {
             },
             event_rx,
         ))
+    }
+
+    /// Build the seed list from metainfo, preserving each URL's origin:
+    /// `url-list` entries are BEP 19 (GetRight-style) file URLs, while
+    /// `httpseeds` entries are BEP 17 (Hoffman-style) seed servers.
+    fn seeds_from_metainfo(metainfo: &Metainfo) -> Vec<Arc<WebSeed>> {
+        let mut seeds: Vec<Arc<WebSeed>> = metainfo
+            .url_list
+            .iter()
+            .map(|url| Arc::new(WebSeed::new(url.clone(), WebSeedType::GetRight)))
+            .collect();
+
+        // Add httpseeds, avoiding duplicates with url-list entries
+        for url in &metainfo.httpseeds {
+            if seeds.iter().any(|s| s.url == *url) {
+                continue;
+            }
+            seeds.push(Arc::new(WebSeed::new(url.clone(), WebSeedType::Hoffman)));
+        }
+
+        seeds
     }
 
     /// Start the web seed download loop
@@ -594,9 +607,13 @@ impl WebSeedManager {
         match seed.seed_type {
             WebSeedType::GetRight => {
                 // BEP 19: For single-file torrents, URL is the file
-                // For multi-file torrents, URL is the directory root
+                // (with the name appended if the URL is a directory).
+                // For multi-file torrents, URL is the directory root.
                 if self.metainfo.info.is_single_file {
-                    Ok(seed.url.clone())
+                    Ok(getright_single_file_url(
+                        &seed.url,
+                        &self.metainfo.info.name,
+                    ))
                 } else {
                     // For multi-file, we need to determine which file(s)
                     // this piece spans and construct appropriate URL
@@ -606,27 +623,14 @@ impl WebSeedManager {
             WebSeedType::Hoffman => {
                 // BEP 17: Append parameters to URL
                 let info_hash = self.metainfo.info_hash_urlencoded();
-                Ok(format!(
-                    "{}?info_hash={}&piece={}",
-                    seed.url, info_hash, piece_index
-                ))
+                Ok(hoffman_piece_url(&seed.url, &info_hash, piece_index))
             }
         }
     }
 
     /// Build URL for a single file in a multi-file torrent (BEP 19 GetRight style)
     fn build_file_url(&self, seed: &WebSeed, file: &FileInfo) -> String {
-        let file_path = file.path.to_string_lossy();
-
-        // URL encode the path components
-        let encoded_path = file_path
-            .split(std::path::MAIN_SEPARATOR)
-            .map(|p| urlencoding::encode(p).into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-
-        let base = seed.url.trim_end_matches('/');
-        format!("{}/{}", base, encoded_path)
+        getright_multi_file_url(&seed.url, &self.metainfo.info.name, &file.path)
     }
 
     /// Build URL for multi-file torrent piece (BEP 19)
@@ -709,7 +713,17 @@ impl WebSeedManager {
                 )
             })?;
 
-            piece_data.extend_from_slice(&data[..(*length as usize).min(data.len())]);
+            // A compliant server answers the Range request with 206 and only
+            // the requested bytes. A server that ignores Range replies 200
+            // with the whole file, so the requested window must be sliced
+            // out starting at `file_offset`, not from the start of the body.
+            let chunk = extract_file_range(
+                &data,
+                status == reqwest::StatusCode::PARTIAL_CONTENT,
+                *file_offset,
+                *length,
+            )?;
+            piece_data.extend_from_slice(chunk);
         }
 
         // Verify the piece hash
@@ -743,6 +757,9 @@ impl WebSeedManager {
     }
 
     /// Shutdown the web seed manager
+    ///
+    /// Idempotent and cheap: sets an atomic flag that the download loop
+    /// checks, so it is safe to call multiple times (e.g. from `stop()`).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
     }
@@ -771,6 +788,85 @@ impl WebSeedManager {
             .iter()
             .filter(|s| s.state() != WebSeedState::Failed)
             .count()
+    }
+}
+
+/// Build the request URL for a single-file torrent (BEP 19 GetRight style)
+///
+/// Per BEP 19, a base URL ending in `/` is a directory and the torrent name
+/// is appended; otherwise the URL already points at the file itself.
+fn getright_single_file_url(base_url: &str, name: &str) -> String {
+    if base_url.ends_with('/') {
+        format!("{}{}", base_url, urlencoding::encode(name))
+    } else {
+        base_url.to_string()
+    }
+}
+
+/// Build the request URL for one file of a multi-file torrent (BEP 19
+/// GetRight style)
+///
+/// Per BEP 19, multi-file torrents append `{name}/{file path}` to the base
+/// URL, where `name` is the torrent's top-level directory.
+fn getright_multi_file_url(base_url: &str, name: &str, file_path: &Path) -> String {
+    // URL encode the path components
+    let encoded_path = file_path
+        .to_string_lossy()
+        .split(std::path::MAIN_SEPARATOR)
+        .map(|p| urlencoding::encode(p).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let base = base_url.trim_end_matches('/');
+    let encoded_name = urlencoding::encode(name);
+    format!("{}/{}/{}", base, encoded_name, encoded_path)
+}
+
+/// Build the request URL for a piece from a seed server (BEP 17 Hoffman style)
+fn hoffman_piece_url(base_url: &str, info_hash_urlencoded: &str, piece_index: u32) -> String {
+    format!(
+        "{}?info_hash={}&piece={}",
+        base_url, info_hash_urlencoded, piece_index
+    )
+}
+
+/// Extract the requested byte window from a per-file web seed response body
+///
+/// A 206 (Partial Content) body must be exactly the requested range. A 200
+/// body is the whole file starting at offset 0, so the window starting at
+/// `file_offset` is sliced out. Any other size is an error.
+fn extract_file_range(
+    data: &[u8],
+    is_partial_content: bool,
+    file_offset: u64,
+    length: u64,
+) -> Result<&[u8]> {
+    if is_partial_content {
+        if data.len() as u64 != length {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::InvalidResponse,
+                format!(
+                    "WebSeed returned wrong range size: expected {}, got {}",
+                    length,
+                    data.len()
+                ),
+            ));
+        }
+        Ok(data)
+    } else {
+        let range_end = file_offset + length;
+        if (data.len() as u64) < range_end {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::InvalidResponse,
+                format!(
+                    "WebSeed full response too short: need {} bytes, got {}",
+                    range_end,
+                    data.len()
+                ),
+            ));
+        }
+        // range_end <= data.len() <= usize::MAX, so these casts are lossless
+        Ok(&data[file_offset as usize..range_end as usize])
     }
 }
 
@@ -1036,5 +1132,148 @@ mod tests {
         let url = "http://example.com/path/to/torrent/file.iso";
         let seed = WebSeed::new(url.to_string(), WebSeedType::GetRight);
         assert_eq!(seed.url, url);
+    }
+
+    // ========================================================================
+    // URL Construction Tests (BEP 19 / BEP 17)
+    // ========================================================================
+
+    use crate::torrent::metainfo::Info;
+    use std::path::PathBuf;
+
+    fn test_metainfo(url_list: Vec<String>, httpseeds: Vec<String>) -> Metainfo {
+        Metainfo {
+            info_hash: [0u8; 20],
+            info: Info {
+                name: "linux.iso".to_string(),
+                piece_length: 32 * 1024,
+                pieces: vec![[0u8; 20]],
+                files: vec![FileInfo {
+                    path: PathBuf::from("linux.iso"),
+                    length: 100,
+                    offset: 0,
+                    md5sum: None,
+                }],
+                total_size: 100,
+                is_single_file: true,
+                private: false,
+            },
+            announce: None,
+            announce_list: Vec::new(),
+            creation_date: None,
+            comment: None,
+            created_by: None,
+            encoding: None,
+            url_list,
+            httpseeds,
+        }
+    }
+
+    #[test]
+    fn test_bep19_single_file_url_with_trailing_slash() {
+        // URL ends in '/': the torrent name is appended
+        assert_eq!(
+            getright_single_file_url("http://example.com/dl/", "linux.iso"),
+            "http://example.com/dl/linux.iso"
+        );
+    }
+
+    #[test]
+    fn test_bep19_single_file_url_without_trailing_slash() {
+        // URL is the complete file URL and is used as-is
+        assert_eq!(
+            getright_single_file_url("http://example.com/dl/linux.iso", "linux.iso"),
+            "http://example.com/dl/linux.iso"
+        );
+    }
+
+    #[test]
+    fn test_bep19_single_file_url_encodes_name() {
+        assert_eq!(
+            getright_single_file_url("http://example.com/dl/", "my file.iso"),
+            "http://example.com/dl/my%20file.iso"
+        );
+    }
+
+    #[test]
+    fn test_bep19_multi_file_url_includes_name_dir() {
+        let path = PathBuf::from("sub").join("a.bin");
+        assert_eq!(
+            getright_multi_file_url("http://example.com/dl/", "My Torrent", &path),
+            "http://example.com/dl/My%20Torrent/sub/a.bin"
+        );
+        // A base URL without a trailing slash is treated the same way
+        assert_eq!(
+            getright_multi_file_url("http://example.com/dl", "My Torrent", &path),
+            "http://example.com/dl/My%20Torrent/sub/a.bin"
+        );
+    }
+
+    #[test]
+    fn test_bep17_hoffman_url() {
+        assert_eq!(
+            hoffman_piece_url("http://seed.example.com/seed.php", "%AA%BB", 7),
+            "http://seed.example.com/seed.php?info_hash=%AA%BB&piece=7"
+        );
+    }
+
+    #[test]
+    fn test_seed_types_from_metainfo_lists() {
+        // url-list entries are BEP 19 (GetRight), httpseeds are BEP 17 (Hoffman)
+        let metainfo = test_metainfo(
+            vec!["http://mirror.example.com/linux.iso".to_string()],
+            vec!["http://seed.example.com/seed.php".to_string()],
+        );
+        let seeds = WebSeedManager::seeds_from_metainfo(&metainfo);
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds[0].url, "http://mirror.example.com/linux.iso");
+        assert_eq!(seeds[0].seed_type, WebSeedType::GetRight);
+        assert_eq!(seeds[1].url, "http://seed.example.com/seed.php");
+        assert_eq!(seeds[1].seed_type, WebSeedType::Hoffman);
+    }
+
+    #[test]
+    fn test_seed_types_dedup_prefers_getright() {
+        let url = "http://both.example.com/".to_string();
+        let metainfo = test_metainfo(vec![url.clone()], vec![url]);
+        let seeds = WebSeedManager::seeds_from_metainfo(&metainfo);
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].seed_type, WebSeedType::GetRight);
+    }
+
+    // ========================================================================
+    // Cross-File Response Handling Tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_file_range_206_exact() {
+        let data = vec![10u8, 11, 12, 13];
+        let chunk = extract_file_range(&data, true, 100, 4).unwrap();
+        assert_eq!(chunk, &data[..]);
+    }
+
+    #[test]
+    fn test_extract_file_range_206_wrong_size_is_error() {
+        // Too short
+        let data = vec![10u8, 11, 12];
+        assert!(extract_file_range(&data, true, 100, 4).is_err());
+        // Too long
+        let data = vec![0u8; 10];
+        assert!(extract_file_range(&data, true, 100, 4).is_err());
+    }
+
+    #[test]
+    fn test_extract_file_range_200_slices_from_file_offset() {
+        // Server ignored the Range header and returned the whole file:
+        // the requested window starts at file_offset, not at offset 0
+        let data: Vec<u8> = (0u8..100).collect();
+        let chunk = extract_file_range(&data, false, 60, 20).unwrap();
+        assert_eq!(chunk, &data[60..80]);
+    }
+
+    #[test]
+    fn test_extract_file_range_200_too_short_is_error() {
+        let data = vec![0u8; 50];
+        assert!(extract_file_range(&data, false, 60, 20).is_err());
     }
 }

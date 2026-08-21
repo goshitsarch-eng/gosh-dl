@@ -97,7 +97,14 @@ impl FileStorage {
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
-        tokio::fs::write(&tmp, bytes).await?;
+        {
+            let mut file = tokio::fs::File::create(&tmp).await?;
+            tokio::io::AsyncWriteExt::write_all(&mut file, bytes).await?;
+            // Flush data to disk before the rename: on power loss the rename
+            // can survive while unsynced data doesn't, leaving a truncated
+            // record at the final path.
+            file.sync_all().await?;
+        }
         tokio::fs::rename(&tmp, path).await?;
         Ok(())
     }

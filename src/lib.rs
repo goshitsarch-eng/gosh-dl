@@ -43,6 +43,7 @@ pub mod engine;
 pub mod error;
 #[cfg(feature = "http")]
 pub mod http;
+pub mod limiter;
 pub(crate) mod priority_queue;
 pub mod protocol;
 pub(crate) mod scheduler;
@@ -74,6 +75,7 @@ pub use storage::SqliteStorage;
 pub use storage::{FileStorage, MemoryStorage, Segment, SegmentState, Storage};
 
 // Priority queue exports
+pub use limiter::RateLimiter;
 pub use priority_queue::{DownloadPriority, PriorityQueue, PriorityQueueStats};
 
 // Scheduler exports

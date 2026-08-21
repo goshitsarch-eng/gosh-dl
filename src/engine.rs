@@ -28,7 +28,6 @@ use crate::http::crawl;
 #[cfg(any(feature = "http", feature = "torrent"))]
 use chrono::Utc;
 use parking_lot::RwLock;
-#[cfg(all(feature = "http", feature = "recursive-http"))]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -51,6 +50,14 @@ const RECURSIVE_EVENT_CHANNEL_CAPACITY: usize = 256;
 struct ManagedDownload {
     status: DownloadStatus,
     handle: Option<DownloadHandle>,
+    /// The options this download was added with. Kept (and persisted) so
+    /// resume — in-session or after a restart — keeps file selection,
+    /// sequential mode, connection caps, and speed limits instead of
+    /// rebuilding them from defaults.
+    options: Option<DownloadOptions>,
+    /// Lifetime torrent transfer totals restored from storage, consumed when
+    /// the torrent (re)starts.
+    restored_totals: Option<(u64, u64)>,
     /// Cached HTTP segment state for in-memory pause/resume (no storage needed)
     #[cfg(feature = "http")]
     cached_segments: Option<Vec<Segment>>,
@@ -76,11 +83,19 @@ struct RecursiveFailFastAbort {
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
-#[cfg(all(feature = "http", feature = "recursive-http"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedDownloadRuntimeMetadata {
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
     #[serde(default)]
     recursive_child: Option<PersistedRecursiveChildState>,
+    /// The download's original options, persisted so crash recovery does not
+    /// silently drop file selection, sequential mode, or speed limits.
+    #[serde(default)]
+    options: Option<DownloadOptions>,
+    /// Lifetime (downloaded, uploaded) byte totals for torrents, so
+    /// seed-ratio decisions survive restarts.
+    #[serde(default)]
+    torrent_totals: Option<(u64, u64)>,
 }
 
 #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -163,6 +178,11 @@ pub struct DownloadEngine {
     /// Bandwidth scheduler for time-based limits
     scheduler: Arc<RwLock<BandwidthScheduler>>,
 
+    /// Global download rate limiter shared by every transfer path
+    global_download_limiter: Arc<crate::limiter::RateLimiter>,
+    /// Global upload rate limiter shared by every transfer path
+    global_upload_limiter: Arc<crate::limiter::RateLimiter>,
+
     /// Shutdown flag
     shutdown: tokio_util::sync::CancellationToken,
 
@@ -189,13 +209,10 @@ impl DownloadEngine {
         // Initialize persistent storage
         #[cfg(feature = "storage")]
         let storage: Option<Arc<dyn Storage>> = if let Some(ref db_path) = config.database_path {
-            match SqliteStorage::new(db_path).await {
-                Ok(s) => Some(Arc::new(s)),
-                Err(e) => {
-                    tracing::warn!("Failed to initialize database storage: {}. Downloads will not be persisted.", e);
-                    None
-                }
-            }
+            // A configured database that fails to open is a hard error:
+            // downgrading to a warning silently runs the engine with no
+            // persistence at all, which callers have no way to detect.
+            Some(Arc::new(SqliteStorage::new(db_path).await?))
         } else {
             None
         };
@@ -257,6 +274,17 @@ impl DownloadEngine {
         #[cfg(feature = "http")]
         let http = Arc::new(HttpDownloader::new(&config)?);
 
+        // One global limiter pair governs all traffic. With the http feature
+        // it's the pool's pair (already seeded from config); otherwise the
+        // engine owns a standalone pair for the torrent paths.
+        #[cfg(feature = "http")]
+        let (global_download_limiter, global_upload_limiter) = http.limiters();
+        #[cfg(not(feature = "http"))]
+        let (global_download_limiter, global_upload_limiter) = (
+            Arc::new(crate::limiter::RateLimiter::new(config.global_download_limit)),
+            Arc::new(crate::limiter::RateLimiter::new(config.global_upload_limit)),
+        );
+
         // Create priority queue for concurrent download limiting
         let priority_queue = PriorityQueue::new(config.max_concurrent_downloads);
 
@@ -286,12 +314,14 @@ impl DownloadEngine {
             recursive_job_event_tx,
             priority_queue,
             scheduler,
+            global_download_limiter,
+            global_upload_limiter,
             shutdown: tokio_util::sync::CancellationToken::new(),
             storage,
         });
 
         // Load persisted downloads from database
-        engine.load_persisted_downloads().await?;
+        let restored_queued = engine.load_persisted_downloads().await?;
         #[cfg(all(feature = "http", feature = "recursive-http"))]
         engine.load_persisted_recursive_jobs().await?;
 
@@ -300,6 +330,14 @@ impl DownloadEngine {
 
         // Start bandwidth scheduler update task
         Self::start_scheduler_task(Arc::clone(&engine));
+
+        // Auto-start downloads that were persisted as Queued: they never got
+        // to run before the crash, and nothing else would ever start them.
+        for id in restored_queued {
+            if let Err(e) = engine.resume(id).await {
+                tracing::warn!("Failed to auto-start restored queued download {}: {}", id, e);
+            }
+        }
 
         Ok(engine)
     }
@@ -314,6 +352,11 @@ impl DownloadEngine {
         }
 
         let shutdown = engine.shutdown.clone();
+        // Hold only a Weak reference: a strong Arc here would keep the engine
+        // alive forever (Drop fires the shutdown token, but Drop can never run
+        // while this task owns an Arc — a reference cycle).
+        let weak = Arc::downgrade(&engine);
+        drop(engine);
         tokio::spawn(async move {
             const PERSISTENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
             let mut interval = tokio::time::interval(PERSISTENCE_INTERVAL);
@@ -321,14 +364,17 @@ impl DownloadEngine {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        let Some(engine) = weak.upgrade() else { break };
                         if let Err(e) = engine.persist_active_downloads().await {
                             tracing::warn!("Failed to persist active downloads: {}", e);
                         }
                     }
                     _ = shutdown.cancelled() => {
                         // Final persistence on shutdown
-                        if let Err(e) = engine.persist_active_downloads().await {
-                            tracing::warn!("Failed to persist downloads on shutdown: {}", e);
+                        if let Some(engine) = weak.upgrade() {
+                            if let Err(e) = engine.persist_active_downloads().await {
+                                tracing::warn!("Failed to persist downloads on shutdown: {}", e);
+                            }
                         }
                         break;
                     }
@@ -343,6 +389,10 @@ impl DownloadEngine {
     /// bandwidth limits if they have changed.
     fn start_scheduler_task(engine: Arc<Self>) {
         let shutdown = engine.shutdown.clone();
+        // Weak for the same reason as the persistence task: a strong Arc in a
+        // shutdown-gated loop is a reference cycle that makes Drop unreachable.
+        let weak = Arc::downgrade(&engine);
+        drop(engine);
         tokio::spawn(async move {
             const SCHEDULER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
             let mut interval = tokio::time::interval(SCHEDULER_INTERVAL);
@@ -350,6 +400,7 @@ impl DownloadEngine {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        let Some(engine) = weak.upgrade() else { break };
                         if engine.scheduler.read().update() {
                             let limits = engine.scheduler.read().get_limits();
                             #[cfg(feature = "http")]
@@ -374,7 +425,12 @@ impl DownloadEngine {
         };
 
         // Collect active downloads and their segment info
-        let active_downloads: Vec<(DownloadStatus, Option<Vec<crate::storage::Segment>>)> = {
+        type PersistEntry = (
+            DownloadStatus,
+            Option<Vec<crate::storage::Segment>>,
+            Option<String>,
+        );
+        let active_downloads: Vec<PersistEntry> = {
             let downloads = self.downloads.read();
             downloads
                 .values()
@@ -389,13 +445,35 @@ impl DownloadEngine {
                             .map(|sd| sd.segments_with_progress()),
                         _ => None,
                     };
-                    (d.status.clone(), segments)
+                    // Torrents refresh their runtime metadata each cycle so
+                    // lifetime transfer totals survive a crash.
+                    #[cfg(feature = "torrent")]
+                    let runtime_json = match &d.handle {
+                        Some(DownloadHandle::Torrent(h)) => {
+                            let totals = h.downloader.transfer_totals();
+                            d.options.as_ref().and_then(|opts| {
+                                self.build_persisted_runtime_metadata(
+                                    opts,
+                                    Some(totals),
+                                    #[cfg(all(feature = "http", feature = "recursive-http"))]
+                                    d.redirect_scope.as_ref(),
+                                    #[cfg(all(feature = "http", feature = "recursive-http"))]
+                                    d.recursive_group_id,
+                                )
+                                .ok()
+                            })
+                        }
+                        _ => None,
+                    };
+                    #[cfg(not(feature = "torrent"))]
+                    let runtime_json: Option<String> = None;
+                    (d.status.clone(), segments, runtime_json)
                 })
                 .collect()
         };
 
         // Save each active download and its segments
-        for (status, segments_opt) in active_downloads {
+        for (status, segments_opt, runtime_json) in active_downloads {
             if let Err(e) = storage.save_download(&status).await {
                 tracing::debug!("Failed to persist download {}: {}", status.id, e);
             }
@@ -406,20 +484,32 @@ impl DownloadEngine {
                     tracing::debug!("Failed to persist segments for {}: {}", status.id, e);
                 }
             }
+
+            // Refresh runtime metadata (torrent transfer totals)
+            if let Some(json) = runtime_json {
+                if let Err(e) = storage.save_runtime_metadata(status.id, &json).await {
+                    tracing::debug!("Failed to persist runtime metadata for {}: {}", status.id, e);
+                }
+            }
         }
 
         Ok(())
     }
 
-    /// Load persisted downloads from database on startup
-    async fn load_persisted_downloads(&self) -> Result<()> {
+    /// Load persisted downloads from database on startup.
+    ///
+    /// Returns the ids of downloads that were persisted in `Queued` state:
+    /// they are restored as `Paused` (there is no task backing them) and the
+    /// caller auto-resumes them, so a crash can't strand them in a state
+    /// `resume()` refuses to act on.
+    async fn load_persisted_downloads(&self) -> Result<Vec<DownloadId>> {
+        let mut restored_queued = Vec::new();
         let storage = match &self.storage {
             Some(s) => s,
-            None => return Ok(()), // No storage configured
+            None => return Ok(restored_queued), // No storage configured
         };
 
         let persisted = storage.load_all().await?;
-        #[cfg(all(feature = "http", feature = "recursive-http"))]
         let runtime_metadata = storage.load_all_runtime_metadata().await?;
         #[cfg(all(feature = "http", feature = "recursive-http"))]
         let mut restored_groups = HashMap::new();
@@ -429,6 +519,12 @@ impl DownloadEngine {
             let restored_state = match &status.state {
                 DownloadState::Downloading | DownloadState::Connecting => DownloadState::Paused,
                 DownloadState::Seeding => DownloadState::Paused, // Torrents that were seeding
+                DownloadState::Queued => {
+                    // No task backs a restored Queued download; restore as
+                    // Paused and let the caller auto-resume it.
+                    restored_queued.push(status.id);
+                    DownloadState::Paused
+                }
                 other => other.clone(),
             };
 
@@ -439,32 +535,32 @@ impl DownloadEngine {
             restored_status.progress.upload_speed = 0;
             restored_status.progress.connections = 0;
 
-            #[cfg(all(feature = "http", feature = "recursive-http"))]
-            let (redirect_scope, recursive_group_id, recursive_fail_fast) =
-                if let Some(runtime_json) = runtime_metadata.get(&status.id) {
-                    match self.parse_persisted_runtime_metadata(runtime_json) {
-                        Ok(runtime) => match runtime.recursive_child {
-                            Some(recursive_child) => (
-                                Some(crawl::RedirectScope::from_persisted(
-                                    recursive_child.redirect_scope,
-                                )?),
-                                recursive_child.recursive_group_id,
-                                recursive_child.fail_fast,
-                            ),
-                            None => (None, None, false),
-                        },
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to parse runtime metadata for {}: {}",
-                                status.id,
-                                e
-                            );
-                            (None, None, false)
-                        }
+            let parsed_runtime = runtime_metadata.get(&status.id).and_then(|runtime_json| {
+                match self.parse_persisted_runtime_metadata(runtime_json) {
+                    Ok(runtime) => Some(runtime),
+                    Err(e) => {
+                        tracing::warn!("Failed to parse runtime metadata for {}: {}", status.id, e);
+                        None
                     }
-                } else {
-                    (None, None, false)
-                };
+                }
+            });
+            let restored_options = parsed_runtime.as_ref().and_then(|r| r.options.clone());
+            let restored_totals = parsed_runtime.as_ref().and_then(|r| r.torrent_totals);
+
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            let (redirect_scope, recursive_group_id, recursive_fail_fast) = match parsed_runtime
+                .as_ref()
+                .and_then(|r| r.recursive_child.clone())
+            {
+                Some(recursive_child) => (
+                    Some(crawl::RedirectScope::from_persisted(
+                        recursive_child.redirect_scope,
+                    )?),
+                    recursive_child.recursive_group_id,
+                    recursive_child.fail_fast,
+                ),
+                None => (None, None, false),
+            };
 
             #[cfg(all(feature = "http", feature = "recursive-http"))]
             if let Some(group_id) = recursive_group_id {
@@ -492,6 +588,8 @@ impl DownloadEngine {
                 ManagedDownload {
                     status: restored_status,
                     handle: None,
+                    options: restored_options,
+                    restored_totals,
                     #[cfg(feature = "http")]
                     cached_segments: None,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -514,7 +612,7 @@ impl DownloadEngine {
             self.recursive_groups.write().extend(restored_groups);
         }
 
-        Ok(())
+        Ok(restored_queued)
     }
 
     #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -682,9 +780,14 @@ impl DownloadEngine {
             completed_at: None,
         };
 
-        #[cfg(all(feature = "http", feature = "recursive-http"))]
-        let runtime_metadata_json =
-            self.build_persisted_runtime_metadata(redirect_scope.as_ref(), recursive_group_id)?;
+        let runtime_metadata_json = self.build_persisted_runtime_metadata(
+            &options,
+            None,
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            redirect_scope.as_ref(),
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            recursive_group_id,
+        )?;
 
         // Insert into downloads map
         {
@@ -694,6 +797,8 @@ impl DownloadEngine {
                 ManagedDownload {
                     status: status.clone(),
                     handle: None,
+                    options: Some(options.clone()),
+                    restored_totals: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -716,11 +821,11 @@ impl DownloadEngine {
             if let Err(e) = storage.save_download(&status).await {
                 tracing::warn!("Failed to persist new download {}: {}", id, e);
             }
-            #[cfg(all(feature = "http", feature = "recursive-http"))]
-            if let Some(runtime_json) = runtime_metadata_json {
-                if let Err(e) = storage.save_runtime_metadata(id, &runtime_json).await {
-                    tracing::warn!("Failed to persist runtime metadata for {}: {}", id, e);
-                }
+            if let Err(e) = storage
+                .save_runtime_metadata(id, &runtime_metadata_json)
+                .await
+            {
+                tracing::warn!("Failed to persist runtime metadata for {}: {}", id, e);
             }
         }
 
@@ -1046,42 +1151,38 @@ impl DownloadEngine {
         }
     }
 
-    #[cfg(all(feature = "http", feature = "recursive-http"))]
     fn build_persisted_runtime_metadata(
         &self,
-        redirect_scope: Option<&crawl::RedirectScope>,
-        recursive_group_id: Option<Uuid>,
-    ) -> Result<Option<String>> {
-        let runtime = match redirect_scope {
-            Some(redirect_scope) => PersistedDownloadRuntimeMetadata {
-                recursive_child: Some(PersistedRecursiveChildState {
-                    redirect_scope: redirect_scope.to_persisted(),
-                    recursive_group_id,
-                    fail_fast: recursive_group_id
-                        .and_then(|group_id| {
-                            self.recursive_groups
-                                .read()
-                                .get(&group_id)
-                                .map(|g| g.fail_fast)
-                        })
-                        .unwrap_or(false),
-                }),
-            },
-            None => PersistedDownloadRuntimeMetadata {
-                recursive_child: None,
-            },
+        options: &DownloadOptions,
+        torrent_totals: Option<(u64, u64)>,
+        #[cfg(all(feature = "http", feature = "recursive-http"))] redirect_scope: Option<
+            &crawl::RedirectScope,
+        >,
+        #[cfg(all(feature = "http", feature = "recursive-http"))] recursive_group_id: Option<Uuid>,
+    ) -> Result<String> {
+        let runtime = PersistedDownloadRuntimeMetadata {
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            recursive_child: redirect_scope.map(|redirect_scope| PersistedRecursiveChildState {
+                redirect_scope: redirect_scope.to_persisted(),
+                recursive_group_id,
+                fail_fast: recursive_group_id
+                    .and_then(|group_id| {
+                        self.recursive_groups
+                            .read()
+                            .get(&group_id)
+                            .map(|g| g.fail_fast)
+                    })
+                    .unwrap_or(false),
+            }),
+            options: Some(options.clone()),
+            torrent_totals,
         };
 
-        if runtime.recursive_child.is_none() {
-            return Ok(None);
-        }
-
-        serde_json::to_string(&runtime).map(Some).map_err(|e| {
+        serde_json::to_string(&runtime).map_err(|e| {
             EngineError::Internal(format!("Failed to serialize runtime metadata: {}", e))
         })
     }
 
-    #[cfg(all(feature = "http", feature = "recursive-http"))]
     fn parse_persisted_runtime_metadata(
         &self,
         runtime_json: &str,
@@ -1284,6 +1385,8 @@ impl DownloadEngine {
                 ManagedDownload {
                     status: status.clone(),
                     handle: None,
+                    options: Some(options.clone()),
+                    restored_totals: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -1298,6 +1401,21 @@ impl DownloadEngine {
         if let Some(ref storage) = self.storage {
             if let Err(e) = storage.save_download(&status).await {
                 tracing::warn!("Failed to persist new torrent download {}: {}", id, e);
+            }
+            match self.build_persisted_runtime_metadata(
+                &options,
+                None,
+                #[cfg(all(feature = "http", feature = "recursive-http"))]
+                None,
+                #[cfg(all(feature = "http", feature = "recursive-http"))]
+                None,
+            ) {
+                Ok(runtime_json) => {
+                    if let Err(e) = storage.save_runtime_metadata(id, &runtime_json).await {
+                        tracing::warn!("Failed to persist runtime metadata for {}: {}", id, e);
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to serialize options for {}: {}", id, e),
             }
             // Save raw torrent data for crash recovery
             if let Err(e) = storage.save_torrent_data(id, torrent_data).await {
@@ -1370,6 +1488,8 @@ impl DownloadEngine {
                 ManagedDownload {
                     status: status.clone(),
                     handle: None,
+                    options: Some(options.clone()),
+                    restored_totals: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -1384,6 +1504,21 @@ impl DownloadEngine {
         if let Some(ref storage) = self.storage {
             if let Err(e) = storage.save_download(&status).await {
                 tracing::warn!("Failed to persist new magnet download {}: {}", id, e);
+            }
+            match self.build_persisted_runtime_metadata(
+                &options,
+                None,
+                #[cfg(all(feature = "http", feature = "recursive-http"))]
+                None,
+                #[cfg(all(feature = "http", feature = "recursive-http"))]
+                None,
+            ) {
+                Ok(runtime_json) => {
+                    if let Err(e) = storage.save_runtime_metadata(id, &runtime_json).await {
+                        tracing::warn!("Failed to persist runtime metadata for {}: {}", id, e);
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to serialize options for {}: {}", id, e),
             }
         }
 
@@ -1425,6 +1560,8 @@ impl DownloadEngine {
             choking_interval_secs: config.torrent.choking_interval_secs,
             enable_utp: config.torrent.utp.enabled
                 && config.torrent.utp.policy != crate::config::TransportPolicy::TcpOnly,
+            enable_endgame: config.torrent.enable_endgame,
+            allocation_mode: config.torrent.allocation_mode,
         }
     }
 
@@ -1440,20 +1577,10 @@ impl DownloadEngine {
         let torrent_config = self.build_torrent_runtime_config(&options);
         let (webseed_config, encryption_config, transport_policy, tcp_fallback) = {
             let config = self.config.read();
-            let encryption = if config.torrent.encryption.policy
-                == crate::config::EncryptionPolicy::Preferred
-                && config.torrent.encryption.allow_plaintext
-                && config.torrent.encryption.allow_rc4
-                && config.torrent.encryption.min_padding == 0
-                && config.torrent.encryption.max_padding == 512
-            {
-                crate::config::EncryptionConfig {
-                    policy: crate::config::EncryptionPolicy::Disabled,
-                    ..config.torrent.encryption.clone()
-                }
-            } else {
-                config.torrent.encryption.clone()
-            };
+            // Honor the configured policy as-is: the old special-case that
+            // silently rewrote a default "Preferred" config to "Disabled"
+            // meant the documented default was actually plaintext-only.
+            let encryption = config.torrent.encryption.clone();
             (
                 config.torrent.webseed.clone(),
                 encryption,
@@ -1472,6 +1599,27 @@ impl DownloadEngine {
         downloader.set_webseed_config(webseed_config);
         downloader.set_mse_config(encryption_config);
         downloader.set_transport_policy(transport_policy, tcp_fallback);
+        {
+            // All torrent traffic draws from the engine's global limiters,
+            // plus per-download limits when the options specify them.
+            let mut down = vec![Arc::clone(&self.global_download_limiter)];
+            if let Some(l) = options.max_download_speed.filter(|l| *l > 0) {
+                down.push(Arc::new(crate::limiter::RateLimiter::new(Some(l))));
+            }
+            let mut up = vec![Arc::clone(&self.global_upload_limiter)];
+            if let Some(l) = options.max_upload_speed.filter(|l| *l > 0) {
+                up.push(Arc::new(crate::limiter::RateLimiter::new(Some(l))));
+            }
+            downloader.set_rate_limiters(down, up);
+        }
+        // Restore lifetime transfer totals so seed-ratio decisions survive
+        // restarts.
+        if let Some((downloaded, uploaded)) = {
+            let mut downloads = self.downloads.write();
+            downloads.get_mut(&id).and_then(|d| d.restored_totals.take())
+        } {
+            downloader.set_transfer_totals(downloaded, uploaded);
+        }
 
         // Apply selected files for partial download
         if let Some(ref selected) = options.selected_files {
@@ -1485,11 +1633,21 @@ impl DownloadEngine {
 
         let downloader_clone = Arc::clone(&downloader);
         let engine = self.arc()?;
+        let priority_queue = Arc::clone(&self.priority_queue);
+        let priority = options.priority;
 
         // Update state
-        self.update_state(id, DownloadState::Connecting)?;
+        self.update_state(id, DownloadState::Queued)?;
 
         let task = tokio::spawn(async move {
+            // Torrents respect the same engine-wide concurrency limit and
+            // priority ordering as HTTP downloads. The permit is held for the
+            // life of the task (including seeding). If the task is aborted
+            // while still waiting here, cancel()/shutdown() clear the
+            // abandoned queue entry via priority_queue.remove(id).
+            let _permit = priority_queue.acquire(id, priority).await;
+            engine.update_state(id, DownloadState::Connecting)?;
+
             // Start the download (announces to trackers, verifies existing pieces)
             if let Err(e) = Arc::clone(&downloader_clone).start().await {
                 let error_msg = e.to_string();
@@ -1617,20 +1775,10 @@ impl DownloadEngine {
         let torrent_config = self.build_torrent_runtime_config(&options);
         let (webseed_config, encryption_config, transport_policy, tcp_fallback) = {
             let config = self.config.read();
-            let encryption = if config.torrent.encryption.policy
-                == crate::config::EncryptionPolicy::Preferred
-                && config.torrent.encryption.allow_plaintext
-                && config.torrent.encryption.allow_rc4
-                && config.torrent.encryption.min_padding == 0
-                && config.torrent.encryption.max_padding == 512
-            {
-                crate::config::EncryptionConfig {
-                    policy: crate::config::EncryptionPolicy::Disabled,
-                    ..config.torrent.encryption.clone()
-                }
-            } else {
-                config.torrent.encryption.clone()
-            };
+            // Honor the configured policy as-is: the old special-case that
+            // silently rewrote a default "Preferred" config to "Disabled"
+            // meant the documented default was actually plaintext-only.
+            let encryption = config.torrent.encryption.clone();
             (
                 config.torrent.webseed.clone(),
                 encryption,
@@ -1649,6 +1797,27 @@ impl DownloadEngine {
         downloader.set_webseed_config(webseed_config);
         downloader.set_mse_config(encryption_config);
         downloader.set_transport_policy(transport_policy, tcp_fallback);
+        {
+            // All torrent traffic draws from the engine's global limiters,
+            // plus per-download limits when the options specify them.
+            let mut down = vec![Arc::clone(&self.global_download_limiter)];
+            if let Some(l) = options.max_download_speed.filter(|l| *l > 0) {
+                down.push(Arc::new(crate::limiter::RateLimiter::new(Some(l))));
+            }
+            let mut up = vec![Arc::clone(&self.global_upload_limiter)];
+            if let Some(l) = options.max_upload_speed.filter(|l| *l > 0) {
+                up.push(Arc::new(crate::limiter::RateLimiter::new(Some(l))));
+            }
+            downloader.set_rate_limiters(down, up);
+        }
+        // Restore lifetime transfer totals so seed-ratio decisions survive
+        // restarts.
+        if let Some((downloaded, uploaded)) = {
+            let mut downloads = self.downloads.write();
+            downloads.get_mut(&id).and_then(|d| d.restored_totals.take())
+        } {
+            downloader.set_transfer_totals(downloaded, uploaded);
+        }
 
         if let Some(ref selected) = options.selected_files {
             downloader.set_selected_files(Some(selected));
@@ -1661,11 +1830,21 @@ impl DownloadEngine {
 
         let downloader_clone = Arc::clone(&downloader);
         let engine = self.arc()?;
+        let priority_queue = Arc::clone(&self.priority_queue);
+        let priority = options.priority;
 
         // Update state
-        self.update_state(id, DownloadState::Connecting)?;
+        self.update_state(id, DownloadState::Queued)?;
 
         let task = tokio::spawn(async move {
+            // Torrents respect the same engine-wide concurrency limit and
+            // priority ordering as HTTP downloads. The permit is held for the
+            // life of the task (including seeding). If the task is aborted
+            // while still waiting here, cancel()/shutdown() clear the
+            // abandoned queue entry via priority_queue.remove(id).
+            let _permit = priority_queue.acquire(id, priority).await;
+            engine.update_state(id, DownloadState::Connecting)?;
+
             // Start the download (announces to trackers)
             if let Err(e) = Arc::clone(&downloader_clone).start().await {
                 let error_msg = e.to_string();
@@ -1798,6 +1977,8 @@ impl DownloadEngine {
 
                 let progress = downloader.progress();
                 let metainfo = downloader.metainfo();
+                let torrent_state = downloader.state();
+                let mut state_change: Option<(DownloadState, DownloadState)> = None;
                 let (send_progress, persist_torrent_data) = {
                     let mut downloads = engine.downloads.write();
                     let download = match downloads.get_mut(&id) {
@@ -1810,6 +1991,16 @@ impl DownloadEngine {
                         DownloadState::Error { .. } | DownloadState::Completed
                     ) {
                         break;
+                    }
+
+                    // Surface seeding at the engine level: without this the
+                    // download reports "Downloading" for its entire seed life.
+                    if torrent_state == crate::torrent::TorrentState::Seeding
+                        && download.status.state == DownloadState::Downloading
+                    {
+                        download.status.state = DownloadState::Seeding;
+                        state_change =
+                            Some((DownloadState::Downloading, DownloadState::Seeding));
                     }
 
                     let mut needs_persist = false;
@@ -1849,6 +2040,14 @@ impl DownloadEngine {
                             }
                         }
                     }
+                }
+
+                if let Some((old_state, new_state)) = state_change {
+                    let _ = engine.event_tx.send(DownloadEvent::StateChanged {
+                        id,
+                        old_state,
+                        new_state,
+                    });
                 }
 
                 if send_progress {
@@ -1956,14 +2155,36 @@ impl DownloadEngine {
                 )
             };
 
+            // Seed the resume-validator cell with the values persisted by a
+            // previous session; the HTTP layer validates the partial file
+            // against them and replaces them with the server's current ones.
+            let validators_cell: Arc<RwLock<crate::http::ResumeValidators>> = {
+                let downloads = engine.downloads.read();
+                let saved = downloads
+                    .get(&id)
+                    .map(|d| crate::http::ResumeValidators {
+                        etag: d.status.metadata.etag.clone(),
+                        last_modified: d.status.metadata.last_modified.clone(),
+                    })
+                    .unwrap_or_default();
+                Arc::new(RwLock::new(saved))
+            };
+
             // Create progress callback
             let engine_clone = Arc::clone(&engine);
+            let validators_for_progress = Arc::clone(&validators_cell);
             let progress_callback = Arc::new(move |progress: DownloadProgress| {
                 // Update progress in download status
                 {
                     let mut downloads = engine_clone.downloads.write();
                     if let Some(download) = downloads.get_mut(&id) {
                         download.status.progress = progress.clone();
+                        // Keep the persisted metadata in sync with the
+                        // validators observed by the HTTP layer so the next
+                        // session can validate its resume.
+                        let v = validators_for_progress.read().clone();
+                        download.status.metadata.etag = v.etag;
+                        download.status.metadata.last_modified = v.last_modified;
                     }
                 }
                 // Emit progress event
@@ -1984,6 +2205,12 @@ impl DownloadEngine {
                     config.min_segment_size,
                 )
             };
+
+            // Per-download speed limit, layered on top of the global limiter
+            let per_download_limiter = options
+                .max_download_speed
+                .filter(|l| *l > 0)
+                .map(|l| Arc::new(crate::limiter::RateLimiter::new(Some(l))));
 
             // Perform the download (uses segmented if server supports it)
             let cookies_opt = if cookies.is_empty() {
@@ -2012,6 +2239,8 @@ impl DownloadEngine {
                         min_segment_size,
                         cancel_token_clone.clone(),
                         saved_segments.take(),
+                        Some(Arc::clone(&validators_cell)),
+                        per_download_limiter.clone(),
                         {
                             let progress_callback = Arc::clone(&progress_callback);
                             move |progress| progress_callback(progress)
@@ -2295,6 +2524,11 @@ impl DownloadEngine {
             #[cfg(not(feature = "torrent"))]
             let has_torrent_handle = false;
 
+            // Start from the download's original options (kept in memory and
+            // persisted across restarts) so resume keeps file selection,
+            // sequential mode, connection caps, and speed limits — then let
+            // the current metadata override the fields the engine mutates
+            // during a download's lifetime.
             let options = DownloadOptions {
                 priority: download.status.priority,
                 save_dir: Some(download.status.metadata.save_dir.clone()),
@@ -2309,7 +2543,7 @@ impl DownloadEngine {
                 },
                 checksum: download.status.metadata.checksum.clone(),
                 mirrors: download.status.metadata.mirrors.clone(),
-                ..Default::default()
+                ..download.options.clone().unwrap_or_default()
             };
 
             (
@@ -2475,12 +2709,24 @@ impl DownloadEngine {
                 }
                 #[cfg(feature = "torrent")]
                 DownloadHandle::Torrent(h) => {
-                    drop(h.downloader.stop());
+                    // Await stop() (bounded): it sets the shutdown flag,
+                    // aborts discovery tasks, and announces "stopped" —
+                    // dropping the future un-polled would run none of that.
+                    if tokio::time::timeout(std::time::Duration::from_secs(5), h.downloader.stop())
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("Torrent stop timed out during cancel");
+                    }
                     h.progress_task.abort();
                     h.task.abort();
                 }
             }
         }
+
+        // If the task was aborted while still waiting for a concurrency slot,
+        // its queue entry would otherwise sit at the head forever.
+        self.priority_queue.remove(id);
 
         // Delete files and segments if requested
         if let Some(path) = save_path {
@@ -2493,10 +2739,15 @@ impl DownloadEngine {
                     tokio::fs::remove_file(&path).await.ok();
                 }
             }
-            // Also try to remove partial file
-            let partial_path = path.with_extension("part");
-            if partial_path.exists() {
-                tokio::fs::remove_file(&partial_path).await.ok();
+            // Also try to remove the partial file, using the same naming
+            // scheme as the HTTP layer (`file.zip` -> `file.zip.part`);
+            // `with_extension` would target an unrelated `file.part`.
+            #[cfg(feature = "http")]
+            {
+                let partial_path = crate::http::partial_path_for(&path);
+                if partial_path.exists() {
+                    tokio::fs::remove_file(&partial_path).await.ok();
+                }
             }
         }
 
@@ -2795,6 +3046,13 @@ impl DownloadEngine {
 
     /// Graceful shutdown
     pub async fn shutdown(&self) -> Result<()> {
+        // Persist a final snapshot while download handles still exist:
+        // segment progress is only reachable through them, and the background
+        // persistence task's own shutdown save is not awaited by anyone.
+        if let Err(e) = self.persist_active_downloads().await {
+            tracing::warn!("Final persistence on shutdown failed: {}", e);
+        }
+
         // Signal shutdown
         self.shutdown.cancel();
 
@@ -2817,7 +3075,15 @@ impl DownloadEngine {
                 }
                 #[cfg(feature = "torrent")]
                 DownloadHandle::Torrent(h) => {
-                    drop(h.downloader.stop());
+                    // Await stop() (bounded): it sets the shutdown flag,
+                    // aborts discovery tasks, and announces "stopped" —
+                    // dropping the future un-polled would run none of that.
+                    if tokio::time::timeout(std::time::Duration::from_secs(5), h.downloader.stop())
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("Torrent stop timed out during shutdown");
+                    }
                     h.progress_task.abort();
                     // Wait for task to finish (with timeout)
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h.task).await;

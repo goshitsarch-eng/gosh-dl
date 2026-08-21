@@ -340,8 +340,12 @@ impl std::fmt::Display for TransportPolicy {
 /// uTP (Micro Transport Protocol) configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UtpConfigSettings {
-    /// Enable uTP transport
-    #[serde(default = "default_true")]
+    /// Enable uTP transport.
+    ///
+    /// The uTP stack is experimental and currently non-functional for real
+    /// data transfer; a config file that omits this key gets the same `false`
+    /// default as `UtpConfigSettings::default()`.
+    #[serde(default)]
     pub enabled: bool,
 
     /// Transport policy (prefer-utp, prefer-tcp, utp-only, tcp-only)
@@ -546,6 +550,15 @@ impl EngineConfig {
             return Err(EngineError::invalid_input(
                 "max_connections_per_download",
                 "Must be at least 1",
+            ));
+        }
+
+        // Segment-count math divides by this; zero would panic on any
+        // range-capable server.
+        if self.min_segment_size == 0 {
+            return Err(EngineError::invalid_input(
+                "min_segment_size",
+                "Must be at least 1 byte",
             ));
         }
 

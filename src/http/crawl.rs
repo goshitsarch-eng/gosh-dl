@@ -380,7 +380,7 @@ async fn fetch_discovery_response(
                 }
             }
 
-            let response = request.send().await?.error_for_status()?;
+            let mut response = request.send().await?.error_for_status()?;
             let final_url = response.url().clone();
             let content_type = response
                 .headers()
@@ -414,12 +414,17 @@ async fn fetch_discovery_response(
                 }
             }
 
-            let body = response.bytes().await?;
-            if body.len() > MAX_DISCOVERY_HTML_BYTES {
-                return Err(EngineError::ResourceLimit {
-                    resource: "recursive_html_bytes",
-                    limit: MAX_DISCOVERY_HTML_BYTES,
-                });
+            // Stream the body so a chunked (or lying) response cannot buffer
+            // more than the discovery HTML cap in memory.
+            let mut body: Vec<u8> = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if body.len() + chunk.len() > MAX_DISCOVERY_HTML_BYTES {
+                    return Err(EngineError::ResourceLimit {
+                        resource: "recursive_html_bytes",
+                        limit: MAX_DISCOVERY_HTML_BYTES,
+                    });
+                }
+                body.extend_from_slice(&chunk);
             }
 
             Ok(DiscoveryResponse {
@@ -463,12 +468,13 @@ pub(crate) async fn discover(
     let mut queue = VecDeque::from([(parsed_url.clone(), 0usize)]);
     let mut visited_pages = HashSet::new();
     let mut discovered: BTreeMap<String, RecursiveEntry> = BTreeMap::new();
+    let mut pages_truncated = false;
     // Fetches run with bounded concurrency; responses are processed (and new
     // pages enqueued) one at a time on this task, so manifest construction
     // stays deterministic. On error the unfinished fetches are dropped.
     let mut in_flight = FuturesUnordered::new();
 
-    loop {
+    'crawl: loop {
         // Fill available fetch slots from the BFS queue.
         while in_flight.len() < recursive.max_discovery_concurrency {
             let Some((current_url, depth)) = queue.pop_front() else {
@@ -480,22 +486,34 @@ pub(crate) async fn discover(
             }
 
             if visited_pages.len() > MAX_DISCOVERED_PAGES {
-                return Err(EngineError::ResourceLimit {
-                    resource: "recursive_pages",
-                    limit: MAX_DISCOVERED_PAGES,
-                });
+                tracing::warn!(
+                    "Recursive discovery reached the page limit ({}); results are truncated",
+                    MAX_DISCOVERED_PAGES
+                );
+                pages_truncated = true;
+                queue.clear();
+                break;
             }
 
             in_flight.push(async move {
                 let response = fetch_discovery_response(http, &current_url, options).await;
-                (depth, response)
+                (current_url, depth, response)
             });
         }
 
-        let Some((depth, response)) = in_flight.next().await else {
+        let Some((current_url, depth, response)) = in_flight.next().await else {
             break; // queue drained and no fetches in flight
         };
-        let response = response?;
+        let response = match response {
+            Ok(response) => response,
+            // A dead root is a real error; a failing nested page only loses
+            // its own subtree, so log it and keep crawling.
+            Err(err) if depth == 0 => return Err(err),
+            Err(err) => {
+                tracing::warn!("Skipping recursive discovery page {}: {}", current_url, err);
+                continue;
+            }
+        };
 
         if !is_url_in_scope(&response.final_url, &parsed_url, recursive, depth) {
             return Err(EngineError::invalid_input(
@@ -523,7 +541,12 @@ pub(crate) async fn discover(
                 }
 
                 if normalized.path().ends_with('/') {
-                    if !visited_pages.contains(normalized.as_str()) {
+                    // Autoindex sort links (`?C=N;O=D`, ...) address the same
+                    // directory page, so strip the query before dedup/enqueue.
+                    // File URLs keep their query: it may be load-bearing.
+                    let mut normalized = normalized;
+                    normalized.set_query(None);
+                    if !pages_truncated && !visited_pages.contains(normalized.as_str()) {
                         queue.push_back((normalized, depth + 1));
                     }
                     continue;
@@ -533,6 +556,15 @@ pub(crate) async fn discover(
                 if !path_is_selected(&relative_path, recursive) {
                     continue;
                 }
+
+                if discovered.len() >= MAX_DISCOVERED_FILES {
+                    tracing::warn!(
+                        "Recursive discovery reached the file limit ({}); results are truncated",
+                        MAX_DISCOVERED_FILES
+                    );
+                    break 'crawl;
+                }
+
                 insert_entry(
                     &mut discovered,
                     RecursiveEntry {
@@ -542,19 +574,21 @@ pub(crate) async fn discover(
                     },
                     recursive,
                 )?;
-
-                if discovered.len() > MAX_DISCOVERED_FILES {
-                    return Err(EngineError::ResourceLimit {
-                        resource: "recursive_files",
-                        limit: MAX_DISCOVERED_FILES,
-                    });
-                }
             }
         } else {
             let relative_path = build_relative_path(&response.final_url, &parsed_url, recursive)?;
             if !path_is_selected(&relative_path, recursive) {
                 continue;
             }
+
+            if discovered.len() >= MAX_DISCOVERED_FILES {
+                tracing::warn!(
+                    "Recursive discovery reached the file limit ({}); results are truncated",
+                    MAX_DISCOVERED_FILES
+                );
+                break 'crawl;
+            }
+
             insert_entry(
                 &mut discovered,
                 RecursiveEntry {
@@ -577,17 +611,18 @@ pub(crate) async fn discover(
 mod tests {
     use super::{
         build_relative_path, insert_entry, is_url_in_scope, normalize_path, normalize_url,
-        normalized_scope_prefix, path_is_selected, pattern_matches,
+        normalized_scope_prefix, path_is_selected, pattern_matches, MAX_DISCOVERED_FILES,
+        MAX_DISCOVERED_PAGES,
     };
     use crate::types::RecursiveOptions;
     use crate::{DownloadEngine, DownloadOptions, EngineConfig, EngineError, RecursiveEntry};
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::time::timeout;
     use url::Url;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -1160,5 +1195,295 @@ mod tests {
             .map(|entry| entry.relative_path.to_string_lossy().to_string())
             .collect();
         assert_eq!(paths, vec!["releases/notes.txt"]);
+    }
+
+    #[tokio::test]
+    async fn discover_strips_autoindex_queries_from_directory_links() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_engine(&temp_dir).await;
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/pub/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(
+                        r#"
+                        <html><body>
+                            <a href="?C=N;O=D">Name</a>
+                            <a href="?C=M;O=A">Last modified</a>
+                            <a href="?C=S;O=A">Size</a>
+                            <a href="releases/">releases/</a>
+                            <a href="releases/?C=N;O=D">releases sorted</a>
+                            <a href="report.bin?version=2">report.bin</a>
+                        </body></html>
+                        "#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/pub/releases/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(
+                        r#"
+                        <html><body>
+                            <a href="?C=M;O=D">Last modified</a>
+                            <a href="app.tar.gz">app.tar.gz</a>
+                        </body></html>
+                        "#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let manifest = engine
+            .discover_http_recursive(
+                &format!("{}/pub/", server.uri()),
+                &DownloadOptions::default(),
+                &RecursiveOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let paths: Vec<_> = manifest
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(paths, vec!["releases/app.tar.gz", "report.bin"]);
+
+        // File URLs keep their query string; it may be load-bearing.
+        let report = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == Path::new("report.bin"))
+            .unwrap();
+        assert!(
+            report.url.ends_with("/pub/report.bin?version=2"),
+            "unexpected file URL: {}",
+            report.url
+        );
+
+        // MockServer verifies the .expect(1) counters on drop: each directory
+        // page is fetched exactly once despite the sort-link variants.
+    }
+
+    #[tokio::test]
+    async fn discover_truncates_at_page_limit() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_engine(&temp_dir).await;
+        let server = MockServer::start().await;
+
+        let dir_count = MAX_DISCOVERED_PAGES + 100;
+        let root_body = (0..dir_count)
+            .map(|idx| format!(r#"<a href="d{idx}/">d{idx}/</a>"#))
+            .collect::<String>();
+
+        Mock::given(method("GET"))
+            .and(path("/pub/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(format!("<html><body>{root_body}</body></html>")),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/pub/d\d+/$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(
+                        r#"<html><body><a href="file.bin">file.bin</a></body></html>"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let manifest = engine
+            .discover_http_recursive(
+                &format!("{}/pub/", server.uri()),
+                &DownloadOptions::default(),
+                &RecursiveOptions {
+                    max_discovery_concurrency: 1,
+                    ..RecursiveOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The root page plus MAX_DISCOVERED_PAGES - 1 directory pages are
+        // fetched before the limit stops the crawl; each directory
+        // contributes one file to the truncated manifest.
+        assert_eq!(manifest.entries.len(), MAX_DISCOVERED_PAGES - 1);
+    }
+
+    #[tokio::test]
+    async fn discover_truncates_at_file_limit() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_engine(&temp_dir).await;
+        let server = MockServer::start().await;
+
+        let file_count = MAX_DISCOVERED_FILES + 50;
+        let body = (0..file_count)
+            .map(|idx| format!(r#"<a href="f{idx:05}.bin">f{idx:05}.bin</a>"#))
+            .collect::<String>();
+
+        Mock::given(method("GET"))
+            .and(path("/pub/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(format!("<html><body>{body}</body></html>")),
+            )
+            .mount(&server)
+            .await;
+
+        let manifest = engine
+            .discover_http_recursive(
+                &format!("{}/pub/", server.uri()),
+                &DownloadOptions::default(),
+                &RecursiveOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manifest.entries.len(), MAX_DISCOVERED_FILES);
+    }
+
+    #[tokio::test]
+    async fn discover_skips_pages_that_fail_to_fetch() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_engine(&temp_dir).await;
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/pub/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(
+                        r#"
+                        <html><body>
+                            <a href="broken/">broken/</a>
+                            <a href="good/">good/</a>
+                            <a href="top.txt">top.txt</a>
+                        </body></html>
+                        "#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        // "/pub/broken/" has no mock and returns 404; the crawl should keep
+        // the rest of the discovery instead of aborting.
+        Mock::given(method("GET"))
+            .and(path("/pub/good/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(
+                        r#"<html><body><a href="file.bin">file.bin</a></body></html>"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let manifest = engine
+            .discover_http_recursive(
+                &format!("{}/pub/", server.uri()),
+                &DownloadOptions::default(),
+                &RecursiveOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let paths: Vec<_> = manifest
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(paths, vec!["good/file.bin", "top.txt"]);
+    }
+
+    #[tokio::test]
+    async fn discover_fails_when_root_fetch_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_engine(&temp_dir).await;
+        let server = MockServer::start().await;
+
+        // No mock for the root: wiremock answers 404.
+        let err = engine
+            .discover_http_recursive(
+                &format!("{}/pub/", server.uri()),
+                &DownloadOptions::default(),
+                &RecursiveOptions::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, EngineError::Network { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_skips_oversized_nested_page() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_engine(&temp_dir).await;
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/pub/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(
+                        r#"
+                        <html><body>
+                            <a href="huge/">huge/</a>
+                            <a href="ok.txt">ok.txt</a>
+                        </body></html>
+                        "#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let oversized = "x".repeat(super::MAX_DISCOVERY_HTML_BYTES + 1);
+        Mock::given(method("GET"))
+            .and(path("/pub/huge/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(oversized),
+            )
+            .mount(&server)
+            .await;
+
+        let manifest = engine
+            .discover_http_recursive(
+                &format!("{}/pub/", server.uri()),
+                &DownloadOptions::default(),
+                &RecursiveOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let paths: Vec<_> = manifest
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(paths, vec!["ok.txt"]);
     }
 }

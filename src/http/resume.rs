@@ -19,6 +19,38 @@ pub struct RangedResponseContext<'a> {
     pub response_last_modified: Option<&'a str>,
 }
 
+/// Server-provided validators for a downloaded resource, used to detect that
+/// the remote file changed between sessions before resuming a partial file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeValidators {
+    /// ETag from the last successful probe/response
+    pub etag: Option<String>,
+    /// Last-Modified from the last successful probe/response
+    pub last_modified: Option<String>,
+}
+
+/// Compare saved validators against the server's current ones.
+///
+/// A saved validator that is now missing or different means the partial file
+/// may belong to an older version of the resource and must not be resumed.
+/// With no saved validators there is nothing to compare, so resume is allowed
+/// (matching single-session behavior).
+pub fn validators_match(saved: &ResumeValidators, current: &ResumeValidators) -> bool {
+    let etag_valid = match (&saved.etag, &current.etag) {
+        (Some(saved), Some(current)) => saved == current,
+        (Some(_), None) => false, // Had ETag, now missing
+        (None, _) => true,        // Didn't have ETag, can't validate
+    };
+
+    let last_modified_valid = match (&saved.last_modified, &current.last_modified) {
+        (Some(saved), Some(current)) => saved == current,
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+
+    etag_valid && last_modified_valid
+}
+
 /// Information about resume capability
 #[derive(Debug, Clone)]
 pub struct ResumeInfo {
@@ -109,20 +141,16 @@ pub async fn check_resume(
         false
     } else {
         // Validate ETag or Last-Modified if we have saved values
-        let etag_valid = match (saved_etag, &etag) {
-            (Some(saved), Some(current)) => saved == current,
-            (Some(_), None) => false, // Had ETag, now missing
-            (None, _) => true,        // Didn't have ETag, can't validate
-        };
-
-        let last_modified_valid = match (saved_last_modified, &last_modified) {
-            (Some(saved), Some(current)) => saved == current,
-            (Some(_), None) => false,
-            (None, _) => true,
-        };
-
-        // Must pass both validations
-        etag_valid && last_modified_valid
+        validators_match(
+            &ResumeValidators {
+                etag: saved_etag.map(String::from),
+                last_modified: saved_last_modified.map(String::from),
+            },
+            &ResumeValidators {
+                etag: etag.clone(),
+                last_modified: last_modified.clone(),
+            },
+        )
     };
 
     Ok(ResumeInfo {

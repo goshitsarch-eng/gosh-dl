@@ -234,6 +234,12 @@ fn parse_btih(xt: &str) -> Option<Sha1Hash> {
     // Format: urn:btih:<hash>
     let hash_str = xt.strip_prefix("urn:btih:")?;
 
+    // Valid hashes are ASCII hex/base32; multi-byte UTF-8 would panic the
+    // byte-indexed slicing below (found by fuzz_magnet).
+    if !hash_str.is_ascii() {
+        return None;
+    }
+
     match hash_str.len() {
         // 40-char hex encoding
         40 => {

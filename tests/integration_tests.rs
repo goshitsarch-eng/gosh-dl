@@ -3538,14 +3538,23 @@ async fn test_cancel_all() {
     );
     assert!(engine.list().is_empty(), "No downloads should remain");
 
-    for id in ids {
+    // cancel_all iterates a HashMap, so Removed events arrive in arbitrary
+    // order; waiting for them in insertion order would skip (and consume) the
+    // other download's event and then time out.
+    let mut remaining: std::collections::HashSet<_> = ids.iter().copied().collect();
+    while !remaining.is_empty() {
         let removed = wait_for_event(
             &mut events,
-            |e| matches!(e, DownloadEvent::Removed { id: eid } if *eid == id),
+            |e| matches!(e, DownloadEvent::Removed { id } if remaining.contains(id)),
             Duration::from_secs(2),
         )
         .await;
-        assert!(removed.is_some(), "Should receive Removed event for {}", id);
+        match removed {
+            Some(DownloadEvent::Removed { id }) => {
+                remaining.remove(&id);
+            }
+            _ => panic!("Should receive Removed events for {:?}", remaining),
+        }
     }
 
     engine.shutdown().await.ok();
@@ -3814,6 +3823,211 @@ async fn test_with_storage_file_storage_resume_across_engines() {
     )
     .await
     .expect("Resumed download should complete");
+
+    engine.shutdown().await.ok();
+}
+
+/// Cross-restart resume validation: a partial file left by a previous session
+/// must be discarded when the remote file's validators changed, even though
+/// If-Range against a fresh probe would happily resume it.
+#[cfg(feature = "storage")]
+#[tokio::test]
+async fn test_cross_restart_resume_discards_partial_when_etag_changed() {
+    use gosh_dl::{DownloadId, DownloadKind, DownloadMetadata, DownloadStatus};
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    let old_content: Vec<u8> = (0..4096).map(|i| (i % 211) as u8).collect();
+    let new_content: Vec<u8> = (0..4096).map(|i| (i % 223) as u8).collect();
+
+    // Simulate a previous session: a partial file holding OLD content...
+    let part_path = temp_dir.path().join("cross-restart.bin.part");
+    tokio::fs::write(&part_path, &old_content[..1024])
+        .await
+        .expect("Failed to seed partial file");
+
+    // ...and a persisted Paused download whose metadata recorded the OLD ETag.
+    let id = DownloadId::new();
+    let url = format!("{}/cross-restart.bin", mock_server.uri());
+    let db_path = temp_dir.path().join("cross-restart.sqlite");
+    {
+        let storage = SqliteStorage::new(&db_path)
+            .await
+            .expect("Failed to create storage");
+        let status = DownloadStatus {
+            id,
+            kind: DownloadKind::Http,
+            state: DownloadState::Paused,
+            priority: Default::default(),
+            progress: DownloadProgress {
+                total_size: Some(old_content.len() as u64),
+                completed_size: 1024,
+                ..Default::default()
+            },
+            metadata: DownloadMetadata {
+                name: "cross-restart.bin".to_string(),
+                url: Some(url.clone()),
+                magnet_uri: None,
+                info_hash: None,
+                save_dir: temp_dir.path().to_path_buf(),
+                filename: Some("cross-restart.bin".to_string()),
+                user_agent: None,
+                referer: None,
+                headers: Vec::new(),
+                cookies: Vec::new(),
+                checksum: None,
+                mirrors: Vec::new(),
+                etag: Some("\"old-etag-v1\"".to_string()),
+                last_modified: None,
+            },
+            torrent_info: None,
+            peers: None,
+            created_at: chrono::Utc::now(),
+            completed_at: None,
+        };
+        storage
+            .save_download(&status)
+            .await
+            .expect("Failed to persist previous-session state");
+    }
+
+    // The server now serves NEW content under a NEW ETag. A ranged request
+    // gets an obliging 206 — this is the dangerous case: without saved-ETag
+    // validation, the old partial bytes would be silently kept.
+    Mock::given(method("HEAD"))
+        .and(path("/cross-restart.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", new_content.len().to_string())
+                .insert_header("Accept-Ranges", "bytes")
+                .insert_header("ETag", "\"new-etag-v2\""),
+        )
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/cross-restart.bin"))
+        .and(header("Range", "bytes=1024-"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header(
+                    "Content-Range",
+                    format!("bytes 1024-4095/{}", new_content.len()),
+                )
+                .insert_header("Content-Length", "3072")
+                .insert_header("ETag", "\"new-etag-v2\"")
+                .set_body_bytes(new_content[1024..].to_vec()),
+        )
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/cross-restart.bin"))
+        .and(MissingHeaderMatcher("range"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", new_content.len().to_string())
+                .insert_header("ETag", "\"new-etag-v2\"")
+                .set_body_bytes(new_content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    // "Restart": a fresh engine on the same database restores the download.
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        database_path: Some(db_path),
+        max_connections_per_download: 1,
+        min_segment_size: 1024 * 1024,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let mut events = engine.subscribe();
+
+    engine.resume(id).await.expect("Failed to resume");
+
+    let completed = wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Completed { id: eid } if *eid == id),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(completed.is_some(), "Resumed download should complete");
+
+    let downloaded = tokio::fs::read(temp_dir.path().join("cross-restart.bin"))
+        .await
+        .expect("Failed to read downloaded file");
+    assert_eq!(
+        downloaded, new_content,
+        "File must be entirely new content — old partial bytes must not survive an ETag change"
+    );
+
+    engine.shutdown().await.ok();
+}
+
+/// The global download limit must actually throttle transfers — it used to
+/// be enforced only on paths most downloads never took.
+#[tokio::test]
+async fn test_global_download_limit_throttles() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let mock_server = MockServer::start().await;
+
+    // 96 KiB at 32 KiB/s: ~32 KiB burst + 64 KiB at rate = at least ~2s.
+    let content: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+    Mock::given(method("GET"))
+        .and(path("/limited.bin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Length", content.len().to_string())
+                .set_body_bytes(content.clone()),
+        )
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path("/limited.bin"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", content.len().to_string()),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let config = EngineConfig {
+        download_dir: temp_dir.path().to_path_buf(),
+        global_download_limit: Some(32 * 1024),
+        min_segment_size: 1024 * 1024,
+        ..Default::default()
+    };
+    let engine = DownloadEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let mut events = engine.subscribe();
+
+    let url = format!("{}/limited.bin", mock_server.uri());
+    let start = std::time::Instant::now();
+    let id = engine
+        .add_http(&url, DownloadOptions::default())
+        .await
+        .expect("Failed to add download");
+
+    let completed = wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Completed { id: eid } if *eid == id),
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(completed.is_some(), "Throttled download should complete");
+
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1200),
+        "96 KiB at 32 KiB/s finished suspiciously fast ({elapsed:?}) — limiter not enforced"
+    );
+
+    let downloaded = tokio::fs::read(temp_dir.path().join("limited.bin"))
+        .await
+        .expect("Failed to read downloaded file");
+    assert_eq!(downloaded, content);
 
     engine.shutdown().await.ok();
 }

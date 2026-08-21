@@ -64,3 +64,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - run: rm Cargo.lock && cargo check --all-features
+
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Run each fuzz target briefly
+        run: |
+          for target in fuzz_bencode fuzz_metainfo fuzz_magnet fuzz_content_disposition; do
+            cargo fuzz run "$target" -- -max_total_time=45 -rss_limit_mb=4096
+          done
