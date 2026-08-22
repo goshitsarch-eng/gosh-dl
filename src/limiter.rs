@@ -58,7 +58,7 @@ impl RateLimiter {
     }
 
     /// Replace the limit. `None` or `Some(0)` means unlimited. Takes effect
-    /// for acquires from now on; sleepers re-check within [`MAX_SLEEP`].
+    /// for acquires from now on; sleepers re-check within `MAX_SLEEP` (500ms).
     pub fn set_limit(&self, limit: Option<u64>) {
         let rate = normalize(limit);
         let mut inner = self.inner.lock();

@@ -96,7 +96,7 @@ impl Segment {
 /// to keep download metadata in an application's own database.
 ///
 /// Annotate implementations with the re-exported
-/// [`#[async_trait]`](async_trait) attribute. The runtime-metadata methods
+/// [`#[async_trait]`](macro@async_trait) attribute. The runtime-metadata methods
 /// and (under the `recursive-http` feature, which also adds `uuid` to the
 /// trait surface) the recursive-job methods have no-op defaults; everything
 /// else is required.

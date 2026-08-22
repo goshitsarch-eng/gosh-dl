@@ -88,15 +88,16 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-dl = "0.5"
+gosh-dl = "0.6"
 tokio = { version = "1", features = ["full"] }
 ```
 
-To enable recursive HTTP directory mirroring:
+Optional features: `recursive-http` (directory mirroring) and `metalink`
+(RFC 5854 `.meta4` documents). To enable recursive HTTP directory mirroring:
 
 ```toml
 [dependencies]
-gosh-dl = { version = "0.5", features = ["recursive-http"] }
+gosh-dl = { version = "0.6", features = ["recursive-http"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -165,6 +166,42 @@ let stopped = engine.stopped();
 let stats = engine.global_stats();
 ```
 
+### Streaming Reads
+
+Read a download's bytes while it is still in flight — for torrents, the read
+position feeds back into piece selection so the swarm fetches what the reader
+needs next:
+
+```rust
+use tokio::io::AsyncReadExt;
+
+let mut reader = engine.open_reader(id, 0)?;
+let mut buf = [0u8; 64 * 1024];
+loop {
+    let n = reader.read(&mut buf).await?;
+    if n == 0 { break; } // download fully read (or gone)
+    // feed a media player, hash incrementally, ...
+}
+```
+
+### Verify & Repair
+
+```rust
+let report = engine.verify(id).await?;   // checksum (HTTP) or piece re-hash (torrent)
+if !report.valid {
+    engine.repair(id).await?;            // re-download what's bad
+}
+```
+
+### Metalink
+
+With the `metalink` feature enabled, RFC 5854 `.meta4` documents expand into
+downloads wired with their mirrors and checksums:
+
+```rust
+let ids = engine.add_metalink_file("release.meta4".as_ref(), DownloadOptions::default()).await?;
+```
+
 With `recursive-http` enabled:
 
 ```rust
@@ -217,6 +254,7 @@ let options = DownloadOptions {
     mirrors: vec!["https://mirror1.example.com/file.zip".to_string()],
     max_connections: Some(8),
     max_download_speed: Some(5 * 1024 * 1024), // 5 MB/s
+    max_upload_speed: Some(1024 * 1024), // 1 MB/s (torrents)
     // Torrent-specific
     selected_files: Some(vec![0, 2, 5]), // Download only specific files
     sequential: Some(true), // For streaming playback

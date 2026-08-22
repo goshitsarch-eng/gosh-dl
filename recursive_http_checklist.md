@@ -16,10 +16,17 @@ Completed:
 
 Still open:
 
-- Milestone 4.4: fuzz coverage
+- Milestone 4.4: fuzz coverage for the crawler (the crate's other fuzz targets run in CI since 0.6.0)
 - Milestone 5.2: CLI support in `gosh-dl-cli`
 - Milestone 6.3: extended mirroring behavior
 - persisted parent-level event/progress history and resumable discovery cursors
+
+Robustness improvements landed in 0.6.0 (outside the original milestones):
+autoindex sort-link queries are stripped so directory pages are fetched once,
+page/file limits truncate the manifest with a warning instead of failing the
+whole discovery, a single failed page fetch is skipped rather than fatal
+(a dead root is still an error), and HTML bodies stream against the size cap
+instead of buffering fully.
 
 ## Working Rules
 

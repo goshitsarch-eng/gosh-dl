@@ -7,6 +7,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-22
+
+This release closes out a full audit of the engine: every feature the README
+advertises is now implemented, wired, and tested. It contains security fixes;
+upgrading is recommended for all users.
+
+### Security
+- Server-supplied filenames (Content-Disposition, percent-decoded URL
+  segments) are now validated on the segmented download path too — a
+  malicious range-capable server could previously write outside `save_dir`
+  via `..%2F` traversal
+- Bencode parsing is depth-limited (untrusted tracker/peer input could
+  overflow the stack) and peer-claimed metadata sizes are bounded (one
+  malicious `ut_metadata` message could drive unbounded allocations)
+- Fixed panics on untrusted input: multi-byte UTF-8 in magnet info-hashes
+  (found by fuzzing) and in GID strings; out-of-range metadata piece indices
+  no longer wedge metadata assembly
+- UDP tracker responses are verified against the transaction ID before any
+  parsing, so stale or forged datagrams can no longer fail an announce
+- Fuzz targets (bencode, metainfo, magnet, Content-Disposition) now run in CI
+
+### Added
+- **Streaming read API**: `DownloadEngine::open_reader(id, offset)` returns a
+  `DownloadReader` implementing `AsyncRead` that yields bytes as they land on
+  disk. For torrents, the read position feeds piece selection so the swarm
+  fetches what the reader needs next
+- **Verify & repair**: `DownloadEngine::verify(id)` re-checks on-disk data
+  (checksum for HTTP, full piece re-hash for torrents); `repair(id)`
+  re-downloads whatever failed
+- **Metalink (RFC 5854)** behind the new `metalink` feature:
+  `add_metalink()` / `add_metalink_file()` expand `.meta4` documents into
+  downloads wired with mirrors and checksums
+- **Mirror segment striping**: segmented downloads assign each segment a
+  mirror round-robin with per-URL health tracking; mirrors are cross-checked
+  by Content-Range total, and only the primary URL carries If-Range validators
+- **Inbound peer connections**: each torrent binds a TCP listener on
+  `listen_port_range` (walking the range; port 0 = OS-assigned) and serves
+  inbound peers — the advertised port finally accepts connections
+- **Unified rate limiting**: a debt-based token-bucket limiter
+  (`gosh_dl::RateLimiter`) shared by segmented HTTP, single-stream HTTP,
+  torrent peers, and webseeds; per-download `max_download_speed` /
+  `max_upload_speed` now work for both protocols, and limits below 16 KiB/s
+  are enforced
+- **Cross-restart resume validation**: ETag/Last-Modified are persisted and
+  checked before resuming a partial file; a changed remote file restarts from
+  zero instead of silently merging two versions
+- Torrent lifetime transfer totals persist across restarts, so seed-ratio
+  decisions survive a restart (and no longer divide by zero on resumed
+  complete torrents)
+- Engine-level `Seeding` state is now reported with a `StateChanged` event
+- `TorrentDownloader::bound_listen_port()` and `utp_listen_port()` accessors
+
+### Changed
+- **uTP transport rebuilt** (BEP 29): per-socket driver task (ACKs,
+  retransmission, LEDBAT delay feedback), spec-correct connection IDs,
+  SYN-ACK sequence handling, selective-ACK processing, inbound uTP
+  acceptance, and tuning config that actually reaches the stack. Covered by
+  loopback, packet-loss, and full-torrent-transfer tests; still opt-in
+- Torrents now respect `max_concurrent_downloads` and priority ordering
+  (previously HTTP-only)
+- Peers now receive keep-alives; idle peers are disconnected only after 150s
+  of true silence instead of 30s; choking decisions apply on idle ticks too
+- Periodic tracker re-announce honoring the announce interval; failed peers
+  back off exponentially (60s doubling, 15min cap); paused torrents stop
+  dialing peers
+- Rarest-first piece selection is live (availability tracked from
+  bitfield/have messages and decremented on disconnect); requested blocks are
+  marked so peers no longer all fetch the same blocks; endgame duplicates are
+  cancelled on receipt and `enable_endgame` is honored
+- The default encryption policy is honored as configured — a default
+  "Preferred" config was previously rewritten to "Disabled"; the MSE
+  initiator now handles responder PadB (mainstream clients no longer fail
+  with "Invalid VC"), and `Allowed` attempts MSE with plaintext fallback
+- `DownloadOptions` persist across restarts, so resume keeps file selection,
+  sequential mode, connection caps, and speed limits; restored `Queued`
+  downloads auto-start
+- Recursive discovery: autoindex sort links no longer multiply crawls, page
+  and file limits truncate (with a warning) instead of discarding all
+  progress, one failed page no longer aborts discovery, and HTML bodies are
+  streamed against the size cap
+- WebSeeds: BEP 17 vs BEP 19 seeds are typed correctly, BEP 19 URLs include
+  the torrent-name directory, and webseed tasks stop on `stop()`
+- UDP tracker announces follow a scaled-down BEP 15 retry schedule
+  (5s/10s/20s) with 60s connection-ID reuse; WebTorrent (WSS) announces use
+  binary-string encoding as the protocol requires
+- File preallocation (`allocation_mode`) is wired and runs before torrent
+  verification; `choking_interval_secs` below 10s is honored
+- `governor` dependency replaced by the built-in rate limiter
+
+### Fixed
+- Segmented download retries re-measure the partial file each attempt instead
+  of appending range bytes at a stale offset (silent corruption); reopened
+  partials are truncated to the expected size; saved segments are discarded
+  when the partial file is missing (zero-filled holes) or the remote file
+  changed
+- Three priority-queue races that could permanently wedge the queue (lost
+  wakeup, pop-wrong-entry, permit released after notification)
+- `cancel()`/`shutdown()` dropped the torrent `stop()` future un-polled, so
+  shutdown never ran and peer tasks kept downloading; shutdown now persists a
+  final snapshot including segment state
+- The engine's background tasks held strong self-references, making `Drop`
+  unreachable; they now hold weak references
+- Pausing a segmented download no longer surfaces as a fatal "size mismatch"
+  error that also churned mirror failover
+- Torrent piece re-verification clears stale bits, so corruption after the
+  initial check is detected (verify/repair depends on this)
+- SQLite migrations run in a transaction (a crash mid-migration previously
+  disabled persistence forever, silently); a configured-but-broken database
+  is now a hard error instead of a silent no-persistence downgrade
+- The SQLite upsert covers all mutable columns (resolved magnet names were
+  never persisted); `save_torrent_data`/`save_runtime_metadata` return
+  `NotFound` instead of silently doing nothing
+- `FileStorage` fsyncs before rename (torn records on power loss);
+  `compact()` no longer races in-flight writes; `MemoryStorage::delete_download`
+  removes torrent data
+- Cancel-with-delete removes the correctly-named partial file
+  (`file.zip.part`, not `file.part`)
+- Segmented downloads report aggregate speed instead of one connection's rate
+- `min_segment_size: 0` is rejected by config validation (division by zero);
+  the uTP `enabled` serde default matches `Default` (a config file omitting
+  the key no longer silently enabled uTP)
+
 ## [0.5.0] - 2026-06-09
 
 ### Added
@@ -291,7 +413,9 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.0...v0.3.1

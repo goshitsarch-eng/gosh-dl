@@ -36,6 +36,8 @@ src/
 ├── config.rs              # EngineConfig and sub-configs
 ├── priority_queue.rs      # Priority-based download scheduling
 ├── scheduler.rs           # Time-based bandwidth scheduling
+├── limiter.rs             # Debt-based byte-rate limiter (all transfer paths)
+├── metalink.rs            # Metalink RFC 5854 parsing + engine API (feature-gated)
 │
 ├── protocol/              # Boundary types (engine ↔ consumer)
 │   ├── mod.rs             # Re-exports all protocol types
@@ -84,6 +86,7 @@ src/
 │
 └── storage/               # Persistence layer
     ├── mod.rs             # Storage trait + MemoryStorage
+    ├── file.rs            # FileStorage (JSON sidecar files)
     └── sqlite.rs          # SQLite backend
 ```
 
@@ -172,10 +175,27 @@ impl DownloadEngine {
     #[cfg(feature = "recursive-http")]
     pub async fn remove_recursive_job(&self, id: Uuid, delete_files: bool) -> Result<()>;
 
+    #[cfg(feature = "metalink")]
+    pub async fn add_metalink(&self, xml: &[u8], opts: DownloadOptions) -> Result<Vec<DownloadId>>;
+    #[cfg(feature = "metalink")]
+    pub async fn add_metalink_file(&self, path: &Path, opts: DownloadOptions) -> Result<Vec<DownloadId>>;
+
     // Control
     pub async fn pause(&self, id: DownloadId) -> Result<()>;
     pub async fn resume(&self, id: DownloadId) -> Result<()>;
     pub async fn cancel(&self, id: DownloadId, delete_files: bool) -> Result<()>;
+    pub async fn pause_all(&self) -> BatchResult;
+    pub async fn resume_all(&self) -> BatchResult;
+    pub async fn cancel_all(&self, delete_files: bool) -> BatchResult;
+
+    // Streaming: AsyncRead over an in-progress download. For torrents the
+    // read position feeds piece selection so the reader is served first.
+    pub fn open_reader(&self, id: DownloadId, offset: u64) -> Result<DownloadReader>;
+
+    // Data integrity: re-check on-disk data (checksum for HTTP, per-piece
+    // re-hash for torrents) and re-download whatever fails.
+    pub async fn verify(&self, id: DownloadId) -> Result<VerifyReport>;
+    pub async fn repair(&self, id: DownloadId) -> Result<VerifyReport>;
 
     // Priority
     pub fn set_priority(&self, id: DownloadId, priority: DownloadPriority) -> Result<()>;
@@ -456,13 +476,16 @@ pub fn calculate_segment_count(total_size: u64, max_connections: usize, min_segm
 ### Download Flow
 
 ```
-HEAD Request → Content-Length, Accept-Ranges, ETag
+HEAD Request → Content-Length, Accept-Ranges, ETag/Last-Modified
+    ↓
+Validate saved ETag/Last-Modified against the probe (cross-restart resume)
     ↓
 Calculate Segments (e.g., 100MB ÷ 16 = 6.25MB each)
     ↓
-Spawn N tasks with Range headers
+Spawn N tasks with Range headers (striped across mirrors when configured)
     ↓
-Each task writes to correct file offset via seek
+Each task writes to correct file offset via seek, drawing from the
+global + per-download rate limiters per chunk
     ↓
 Aggregate progress from all segments
     ↓
@@ -470,6 +493,9 @@ Verify checksum (if provided)
     ↓
 Rename .part file on completion
 ```
+
+The probe's validators are published back to the engine and persisted, so the
+next session can validate its resume against them.
 
 ### Resume Detection
 
@@ -489,21 +515,34 @@ pub async fn check_resume(client: &Client, url: &str, part_path: &Path,
     saved_etag: Option<&str>, saved_last_modified: Option<&str>) -> Result<ResumeInfo>;
 ```
 
-If server content has changed (ETag mismatch), download restarts from beginning.
+Validation runs on every resume — in-session and across restarts. The engine
+persists the probe's ETag/Last-Modified in download metadata; on resume (or
+segment restore) the saved validators are compared against a fresh probe, and
+a mismatch discards the partial data and restarts from byte zero. `If-Range`
+alone cannot catch cross-restart changes, because a freshly probed validator
+always matches the current remote file.
 
 ### Speed Limiting
 
-Uses token bucket algorithm via `governor` crate within `ConnectionPool`:
+A debt-based token bucket (`gosh_dl::RateLimiter`, `src/limiter.rs`) shared
+by every transfer path: segmented HTTP, single-stream HTTP, torrent peer
+traffic (down and up), and webseeds. The engine owns one global pair
+(download/upload); per-download limits from `DownloadOptions` are layered on
+top.
 
 ```rust
-impl ConnectionPool {
-    pub fn new(config: &HttpConfig, download_limit: Option<u64>, upload_limit: Option<u64>) -> Self;
-    pub async fn acquire_download(&self, bytes: u64);  // Blocks until quota available
-    pub async fn acquire_upload(&self, bytes: u64);
+impl RateLimiter {
+    pub fn new(limit: Option<u64>) -> Self;        // bytes/sec; None/0 = unlimited
+    pub fn set_limit(&self, limit: Option<u64>);   // live updates (scheduler)
+    pub async fn acquire(&self, bytes: u64);       // books bytes, sleeps out the debt
 }
 ```
 
-Rate limiting breaks large requests into 16KB chunks to prevent long blocking periods.
+`acquire` books the bytes immediately (the bucket may go negative) and then
+sleeps until the debt is repaid, so chunks of any size are throttled correctly
+— including chunks larger than one second's budget, which the previous
+`governor`-based approach silently waved through (limits under 16 KiB/s did
+nothing).
 
 ### Retry Policy
 
@@ -539,11 +578,22 @@ pub struct MirrorManager {
 }
 
 impl MirrorManager {
-    pub fn url_for_segment(&self, segment_idx: usize) -> String;  // Round-robin
-    pub fn report_failure(&self, url: &str);                      // Track failures
-    pub fn report_success(&self, url: &str);                      // Reset counter
+    pub fn url_for_segment(&self, segment_idx: usize) -> &str;    // Round-robin
+    pub fn report_url_failure(&self, url: &str) -> Option<&str>;  // Track failures
+    pub fn report_success(&self);                                 // Reset counter
 }
 ```
+
+Two cooperating layers:
+
+- **Segment striping**: with more than one available URL, each segment is
+  assigned a mirror round-robin and rotates to another URL on retry. Only the
+  primary URL's requests carry `If-Range` validators (mirrors have their own
+  ETags); every mirror's `Content-Range` total is cross-checked against the
+  expected file size, and a mismatching or failing mirror is penalized and
+  retried elsewhere.
+- **Whole-download failover**: if an attempt fails outright, the engine
+  switches to the next healthy URL and restarts the attempt.
 
 ### Checksum Verification
 
@@ -743,6 +793,21 @@ pub enum PeerMessage {
 ```
 
 Block size is fixed at 16KB (`BLOCK_SIZE = 16384`).
+
+**Connection management:**
+
+- Each torrent binds a TCP listener on `listen_port_range` (walking the range
+  on conflicts; port 0 lets the OS pick) and serves inbound peers through the
+  same connection loop as outbound ones. The actually-bound port is what gets
+  advertised to trackers, DHT, and LPD.
+- Keep-alives are sent on idle receive timeouts; a peer is disconnected only
+  after 150s of true silence. Choking decisions are applied on idle ticks as
+  well as on message receipt.
+- A periodic tracker re-announce task honors the announce interval, and
+  failed peer addresses back off exponentially (60s doubling, 15-minute cap).
+- Requested blocks are marked per piece so peers are not handed duplicate
+  work outside endgame; in endgame, satisfied duplicate requests are
+  `Cancel`led as soon as another peer delivers the block.
 
 ### Piece Manager
 
@@ -947,12 +1012,12 @@ WebSeeds download pieces via HTTP Range requests, with exponential backoff (2x, 
 pub enum TransportPolicy {
     TcpOnly,
     UtpOnly,
-    PreferUtp,      // Default
-    PreferTcp,
+    PreferUtp,
+    PreferTcp,      // Default
 }
 
 pub struct UtpConfigSettings {
-    pub enabled: bool,              // Default: true
+    pub enabled: bool,              // Default: false (opt-in)
     pub policy: TransportPolicy,
     pub tcp_fallback: bool,         // Default: true
     pub target_delay_us: u32,       // Default: 100000 (100ms)
@@ -962,7 +1027,20 @@ pub struct UtpConfigSettings {
 }
 ```
 
-Implements LEDBAT congestion control: delays extra traffic until network delay drops below target (100ms default).
+**Architecture:** one `UtpMux` per torrent shares a UDP socket among
+connections, routing packets by `(remote_addr, receive connection ID)` and
+accepting inbound SYNs (bounded backlog, retransmit dedupe). Each `UtpSocket`
+owns a background *driver task* that processes incoming packets, sends ACKs,
+runs the retransmission timer (RTO with exponential backoff, original packet
+types preserved), and feeds `timestamp_diff` delay samples into the LEDBAT
+controller — so reads and writes never block each other.
+
+Connection IDs follow BEP 29: the initiator receives on `C` (carried by the
+SYN) and sends with `C + 1`; the acceptor mirrors that. Selective ACK is
+supported in both directions, and unknown packet extensions are skipped.
+
+Covered by loopback transfer, packet-loss-proxy, and full torrent-transfer
+tests; still opt-in via `utp.enabled`.
 
 ---
 
@@ -993,6 +1071,14 @@ pub trait Storage: Send + Sync {
     async fn compact(&self) -> Result<()>;
 }
 ```
+
+Three implementations ship with the crate: `SqliteStorage` (`storage`
+feature, WAL mode, transactional schema migrations), `FileStorage` (one JSON
+sidecar per download, fsync-before-rename atomic writes), and
+`MemoryStorage`. The runtime-metadata JSON carries the download's original
+`DownloadOptions` (so resume keeps file selection, sequential mode, and
+limits across restarts), recursive-child context, and torrent lifetime
+transfer totals (so seed-ratio decisions survive restarts).
 
 ### Segment State
 

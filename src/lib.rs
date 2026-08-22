@@ -4,8 +4,18 @@
 //!
 //! ## Features
 //!
-//! - **HTTP/HTTPS Downloads**: Multi-connection segmented downloads with resume support
-//! - **BitTorrent**: Full protocol support including DHT, PEX, and LPD
+//! - **HTTP/HTTPS Downloads**: Multi-connection segmented downloads with
+//!   cross-restart resume validation and mirror segment striping
+//! - **BitTorrent**: Full protocol support including DHT, PEX, LPD, inbound
+//!   peer connections/seeding, and an opt-in uTP (BEP 29) transport
+//! - **Streaming**: [`DownloadEngine::open_reader`] yields an `AsyncRead`
+//!   over an in-progress download; torrent piece selection follows the reader
+//! - **Rate limiting**: global and per-download byte-rate limits covering
+//!   every transfer path
+//! - **Verify & repair**: [`DownloadEngine::verify`] re-checks on-disk data;
+//!   [`DownloadEngine::repair`] re-downloads what's bad
+//! - **Metalink**: RFC 5854 `.meta4` documents expand into downloads with
+//!   mirrors and checksums (feature `metalink`)
 //! - **Cross-platform**: Works on Linux, macOS, and Windows
 //! - **Memory-safe**: Written in Rust with no unsafe code in core paths
 //! - **Async**: Built on Tokio for efficient concurrent downloads

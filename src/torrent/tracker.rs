@@ -590,7 +590,7 @@ impl TrackerClient {
 
     /// Announce to a UDP tracker (BEP 15)
     ///
-    /// Retries with the scaled-down BEP 15 schedule in [`UDP_RETRY_TIMEOUTS`]
+    /// Retries with the scaled-down BEP 15 schedule in `UDP_RETRY_TIMEOUTS`
     /// (rather than the client-wide timeout used for HTTP/WS trackers).
     pub async fn announce_udp(
         &self,
