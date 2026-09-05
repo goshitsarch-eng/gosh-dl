@@ -93,17 +93,13 @@ impl MagnetUri {
                 }
 
                 // Tracker URL
-                "tr" => {
-                    if !value.is_empty() {
-                        trackers.push(value);
-                    }
+                "tr" if !value.is_empty() => {
+                    trackers.push(value);
                 }
 
                 // Web Seed (BEP 19)
-                "ws" => {
-                    if !value.is_empty() {
-                        web_seeds.push(value);
-                    }
+                "ws" if !value.is_empty() => {
+                    web_seeds.push(value);
                 }
 
                 // Exact Length
@@ -122,10 +118,8 @@ impl MagnetUri {
                 }
 
                 // Acceptable Source
-                "as" => {
-                    if !value.is_empty() {
-                        acceptable_sources.push(value);
-                    }
+                "as" if !value.is_empty() => {
+                    acceptable_sources.push(value);
                 }
 
                 // Manifest Topic

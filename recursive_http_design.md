@@ -14,6 +14,12 @@ Current implementation includes:
 - optional in-memory and persisted `fail_fast` sibling cancellation
 - tracked parent recursive jobs with aggregate status, lifecycle methods, dedicated parent events, and SQLite persistence
 
+As of 0.6.1, CI covers recursive HTTP on Linux, macOS, and Windows both on its
+own and alongside torrent, storage, and Metalink features. Child downloads
+inherit authenticated HEAD/GET handling, nested-path lifecycle fixes, and safe
+streaming from saved segments. This does not make discovery itself resumable:
+stored child transfers can resume, but there is no persisted crawl cursor.
+
 Still intentionally deferred:
 
 - full `wget -r` parity

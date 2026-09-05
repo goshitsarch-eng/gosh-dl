@@ -1010,9 +1010,11 @@ pub async fn probe_server(
     url: &str,
     user_agent: &str,
 ) -> Result<ServerCapabilities> {
-    let response = client
-        .head(url)
-        .header("User-Agent", user_agent)
+    probe_request(client.head(url).header("User-Agent", user_agent)).await
+}
+
+pub(crate) async fn probe_request(request: reqwest::RequestBuilder) -> Result<ServerCapabilities> {
+    let response = request
         .header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY)
         .send()
         .await

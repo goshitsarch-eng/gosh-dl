@@ -162,3 +162,45 @@ async fn test_metalink_end_to_end_with_dead_mirror_failover() {
 
     engine.shutdown().await.ok();
 }
+
+#[test]
+fn rejects_unclosed_or_multiple_metalink_roots() {
+    for xml in [
+        "<metalink>",
+        "<metalink><file name=\"file\"/>",
+        "<metalink/><metalink/>",
+        "<metalink></metalink><file name=\"file\"/>",
+    ] {
+        assert!(
+            gosh_dl::metalink::parse_metalink(xml.as_bytes()).is_err(),
+            "accepted {xml}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unsupported_transport_does_not_hide_an_http_mirror() {
+    let dir = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_file(&server, "/file.bin", b"payload").await;
+    let engine = create_test_engine(&dir).await;
+    let mut events = engine.subscribe();
+    let xml = format!("<metalink><file name=\"file.bin\"><url priority=\"1\">ftp://example.com/file.bin</url><url priority=\"2\">{}/file.bin</url></file></metalink>", server.uri());
+    let ids = engine
+        .add_metalink(xml.as_bytes(), DownloadOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 1);
+    wait_for_event(
+        &mut events,
+        |e| matches!(e, DownloadEvent::Completed { id } if *id == ids[0]),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::fs::read(dir.path().join("file.bin")).await.unwrap(),
+        b"payload"
+    );
+    engine.shutdown().await.unwrap();
+}

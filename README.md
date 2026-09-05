@@ -1,6 +1,6 @@
 # gosh-dl
 
-A fast, embeddable download engine for Rust applications. Supports HTTP/HTTPS with multi-connection acceleration and full BitTorrent protocol including DHT, PEX, encryption, and WebSeeds.
+A fast, embeddable download engine for Rust applications. Supports HTTP/HTTPS with multi-connection acceleration and BitTorrent features including DHT, PEX, outgoing encryption, and WebSeeds. Feature coverage and limits are listed below.
 
 [![Crates.io](https://img.shields.io/crates/v/gosh-dl.svg)](https://crates.io/crates/gosh-dl)
 [![Documentation](https://docs.rs/gosh-dl/badge.svg)](https://docs.rs/gosh-dl)
@@ -10,20 +10,20 @@ A fast, embeddable download engine for Rust applications. Supports HTTP/HTTPS wi
 
 gosh-dl brings download functionality directly into your Rust application as a native library, eliminating the complexity of managing external processes, parsing JSON-RPC responses, or bundling platform-specific binaries. Modern applications demand seamless integration, and gosh-dl delivers exactly that; async function calls that feel natural in your codebase, compile-time type safety that catches errors before runtime, and shared memory that keeps your application lightweight and responsive.
 
-Whether you're building a media application that needs BitTorrent with streaming support, a package manager requiring resilient HTTP downloads with checksums and mirrors, or any software that moves files across the network, gosh-dl provides the complete feature set you need. Multi-connection acceleration splits large downloads across parallel connections for maximum throughput. Automatic resume with ETag validation ensures interrupted transfers pick up exactly where they left off. Full BitTorrent support includes DHT for trackerless operation, peer exchange for efficient swarm discovery, and protocol encryption for privacy.
+Whether you're building a media application that needs BitTorrent with streaming support, a package manager requiring resilient HTTP downloads with checksums and mirrors, or any software that moves files across the network, gosh-dl provides native download APIs with the feature coverage listed below. Multi-connection acceleration splits large downloads across parallel connections for maximum throughput. Automatic resume with ETag validation ensures interrupted transfers pick up exactly where they left off. BitTorrent support includes DHT for trackerless operation, peer exchange for efficient swarm discovery, and protocol encryption for privacy.
 
-The engine handles the complexity of segmented downloads, tracker communication, DHT peer discovery, and connection encryption while exposing a clean, intuitive API that integrates naturally with Tokio-based applications. Priority queues let you control which downloads matter most, bandwidth scheduling adapts to time-of-day constraints, and persistence — built-in SQLite, JSON sidecar files, or your own `Storage` implementation — ensures nothing is lost across restarts.
+The engine handles the complexity of segmented downloads, tracker communication, DHT peer discovery, and connection encryption while exposing a clean, intuitive API that integrates naturally with Tokio-based applications. Priority queues let you control which downloads matter most, bandwidth scheduling adapts to time-of-day constraints, and persistence — built-in SQLite, JSON sidecar files, or your own `Storage` implementation — supports recovery across restarts when a durable storage implementation is configured.
 
 A standalone CLI is available in the companion `gosh-dl-cli` project for users who want command-line access to the engine.
 
 ## Features
 
-### Tested & Production-Ready
+### Core Features with Automated Tests
 
 | Feature | Details |
 |---------|---------|
 | Multi-connection HTTP/HTTPS | Up to 16 parallel connections per download |
-| Content-Disposition detection | Automatic filename from server headers |
+| Output filenames | Explicit names, URL fallback, and Content-Disposition when no filename is already selected; see HTTP output paths below |
 | Custom headers | User-Agent, Referer, cookies, arbitrary headers |
 | Checksum verification | MD5, SHA-256 |
 | Concurrent download management | Priority queue (Critical/High/Normal/Low) |
@@ -80,15 +80,22 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 |---------|-------|
 | DHT IPv6 | Depends on upstream `mainline` crate |
 | MSE responder (inbound encryption) | Outgoing MSE works (incl. PadB handling); inbound connections are plaintext-only for now |
-| Proxy support | Wired via reqwest, not covered by tests |
+
+Proxy support is wired through reqwest but lacks dedicated interoperability tests.
+
+Release validation uses local protocol fixtures and a Linux/macOS/Windows
+feature matrix. It does not establish interoperability with every public
+torrent swarm, proxy, or directory-index server. See [ROLLOUT.md](ROLLOUT.md)
+for the rollout audit and remaining validation work.
 
 ## Quick Start
 
-Add to your `Cargo.toml`:
+Requires Rust 1.85 or newer. The 0.6.1 release is published on GitHub as a
+source package. To use that release directly, add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-dl = "0.6"
+gosh-dl = { git = "https://github.com/goshitsarch-eng/gosh-dl", tag = "v0.6.1" }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -97,9 +104,12 @@ Optional features: `recursive-http` (directory mirroring) and `metalink`
 
 ```toml
 [dependencies]
-gosh-dl = { version = "0.6", features = ["recursive-http"] }
+gosh-dl = { git = "https://github.com/goshitsarch-eng/gosh-dl", tag = "v0.6.1", features = ["recursive-http"] }
 tokio = { version = "1", features = ["full"] }
 ```
+
+GitHub releases do not automatically publish to crates.io or update docs.rs.
+The registry badges above refer to the separately published registry version.
 
 Basic usage:
 
@@ -109,6 +119,8 @@ use gosh_dl::{DownloadEngine, EngineConfig, DownloadOptions};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = DownloadEngine::new(EngineConfig::default()).await?;
+    // Subscribe before enqueueing so fast downloads cannot finish unseen.
+    let mut events = engine.subscribe();
 
     // HTTP download
     let id = engine.add_http(
@@ -116,12 +128,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DownloadOptions::default(),
     ).await?;
 
-    // Subscribe to progress events
-    let mut events = engine.subscribe();
     while let Ok(event) = events.recv().await {
         println!("Event: {:?}", event);
+        match event {
+            gosh_dl::DownloadEvent::Completed { id: event_id } if event_id == id => break,
+            gosh_dl::DownloadEvent::Failed { id: event_id, error, .. } if event_id == id => {
+                return Err(error.into());
+            }
+            _ => {}
+        }
     }
 
+    engine.shutdown().await?;
     Ok(())
 }
 ```
@@ -166,6 +184,28 @@ let stopped = engine.stopped();
 let stats = engine.global_stats();
 ```
 
+### Output Paths and Download Lifecycle
+
+Set `DownloadOptions::filename` for a deterministic output name. The engine
+otherwise selects the final URL path segment when present; a server's
+Content-Disposition filename is used only if no filename has already been
+selected. A URL-derived name therefore takes precedence over the header.
+
+Relative names such as `subdir/file.zip` are supported. Empty names, parent
+traversal, and absolute paths are rejected before enqueueing. Both transfer
+paths create parent directories, and completion preserves the relative path
+for subsequent reads, verification, repair, and deletion.
+
+HEAD probes carry the same custom headers, Referer, and cookies as the
+download. If the probe fails, the engine tries GET as a single stream and
+ignores metadata from the failed HEAD response.
+
+Pausing a torrent stops its worker and releases its concurrency slot. Resume
+reconstructs a worker from available metainfo and re-enters the priority
+queue, re-checking existing pieces during startup. A queued torrent remains
+paused until explicitly resumed. File selection, sequential mode, and limits
+are retained.
+
 ### Streaming Reads
 
 Read a download's bytes while it is still in flight — for torrents, the read
@@ -184,7 +224,24 @@ loop {
 }
 ```
 
+HTTP readers expose only the contiguous downloaded prefix, including after
+pause or restart of a segmented download. Torrent readers use verified pieces;
+with persisted metainfo they can read restored files without starting peers.
+Dropping a reader stops its background pump.
+
+EOF can mean completion or a short stream caused by failure, cancellation,
+removal, or a missing/truncated completed file. `total_size()` is the size
+known when the reader was opened; for a reader opened at `offset`, compare
+the bytes received with `total_size.saturating_sub(offset)` when known.
+An unknown size requires another integrity check, such as a checksum.
+
 ### Verify & Repair
+
+Pause active transfers before verification. Queued, connecting, and downloading
+states are rejected. HTTP verification uses the configured checksum, or only
+regular-file presence and size when no checksum is supplied; a size check does
+not detect same-size corruption. Torrent verification re-hashes pieces, using
+persisted metainfo when no live handle exists.
 
 ```rust
 let report = engine.verify(id).await?;   // checksum (HTTP) or piece re-hash (torrent)
@@ -192,6 +249,12 @@ if !report.valid {
     engine.repair(id).await?;            // re-download what's bad
 }
 ```
+
+`repair()` returns the verification report from before repair and queues work
+when data is bad; returning from this call does not mean repair has finished.
+HTTP repair restarts from zero. Torrent repair reconstructs the worker and
+re-checks existing pieces so missing or corrupt pieces can be fetched again.
+Observe download events/status for the resulting transfer.
 
 ### Metalink
 
@@ -201,6 +264,14 @@ downloads wired with their mirrors and checksums:
 ```rust
 let ids = engine.add_metalink_file("release.meta4".as_ref(), DownloadOptions::default()).await?;
 ```
+
+Supported URLs are HTTP/HTTPS, ordered by priority. Other transports are
+skipped, and files with no supported URL are skipped with a warning. SHA-256
+is preferred over MD5. Unclosed or multiple document roots are rejected.
+Torrent `metaurl`, piece hashes, and other checksum algorithms are ignored;
+declared size is parsed but is not an independent integrity constraint.
+
+### Recursive HTTP
 
 With `recursive-http` enabled:
 
@@ -376,7 +447,7 @@ Queue concurrency and global bandwidth limits are applied to the live engine whe
 ### Persistence & Custom Storage
 
 Setting `database_path` persists download state to the built-in SQLite storage
-(`storage` feature) so downloads resume across restarts. If you maintain your
+(`storage` feature) so downloads can resume across restarts. If you maintain your
 own metadata store — or just prefer plain files — inject any implementation of
 the `Storage` trait instead:
 
@@ -393,6 +464,13 @@ let engine = DownloadEngine::with_storage(EngineConfig::default(), storage).awai
 work without the `storage` feature. To bring your own database, implement the
 `Storage` trait (the `#[async_trait]` attribute is re-exported from
 `gosh_dl::storage`) and pass it to `DownloadEngine::with_storage`.
+
+After restart, previously queued downloads auto-start; downloads that were
+connecting, downloading, or seeding are restored as paused and require
+`resume(id)` or `resume_all()`. Completed and error states remain unchanged.
+Saved HTTP segments retain their readable prefix; saved torrent metainfo
+supports offline verification and reading. `MemoryStorage` retains data only
+while its instance lives and does not survive process exit.
 
 ### Bandwidth Scheduling
 
@@ -414,10 +492,20 @@ let config = EngineConfig::default()
 ## Building
 
 ```bash
-cargo build --release
-cargo test
-cargo doc --open
+cargo build --locked --release
+cargo test --locked --all-features
+cargo doc --locked --all-features --open
 ```
+
+## Releasing
+
+The release workflow runs when a change to `Cargo.toml` reaches `main`, or
+when manually dispatched on `main`. It runs the complete CI suite, checks
+the version's changelog entry, and verifies `cargo package --all-features`
+before creating the GitHub tag/release and attaching the `.crate` source
+package. Existing releases are left unchanged. This workflow does not
+publish to crates.io. See [ROLLOUT.md](ROLLOUT.md) for rollout scope and
+remaining validation work.
 
 See [technical_spec.md](technical_spec.md) for architecture details.
 

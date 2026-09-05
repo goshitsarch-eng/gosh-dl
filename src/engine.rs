@@ -596,6 +596,18 @@ impl DownloadEngine {
                 }
             }
 
+            #[cfg(feature = "http")]
+            let cached_segments = if status.kind == DownloadKind::Http {
+                let segments = storage.load_segments(status.id).await?;
+                if segments.is_empty() {
+                    None
+                } else {
+                    Some(segments)
+                }
+            } else {
+                None
+            };
+
             // Insert into downloads map
             self.downloads.write().insert(
                 status.id,
@@ -605,7 +617,7 @@ impl DownloadEngine {
                     options: restored_options,
                     restored_totals,
                     #[cfg(feature = "http")]
-                    cached_segments: None,
+                    cached_segments,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
                     redirect_scope,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -764,6 +776,9 @@ impl DownloadEngine {
         });
 
         let name = filename.clone().unwrap_or_else(|| "download".to_string());
+        // Lifecycle operations use this path before a worker starts, including
+        // cancel-with-delete. Reject unsafe names before storing the download.
+        crate::http::validate_filename_components(&name)?;
 
         // Create download status
         let status = DownloadStatus {
@@ -2308,7 +2323,8 @@ impl DownloadEngine {
                                 download.status.state = DownloadState::Completed;
                                 download.status.completed_at = Some(Utc::now());
                                 download.status.metadata.filename = final_path
-                                    .file_name()
+                                    .strip_prefix(&download.status.metadata.save_dir)
+                                    .ok()
                                     .map(|s| s.to_string_lossy().to_string());
                                 true
                             }
@@ -2439,6 +2455,8 @@ impl DownloadEngine {
 
     /// Pause a download
     pub async fn pause(&self, id: DownloadId) -> Result<()> {
+        #[cfg(feature = "torrent")]
+        let mut torrent_to_stop = None;
         let (status_to_save, segments_to_save) = {
             let mut downloads = self.downloads.write();
             let download = downloads
@@ -2478,6 +2496,11 @@ impl DownloadEngine {
                     #[cfg(feature = "torrent")]
                     DownloadHandle::Torrent(h) => {
                         h.downloader.pause();
+                        // Release the concurrency slot (or queued acquisition)
+                        // and prevent a queued task from starting after pause.
+                        h.task.abort();
+                        h.progress_task.abort();
+                        torrent_to_stop = Some(Arc::clone(&h.downloader));
                         download.handle = Some(DownloadHandle::Torrent(h));
                         // Don't await the task
                     }
@@ -2504,6 +2527,12 @@ impl DownloadEngine {
 
             (download.status.clone(), segments)
         };
+
+        #[cfg(feature = "torrent")]
+        if let Some(downloader) = torrent_to_stop {
+            let _ = tokio::time::timeout(Duration::from_secs(5), downloader.stop()).await;
+            self.priority_queue.remove(id);
+        }
 
         // Persist to database
         if let Some(ref storage) = self.storage {
@@ -2626,13 +2655,49 @@ impl DownloadEngine {
                 #[cfg(feature = "torrent")]
                 DownloadKind::Torrent | DownloadKind::Magnet => {
                     if has_torrent_handle {
-                        // Live handle exists — just unpause
-                        let mut downloads = self.downloads.write();
-                        if let Some(download) = downloads.get_mut(&id) {
-                            if let Some(DownloadHandle::Torrent(ref h)) = download.handle {
-                                h.downloader.resume();
-                                download.status.state = DownloadState::Downloading;
-                            }
+                        // A paused task has released its queue slot. Rebuild
+                        // from its metainfo and reacquire through the queue;
+                        // flipping downloader state alone cannot restart a task.
+                        let (handle, magnet_uri) = {
+                            let mut downloads = self.downloads.write();
+                            let download = downloads
+                                .get_mut(&id)
+                                .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
+                            let handle = match download.handle.take() {
+                                Some(DownloadHandle::Torrent(h)) => h,
+                                _ => {
+                                    return Err(EngineError::Internal(
+                                        "torrent handle disappeared".into(),
+                                    ))
+                                }
+                            };
+                            download.restored_totals = Some(handle.downloader.transfer_totals());
+                            (handle, download.status.metadata.magnet_uri.clone())
+                        };
+                        let metainfo = handle.downloader.metainfo();
+                        handle.task.abort();
+                        handle.progress_task.abort();
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), handle.downloader.stop())
+                                .await;
+                        // Await abort completion before a replacement uses the
+                        // same queue id, so the old permit cannot remove it.
+                        let _ = handle.task.await;
+                        self.priority_queue.remove(id);
+                        let save_dir = options
+                            .save_dir
+                            .clone()
+                            .unwrap_or_else(|| self.config.read().download_dir.clone());
+                        if let Some(metainfo) = metainfo {
+                            self.start_torrent(id, (*metainfo).clone(), save_dir, options)
+                                .await?;
+                        } else if let Some(uri) = magnet_uri {
+                            self.start_magnet(id, MagnetUri::parse(&uri)?, save_dir, options)
+                                .await?;
+                        } else {
+                            return Err(EngineError::Internal(
+                                "torrent has no metainfo for resume".into(),
+                            ));
                         }
                     } else {
                         // No live handle (crash recovery) — try reconstructing from stored data
@@ -2976,6 +3041,37 @@ impl DownloadEngine {
         self.event_tx.subscribe()
     }
 
+    #[cfg(feature = "torrent")]
+    async fn torrent_piece_manager(
+        &self,
+        id: DownloadId,
+    ) -> Result<Arc<crate::torrent::PieceManager>> {
+        let save_dir = {
+            let downloads = self.downloads.read();
+            let download = downloads
+                .get(&id)
+                .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
+            if let Some(DownloadHandle::Torrent(h)) = &download.handle {
+                if let Some(pm) = h.downloader.piece_manager_handle() {
+                    return Ok(pm);
+                }
+            }
+            download.status.metadata.save_dir.clone()
+        };
+        let data = match &self.storage {
+            Some(storage) => storage.load_torrent_data(id).await?,
+            None => None,
+        }
+        .ok_or_else(|| EngineError::InvalidState {
+            action: "read torrent data",
+            current_state: "torrent metadata is not available".into(),
+        })?;
+        Ok(Arc::new(crate::torrent::PieceManager::new(
+            Arc::new(Metainfo::parse(&data)?),
+            save_dir,
+        )))
+    }
+
     /// Re-verify a download's on-disk data.
     ///
     /// - **HTTP**: recomputes the configured checksum over the completed
@@ -2983,8 +3079,10 @@ impl DownloadEngine {
     /// - **Torrents**: re-hashes every piece on disk and rebuilds the piece
     ///   bitmap, so corrupted or truncated pieces become wanted again.
     ///
-    /// Not allowed while the download is actively transferring — pause it
-    /// first. Use [`repair`](Self::repair) to act on a failed verification.
+    /// Queued, connecting, and downloading states are rejected; pause those
+    /// downloads first. Persisted torrent metainfo allows verification without
+    /// a live handle. Size-only HTTP checks do not detect same-size corruption.
+    /// Use [`repair`](Self::repair) to act on a failed verification.
     pub async fn verify(&self, id: DownloadId) -> Result<VerifyReport> {
         let (kind, state, path, checksum, total_size) = {
             let downloads = self.downloads.read();
@@ -3009,7 +3107,7 @@ impl DownloadEngine {
 
         if matches!(
             state,
-            DownloadState::Downloading | DownloadState::Connecting
+            DownloadState::Queued | DownloadState::Downloading | DownloadState::Connecting
         ) {
             return Err(EngineError::InvalidState {
                 action: "verify",
@@ -3042,7 +3140,11 @@ impl DownloadEngine {
                         })
                     }
                     None => {
-                        let on_disk = tokio::fs::metadata(&path).await.map(|m| m.len()).ok();
+                        let on_disk = tokio::fs::metadata(&path)
+                            .await
+                            .ok()
+                            .filter(|m| m.is_file())
+                            .map(|m| m.len());
                         let valid = match (on_disk, total_size) {
                             (Some(actual), Some(expected)) => actual == expected,
                             (Some(_), None) => true,
@@ -3061,20 +3163,7 @@ impl DownloadEngine {
             }
             #[cfg(feature = "torrent")]
             DownloadKind::Torrent | DownloadKind::Magnet => {
-                let pm = {
-                    let downloads = self.downloads.read();
-                    downloads.get(&id).and_then(|d| match &d.handle {
-                        Some(DownloadHandle::Torrent(h)) => h.downloader.piece_manager_handle(),
-                        _ => None,
-                    })
-                };
-                let Some(pm) = pm else {
-                    return Err(EngineError::InvalidState {
-                        action: "verify",
-                        current_state: "no live torrent handle (resume the download first)"
-                            .to_string(),
-                    });
-                };
+                let pm = self.torrent_piece_manager(id).await?;
                 let valid = pm.verify_existing().await?;
                 let total = pm.progress().total_pieces;
                 Ok(VerifyReport {
@@ -3095,11 +3184,12 @@ impl DownloadEngine {
     ///
     /// - **HTTP**: the corrupt file and any partial state are removed and
     ///   the download restarts from zero.
-    /// - **Torrents**: [`verify`](Self::verify) has already marked the bad
-    ///   pieces as missing; the download is resumed (or its live task simply
-    ///   continues) so they are re-fetched.
+    /// - **Torrents**: reconstructs a worker and re-enters the priority queue.
+    ///   Startup re-checks existing pieces so missing or corrupt data can be
+    ///   fetched again, including after a finished task or engine restart.
     ///
-    /// Returns the pre-repair [`VerifyReport`].
+    /// Returns the pre-repair [`VerifyReport`], not a completion result. Observe
+    /// download events or status for the resulting transfer's completion.
     pub async fn repair(&self, id: DownloadId) -> Result<VerifyReport> {
         let report = self.verify(id).await?;
         if report.valid {
@@ -3148,17 +3238,18 @@ impl DownloadEngine {
             }
             #[cfg(feature = "torrent")]
             DownloadKind::Torrent | DownloadKind::Magnet => {
-                match state {
-                    DownloadState::Paused | DownloadState::Error { .. } => {
-                        self.resume(id).await?;
+                // Completed/error tasks have exited; seeding tasks retain
+                // seeding state even when verification finds a bad piece.
+                // Restart through resume in every case to re-fetch bad data.
+                let _ = state;
+                self.update_state(id, DownloadState::Paused)?;
+                {
+                    let mut downloads = self.downloads.write();
+                    if let Some(download) = downloads.get_mut(&id) {
+                        download.status.completed_at = None;
                     }
-                    DownloadState::Completed | DownloadState::Seeding => {
-                        // The live peer loop notices the incomplete bitmap by
-                        // itself; reflect that at the engine level.
-                        self.update_state(id, DownloadState::Downloading)?;
-                    }
-                    _ => {}
                 }
+                self.resume(id).await?;
             }
             #[allow(unreachable_patterns)]
             _ => {}
@@ -3198,10 +3289,12 @@ impl DownloadEngine {
         const CHUNK: u64 = 64 * 1024;
         let (reader_half, mut writer_half) = tokio::io::duplex(256 * 1024);
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
             let mut pos = offset;
+            #[cfg(feature = "torrent")]
+            let mut restored_pm: Option<Arc<crate::torrent::PieceManager>> = None;
             'pump: loop {
                 // Snapshot the source under the lock, then do I/O outside it.
                 enum Source {
@@ -3215,6 +3308,8 @@ impl DownloadEngine {
                         pm: Arc<crate::torrent::PieceManager>,
                         available_end: u64,
                     },
+                    #[cfg(feature = "torrent")]
+                    LoadTorrent,
                     Wait,
                     Finished,
                 }
@@ -3265,9 +3360,36 @@ impl DownloadEngine {
                                             available_end: sd.contiguous_available(),
                                         }
                                     } else {
+                                        // Paused/restored segments can have holes;
+                                        // aggregate progress is not a readable prefix.
+                                        let available_end = download
+                                            .cached_segments
+                                            .as_ref()
+                                            .map(|segments| {
+                                                let mut ordered: Vec<_> = segments.iter().collect();
+                                                ordered.sort_by_key(|s| s.start);
+                                                let mut end: u64 = 0;
+                                                for segment in ordered {
+                                                    if segment.start != end {
+                                                        break;
+                                                    }
+                                                    let size = segment
+                                                        .end
+                                                        .saturating_sub(segment.start)
+                                                        .saturating_add(1);
+                                                    end = end.saturating_add(
+                                                        segment.downloaded.min(size),
+                                                    );
+                                                    if segment.downloaded < size {
+                                                        break;
+                                                    }
+                                                }
+                                                end
+                                            })
+                                            .unwrap_or(download.status.progress.completed_size);
                                         Source::HttpFile {
                                             path: crate::http::partial_path_for(&final_path),
-                                            available_end: download.status.progress.completed_size,
+                                            available_end,
                                         }
                                     }
                                 }
@@ -3277,7 +3399,7 @@ impl DownloadEngine {
                                         Some(DownloadHandle::Torrent(h)) => {
                                             h.downloader.piece_manager_handle()
                                         }
-                                        _ => None,
+                                        _ => restored_pm.clone(),
                                     };
                                     match pm {
                                         Some(pm) => {
@@ -3287,9 +3409,9 @@ impl DownloadEngine {
                                                 pm,
                                             }
                                         }
-                                        // Completed with the handle already
-                                        // torn down: nothing left to serve.
-                                        None if completed => Source::Finished,
+                                        // Rebuild a verified bitmap from persisted
+                                        // metainfo after an engine restart.
+                                        None if download.handle.is_none() => Source::LoadTorrent,
                                         // Magnet metadata not fetched yet, or
                                         // paused with no live handle.
                                         None => Source::Wait,
@@ -3304,6 +3426,16 @@ impl DownloadEngine {
 
                 match source {
                     Source::Finished => break 'pump,
+                    #[cfg(feature = "torrent")]
+                    Source::LoadTorrent => match engine.torrent_piece_manager(id).await {
+                        Ok(pm) => {
+                            if pm.verify_existing().await.is_err() {
+                                break 'pump;
+                            }
+                            restored_pm = Some(pm);
+                        }
+                        Err(_) => break 'pump,
+                    },
                     Source::Wait => {
                         tokio::time::sleep(Duration::from_millis(150)).await;
                         continue 'pump;
@@ -3350,6 +3482,15 @@ impl DownloadEngine {
                                 pos += len as u64;
                             }
                             Err(e) => {
+                                // A rename can race an in-flight download,
+                                // but a missing/truncated final file cannot heal.
+                                if engine
+                                    .status(id)
+                                    .map(|d| d.state == DownloadState::Completed)
+                                    .unwrap_or(true)
+                                {
+                                    break 'pump;
+                                }
                                 tracing::debug!(
                                     "Streaming read of {:?} at {} failed ({}); retrying",
                                     path,
@@ -3369,7 +3510,16 @@ impl DownloadEngine {
                         }
                         if available_end <= pos {
                             if pos >= pm.total_size() {
+                                pm.set_stream_position(None);
                                 break 'pump; // fully drained
+                            }
+                            if engine
+                                .status(id)
+                                .map(|d| d.state == DownloadState::Completed)
+                                .unwrap_or(true)
+                            {
+                                pm.set_stream_position(None);
+                                break 'pump;
                             }
                             tokio::time::sleep(Duration::from_millis(150)).await;
                             continue 'pump;
@@ -3409,6 +3559,7 @@ impl DownloadEngine {
         Ok(DownloadReader {
             inner: reader_half,
             total_size,
+            task,
         })
     }
 
@@ -3606,6 +3757,15 @@ pub struct VerifyReport {
 pub struct DownloadReader {
     inner: tokio::io::DuplexStream,
     total_size: Option<u64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DownloadReader {
+    fn drop(&mut self) {
+        // A pump waiting for unavailable bytes never writes to the duplex
+        // stream and cannot otherwise notice that its reader disappeared.
+        self.task.abort();
+    }
 }
 
 impl DownloadReader {

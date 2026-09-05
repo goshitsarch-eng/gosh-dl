@@ -2200,10 +2200,11 @@ impl TorrentDownloader {
                             if conn.unchoke().await.is_ok() {
                                 tracing::debug!("Unchoked idle peer {}", addr);
                             }
-                        } else if !should_unchoke && currently_unchoked {
-                            if conn.choke().await.is_ok() {
-                                tracing::debug!("Choked idle peer {}", addr);
-                            }
+                        } else if !should_unchoke
+                            && currently_unchoked
+                            && conn.choke().await.is_ok()
+                        {
+                            tracing::debug!("Choked idle peer {}", addr);
                         }
                     }
                     continue;

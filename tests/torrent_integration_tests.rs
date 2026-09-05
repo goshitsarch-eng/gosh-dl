@@ -1203,6 +1203,193 @@ async fn test_verify_detects_corrupt_torrent_piece() {
 }
 
 // =============================================================================
+// Rollout lifecycle regressions
+// =============================================================================
+
+#[tokio::test]
+async fn paused_queued_torrent_waits_for_explicit_resume() {
+    use gosh_dl::{torrent::BencodeValue, DownloadState};
+    let dir = TempDir::new().unwrap();
+    let engine = DownloadEngine::new(EngineConfig {
+        download_dir: dir.path().into(),
+        max_concurrent_downloads: 1,
+        enable_dht: false,
+        enable_pex: false,
+        enable_lpd: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for name in ["occupy-slot", "queued-torrent"] {
+        let (data, _, _) = build_test_torrent(name, 16384, 1);
+        let mut value = BencodeValue::parse_exact(&data).unwrap();
+        if let BencodeValue::Dict(ref mut dict) = value {
+            dict.remove(b"announce".as_slice());
+        }
+        ids.push(
+            engine
+                .add_torrent(&value.encode(), DownloadOptions::default())
+                .await
+                .unwrap(),
+        );
+        if ids.len() == 1 {
+            timeout(Duration::from_secs(3), async {
+                while engine.status(ids[0]).unwrap().state == DownloadState::Queued {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+    engine.pause(ids[1]).await.unwrap();
+    engine.cancel(ids[0], false).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(engine.status(ids[1]).unwrap().state, DownloadState::Paused);
+    engine.resume(ids[1]).await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while engine.status(ids[1]).unwrap().state != DownloadState::Downloading {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("resumed torrent must start a live worker");
+    engine.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn repair_restarts_a_corrupt_seeding_torrent() {
+    use gosh_dl::{torrent::BencodeValue, DownloadState};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let dir = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let (data, _, pieces) = build_test_torrent("repair-seed", 16384, 1);
+    let content = pieces[0].clone();
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", "bytes 0-16383/16384")
+                .set_body_bytes(content.clone()),
+        )
+        .mount(&server)
+        .await;
+    let mut value = BencodeValue::parse_exact(&data).unwrap();
+    if let BencodeValue::Dict(ref mut dict) = value {
+        dict.remove(b"announce".as_slice());
+        dict.insert(
+            b"url-list".to_vec(),
+            BencodeValue::Bytes(format!("{}/repair-seed", server.uri()).into_bytes()),
+        );
+    }
+    tokio::fs::write(dir.path().join("repair-seed"), &content)
+        .await
+        .unwrap();
+    let engine = DownloadEngine::new(EngineConfig {
+        download_dir: dir.path().into(),
+        enable_dht: false,
+        enable_pex: false,
+        enable_lpd: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let id = engine
+        .add_torrent(&value.encode(), DownloadOptions::default())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        while engine.status(id).unwrap().state != DownloadState::Seeding {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut corrupt = content.clone();
+    corrupt[10] ^= 0xff;
+    tokio::fs::write(dir.path().join("repair-seed"), &corrupt)
+        .await
+        .unwrap();
+    assert!(!engine.repair(id).await.unwrap().valid);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if tokio::fs::read(dir.path().join("repair-seed"))
+                .await
+                .unwrap()
+                == content
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("repair must fetch and write the corrupt piece again");
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn verify_and_read_a_restored_completed_torrent_without_starting_peers() {
+    use gosh_dl::{
+        storage::{MemoryStorage, Storage},
+        torrent::BencodeValue,
+        DownloadState,
+    };
+    use tokio::io::AsyncReadExt;
+    let dir = TempDir::new().unwrap();
+    let (data, _, pieces) = build_test_torrent("restored-reader", 16384, 1);
+    let content = &pieces[0];
+    tokio::fs::write(dir.path().join("restored-reader"), content)
+        .await
+        .unwrap();
+    let mut value = BencodeValue::parse_exact(&data).unwrap();
+    if let BencodeValue::Dict(ref mut dict) = value {
+        dict.remove(b"announce".as_slice());
+    }
+    let storage = Arc::new(MemoryStorage::new());
+    let config = EngineConfig {
+        download_dir: dir.path().into(),
+        enable_dht: false,
+        enable_pex: false,
+        enable_lpd: false,
+        ..Default::default()
+    };
+    let original = DownloadEngine::with_storage(config.clone(), storage.clone())
+        .await
+        .unwrap();
+    let id = original
+        .add_torrent(&value.encode(), DownloadOptions::default())
+        .await
+        .unwrap();
+    original.pause(id).await.unwrap();
+    let mut status = original.status(id).unwrap();
+    original.shutdown().await.unwrap();
+    status.state = DownloadState::Completed;
+    status.progress.total_size = Some(content.len() as u64);
+    status.progress.completed_size = content.len() as u64;
+    storage.save_download(&status).await.unwrap();
+    let engine = DownloadEngine::with_storage(config, storage).await.unwrap();
+    assert!(engine.verify(id).await.unwrap().valid);
+    let mut reader = engine.open_reader(id, 0).unwrap();
+    let mut bytes = Vec::new();
+    timeout(Duration::from_secs(2), reader.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&bytes, content);
+    assert_eq!(engine.status(id).unwrap().state, DownloadState::Completed);
+    let mut corrupt = content.clone();
+    corrupt[0] ^= 0xff;
+    tokio::fs::write(dir.path().join("restored-reader"), corrupt)
+        .await
+        .unwrap();
+    assert!(!engine.verify(id).await.unwrap().valid);
+    engine.shutdown().await.unwrap();
+}
+
+// =============================================================================
 // uTP Transport Tests
 // =============================================================================
 
