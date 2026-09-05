@@ -3079,8 +3079,10 @@ impl DownloadEngine {
     /// - **Torrents**: re-hashes every piece on disk and rebuilds the piece
     ///   bitmap, so corrupted or truncated pieces become wanted again.
     ///
-    /// Not allowed while the download is actively transferring — pause it
-    /// first. Use [`repair`](Self::repair) to act on a failed verification.
+    /// Queued, connecting, and downloading states are rejected; pause those
+    /// downloads first. Persisted torrent metainfo allows verification without
+    /// a live handle. Size-only HTTP checks do not detect same-size corruption.
+    /// Use [`repair`](Self::repair) to act on a failed verification.
     pub async fn verify(&self, id: DownloadId) -> Result<VerifyReport> {
         let (kind, state, path, checksum, total_size) = {
             let downloads = self.downloads.read();
@@ -3182,11 +3184,12 @@ impl DownloadEngine {
     ///
     /// - **HTTP**: the corrupt file and any partial state are removed and
     ///   the download restarts from zero.
-    /// - **Torrents**: [`verify`](Self::verify) has already marked the bad
-    ///   pieces as missing; the download is resumed (or its live task simply
-    ///   continues) so they are re-fetched.
+    /// - **Torrents**: reconstructs a worker and re-enters the priority queue.
+    ///   Startup re-checks existing pieces so missing or corrupt data can be
+    ///   fetched again, including after a finished task or engine restart.
     ///
-    /// Returns the pre-repair [`VerifyReport`].
+    /// Returns the pre-repair [`VerifyReport`], not a completion result. Observe
+    /// download events or status for the resulting transfer's completion.
     pub async fn repair(&self, id: DownloadId) -> Result<VerifyReport> {
         let report = self.verify(id).await?;
         if report.valid {

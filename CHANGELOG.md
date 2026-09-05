@@ -42,6 +42,14 @@ corresponding GitHub release.
 - Added a GitHub release workflow gated on the complete CI suite, with versioned
   changelog notes and a verified Rust source package attached to the release.
 
+### Documentation
+- Updated installation, filename precedence, pause/resume, streaming EOF,
+  verify/repair, persistence, and Metalink guidance for 0.6.1.
+- Aligned the technical specification and recursive HTTP status documents with
+  implemented behaviour and CI coverage; replaced machine-local document links.
+- Documented the GitHub source-package release process separately from registry
+  publishing and corrected changelog comparison links.
+
 ## [0.6.0] - 2026-08-22
 
 This version adds the engine features and security fixes listed below.
@@ -447,8 +455,9 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.0...HEAD
-[0.6.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.5.0...v0.6.0
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/d475e65feedf1fd5da88bb9e29d99bc8696467a0...v0.6.1
+[0.6.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.5.0...d475e65feedf1fd5da88bb9e29d99bc8696467a0
 [0.5.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.3.1...v0.3.2

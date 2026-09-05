@@ -2,6 +2,9 @@
 
 A native Rust download engine supporting HTTP/HTTPS and BitTorrent protocols.
 
+Current implementation reference: **0.6.1**, requiring Rust **1.85+**.
+See [ROLLOUT.md](ROLLOUT.md) for validation scope and remaining feature limits.
+
 ---
 
 ## Table of Contents
@@ -222,6 +225,22 @@ impl DownloadEngine {
     pub fn get_config(&self) -> EngineConfig;
 }
 ```
+
+### Lifecycle and Integrity Semantics
+
+| Operation | 0.6.1 behaviour |
+| --- | --- |
+| Torrent pause | Stops the worker and releases its queue slot. A queued task cannot start after pause. |
+| Torrent resume | Reconstructs the worker from metainfo or the original magnet URI, preserves options and lifetime totals, and reacquires a priority-queue permit. Startup checks existing pieces. |
+| `verify` | Rejects queued, connecting, and downloading states. HTTP uses a checksum, or regular-file presence/size only. Torrents rebuild their piece bitmap; persisted metainfo allows verification without a live handle. |
+| `repair` | Returns the pre-repair report. Invalid HTTP data is restarted from zero; invalid torrent data causes worker reconstruction and re-checking/refetching. Callers observe events/status for completion. |
+| `open_reader` | HTTP serves only a gap-free prefix, using saved segment state when paused/restored. Torrents serve verified pieces and can reconstruct a bitmap from persisted metainfo without starting peers. |
+| Reader termination | Dropping the reader aborts its pump. EOF can also signal a failed/removed download or an unreadable completed file; compare bytes read with the known size minus the opening offset. |
+
+`DownloadReader::total_size()` is a snapshot at open time and can be `None`.
+Size-only verification cannot detect corruption that leaves the file length
+unchanged. Persisted torrent verification requires saved metainfo; an unresolved
+magnet does not yet have the piece hashes needed to verify data.
 
 ### Download States
 
@@ -475,24 +494,24 @@ pub fn calculate_segment_count(total_size: u64, max_connections: usize, min_segm
 
 ### Download Flow
 
-```
-HEAD Request → Content-Length, Accept-Ranges, ETag/Last-Modified
-    ↓
-Validate saved ETag/Last-Modified against the probe (cross-restart resume)
-    ↓
-Calculate Segments (e.g., 100MB ÷ 16 = 6.25MB each)
-    ↓
-Spawn N tasks with Range headers (striped across mirrors when configured)
-    ↓
-Each task writes to correct file offset via seek, drawing from the
-global + per-download rate limiters per chunk
-    ↓
-Aggregate progress from all segments
-    ↓
-Verify checksum (if provided)
-    ↓
-Rename .part file on completion
-```
+1. Validate the selected output filename before adding it to engine state.
+2. Probe with HEAD, including the download's custom headers, Referer, and
+   cookies. Use metadata only from successful responses; a failed probe falls
+   back to a single GET stream.
+3. Compare saved ETag/Last-Modified validators with the successful probe.
+   Use segmented ranges when supported and appropriate for the file size;
+   otherwise use a single stream.
+4. Create output parent directories and write to the `.part` file. Segmented
+   tasks seek to their own ranges and may use configured mirrors. Charge each
+   chunk to global and per-download limits and aggregate progress.
+5. Verify any configured checksum, rename the completed file, and retain its
+   path relative to `save_dir` in metadata for lifecycle operations.
+
+The engine selects an explicit filename first, then the final URL path segment
+when present. Content-Disposition is used only if neither has selected a name.
+Server filename detection therefore does not override an existing URL-derived
+engine filename. Relative subpaths are supported; parent traversal and absolute
+paths are rejected.
 
 The probe's validators are published back to the engine and persisted, so the
 next session can validate its resume against them.
@@ -1079,6 +1098,13 @@ sidecar per download, fsync-before-rename atomic writes), and
 `DownloadOptions` (so resume keeps file selection, sequential mode, and
 limits across restarts), recursive-child context, and torrent lifetime
 transfer totals (so seed-ratio decisions survive restarts).
+
+Restoration maps `Connecting`, `Downloading`, and `Seeding` to `Paused`.
+Previously queued downloads are restored and automatically resumed; completed,
+paused, and error states are retained. Saved HTTP segments are loaded for safe
+streaming as well as resume. Torrent metainfo supports offline reads and
+verification. `MemoryStorage` can be shared between engine instances in one
+process but is not durable across process exit.
 
 ### Segment State
 

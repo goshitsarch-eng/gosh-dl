@@ -45,6 +45,7 @@ and malformed or mixed-transport Metalinks.
 
 | Priority | Area | Remaining work |
 | --- | --- | --- |
+| Before relying on server-selected filenames | Engine filename precedence | The engine's explicit/URL-derived filename takes precedence over Content-Disposition. Set `DownloadOptions::filename` when a deterministic name is required; automatic server-name preference would need a separate behaviour change. |
 | Before broad network rollout | DHT, PEX, LPD, encryption, trackers and proxies | Run interoperability and long-duration tests with representative real servers/clients. DHT network tests are intentionally ignored locally; proxy coverage is still missing. Fixture tests do not prove every real-world combination. |
 | Before depending on inbound encryption | MSE responder | Inbound MSE remains unimplemented. Outgoing encryption is implemented; inbound peers are plaintext-only under compatible policies. |
 | Before depending on IPv6-only trackerless discovery | DHT IPv6 | Remains dependent on upstream `mainline` support. |

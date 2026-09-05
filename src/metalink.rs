@@ -273,12 +273,15 @@ impl DownloadEngine {
     /// Add every file described by a Metalink 4 (RFC 5854) document as an
     /// HTTP download.
     ///
-    /// For each `<file>`: the highest-priority URL becomes the primary
+    /// For each `<file>`: the highest-priority HTTP/HTTPS URL becomes the primary
     /// download URL, the rest become mirrors (automatic failover), and the
     /// document's SHA-256 (or MD5) checksum is verified after download.
     /// `options` supplies the shared settings (save dir, headers, limits...);
     /// per-file fields (`filename`, `mirrors`, `checksum`) are overridden from
-    /// the document. Files with no URLs are skipped with a warning.
+    /// the document. Other transports are ignored; files with no supported URL
+    /// are skipped with a warning. Declared size is parsed but is not enforced
+    /// as an independent integrity constraint. Torrent metaurls, piece hashes,
+    /// and hash algorithms other than SHA-256/MD5 are not supported.
     ///
     /// All-or-nothing: if adding any file fails, the downloads already added
     /// from this document are cancelled and the error is returned.

@@ -1,6 +1,6 @@
 # Recursive HTTP Implementation Checklist
 
-This checklist breaks [recursive_http_design.md](/home/gosh/Github/gosh-dl/recursive_http_design.md) into issue-sized tasks that can be implemented incrementally without destabilizing the existing HTTP engine.
+This checklist breaks [recursive_http_design.md](recursive_http_design.md) into issue-sized tasks that can be implemented incrementally without destabilizing the existing HTTP engine.
 
 ## Current Status
 
@@ -27,6 +27,12 @@ page/file limits truncate the manifest with a warning instead of failing the
 whole discovery, a single failed page fetch is skipped rather than fatal
 (a dead root is still an error), and HTML bodies stream against the size cap
 instead of buffering fully.
+
+Rollout updates in 0.6.1 add Linux/macOS/Windows CI coverage for recursive HTTP
+alone and with all other functional features. Child downloads inherit the
+HTTP authentication, nested-path, and restored-streaming fixes described in
+[ROLLOUT.md](ROLLOUT.md). Crawler-specific fuzzing and resumable discovery
+cursors remain open; the broader CI matrix does not complete those milestones.
 
 ## Working Rules
 
@@ -57,9 +63,9 @@ Scope:
 
 Files:
 
-- [Cargo.toml](/home/gosh/Github/gosh-dl/Cargo.toml)
-- [src/lib.rs](/home/gosh/Github/gosh-dl/src/lib.rs)
-- [src/http/mod.rs](/home/gosh/Github/gosh-dl/src/http/mod.rs)
+- [Cargo.toml](Cargo.toml)
+- [src/lib.rs](src/lib.rs)
+- [src/http/mod.rs](src/http/mod.rs)
 
 Acceptance criteria:
 
@@ -78,9 +84,9 @@ Scope:
 
 Files:
 
-- [src/protocol/options.rs](/home/gosh/Github/gosh-dl/src/protocol/options.rs)
-- [src/types.rs](/home/gosh/Github/gosh-dl/src/types.rs)
-- [src/lib.rs](/home/gosh/Github/gosh-dl/src/lib.rs)
+- [src/protocol/options.rs](src/protocol/options.rs)
+- [src/types.rs](src/types.rs)
+- [src/lib.rs](src/lib.rs)
 
 Acceptance criteria:
 
@@ -100,8 +106,8 @@ Scope:
 
 Files:
 
-- [src/http/crawl.rs](/home/gosh/Github/gosh-dl/src/http/crawl.rs)
-- [src/http/mod.rs](/home/gosh/Github/gosh-dl/src/http/mod.rs)
+- [src/http/crawl.rs](src/http/crawl.rs)
+- [src/http/mod.rs](src/http/mod.rs)
 
 Acceptance criteria:
 
@@ -120,7 +126,7 @@ Scope:
 
 Files:
 
-- [src/http/crawl.rs](/home/gosh/Github/gosh-dl/src/http/crawl.rs)
+- [src/http/crawl.rs](src/http/crawl.rs)
 
 Acceptance criteria:
 
@@ -147,7 +153,7 @@ Scope:
 
 Files:
 
-- [src/http/crawl.rs](/home/gosh/Github/gosh-dl/src/http/crawl.rs)
+- [src/http/crawl.rs](src/http/crawl.rs)
 
 Acceptance criteria:
 
@@ -171,8 +177,8 @@ Scope:
 
 Files:
 
-- [Cargo.toml](/home/gosh/Github/gosh-dl/Cargo.toml)
-- [src/http/crawl.rs](/home/gosh/Github/gosh-dl/src/http/crawl.rs)
+- [Cargo.toml](Cargo.toml)
+- [src/http/crawl.rs](src/http/crawl.rs)
 
 Acceptance criteria:
 
@@ -191,7 +197,7 @@ Scope:
 
 Files:
 
-- [src/http/crawl.rs](/home/gosh/Github/gosh-dl/src/http/crawl.rs)
+- [src/http/crawl.rs](src/http/crawl.rs)
 
 Acceptance criteria:
 
@@ -220,7 +226,7 @@ Scope:
 
 Files:
 
-- [src/http/crawl.rs](/home/gosh/Github/gosh-dl/src/http/crawl.rs)
+- [src/http/crawl.rs](src/http/crawl.rs)
 
 Acceptance criteria:
 
@@ -246,7 +252,7 @@ Scope:
 
 Files:
 
-- [src/http/crawl.rs](/home/gosh/Github/gosh-dl/src/http/crawl.rs)
+- [src/http/crawl.rs](src/http/crawl.rs)
 
 Acceptance criteria:
 
@@ -271,8 +277,8 @@ Scope:
 
 Files:
 
-- [src/engine.rs](/home/gosh/Github/gosh-dl/src/engine.rs)
-- [src/http/crawl.rs](/home/gosh/Github/gosh-dl/src/http/crawl.rs)
+- [src/engine.rs](src/engine.rs)
+- [src/http/crawl.rs](src/http/crawl.rs)
 
 Acceptance criteria:
 
@@ -292,7 +298,7 @@ Scope:
 
 Files:
 
-- [src/engine.rs](/home/gosh/Github/gosh-dl/src/engine.rs)
+- [src/engine.rs](src/engine.rs)
 
 Acceptance criteria:
 
@@ -309,7 +315,7 @@ Scope:
 
 Files:
 
-- [src/engine.rs](/home/gosh/Github/gosh-dl/src/engine.rs)
+- [src/engine.rs](src/engine.rs)
 
 Acceptance criteria:
 
@@ -325,8 +331,8 @@ Scope:
 
 Files:
 
-- [src/engine.rs](/home/gosh/Github/gosh-dl/src/engine.rs)
-- [recursive_http_design.md](/home/gosh/Github/gosh-dl/recursive_http_design.md)
+- [src/engine.rs](src/engine.rs)
+- [recursive_http_design.md](recursive_http_design.md)
 
 Acceptance criteria:
 
@@ -347,7 +353,7 @@ Scope:
 
 Files:
 
-- [src/http/crawl.rs](/home/gosh/Github/gosh-dl/src/http/crawl.rs)
+- [src/http/crawl.rs](src/http/crawl.rs)
 
 Acceptance criteria:
 
@@ -362,7 +368,7 @@ Scope:
 
 Files:
 
-- [tests/integration_tests.rs](/home/gosh/Github/gosh-dl/tests/integration_tests.rs)
+- [tests/integration_tests.rs](tests/integration_tests.rs)
 
 Acceptance criteria:
 
@@ -386,7 +392,7 @@ Scope:
 
 Files:
 
-- [tests/integration_tests.rs](/home/gosh/Github/gosh-dl/tests/integration_tests.rs)
+- [tests/integration_tests.rs](tests/integration_tests.rs)
 
 Acceptance criteria:
 
@@ -403,8 +409,8 @@ Scope:
 
 Files:
 
-- [fuzz/Cargo.toml](/home/gosh/Github/gosh-dl/fuzz/Cargo.toml)
-- [fuzz/fuzz_targets](/home/gosh/Github/gosh-dl/fuzz/fuzz_targets)
+- [fuzz/Cargo.toml](fuzz/Cargo.toml)
+- [fuzz/fuzz_targets](fuzz/fuzz_targets)
 
 Acceptance criteria:
 
@@ -424,8 +430,8 @@ Scope:
 
 Files:
 
-- [README.md](/home/gosh/Github/gosh-dl/README.md)
-- [technical_spec.md](/home/gosh/Github/gosh-dl/technical_spec.md)
+- [README.md](README.md)
+- [technical_spec.md](technical_spec.md)
 
 Acceptance criteria:
 
