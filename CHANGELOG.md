@@ -30,6 +30,8 @@ corresponding GitHub release.
   this allows seeding, completed, and failed live handles to fetch bad pieces again.
 - Restored torrents can be verified and streamed from persisted metainfo without
   starting network peers first.
+- uTP re-acknowledges duplicate data after a lost acknowledgment and reports
+  out-of-order packets with selective ACKs even when the cumulative ACK is unchanged.
 - Verification rejects queued downloads and no longer accepts directories as
   valid HTTP files when checking size.
 - Metalink parsing rejects unclosed and multiple roots. Unsupported transport
@@ -41,6 +43,8 @@ corresponding GitHub release.
   macOS, and Windows CI matrix; checks use the committed lockfile.
 - Added a GitHub release workflow gated on the complete CI suite, with versioned
   changelog notes and a verified Rust source package attached to the release.
+- Changelog updates also trigger the release gate so corrections to an unpublished
+  version can be validated and released from the corrected commit.
 
 ### Documentation
 - Updated installation, filename precedence, pause/resume, streaming EOF,

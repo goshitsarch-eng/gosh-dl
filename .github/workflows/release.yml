@@ -2,7 +2,7 @@ name: Release
 on:
   push:
     branches: [main]
-    paths: [Cargo.toml]
+    paths: [Cargo.toml, CHANGELOG.md]
   workflow_dispatch:
 
 permissions:

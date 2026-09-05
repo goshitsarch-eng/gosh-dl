@@ -370,6 +370,13 @@ impl UtpSocketInner {
                     }
                 }
 
+                if is_data && self.state.can_receive_data() {
+                    // Re-ack duplicates when an earlier ACK was lost, and
+                    // report SACK gaps even if the cumulative ACK is unchanged.
+                    let ack = self.build_packet(PacketType::State, Vec::new());
+                    self.send_packet_direct(ack).await?;
+                }
+
                 // Our FIN fully acknowledged?
                 if self.fin_sent
                     && self.state == ConnectionState::FinSent
@@ -1044,6 +1051,46 @@ mod tests {
         // Acceptor: sends with C, receives on C + 1
         assert_eq!(incoming.send_conn_id, 100);
         assert_eq!(incoming.recv_conn_id, 101);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_data_replaces_lost_ack_and_reports_gaps() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut sock = UtpSocketInner::new_incoming(
+            "127.0.0.1:1".parse().unwrap(),
+            100,
+            1,
+            tx,
+            UtpConfig::default(),
+        );
+        sock.state = ConnectionState::Connected;
+        let data = Packet::data(101, 2, 0, b"hello".to_vec());
+        sock.process_packet(data.clone()).await.unwrap();
+        sock.maybe_send_ack().await.unwrap();
+        let first_ack = Packet::decode(&rx.try_recv().unwrap().0).unwrap();
+        assert_eq!(first_ack.ack_nr, 2);
+
+        // Discard that ACK as if it were lost, then retransmit the same data.
+        sock.process_packet(data).await.unwrap();
+        sock.maybe_send_ack().await.unwrap();
+        let replacement = rx.try_recv().expect("lost ACK must be sent again");
+        let replacement = Packet::decode(&replacement.0).unwrap();
+        assert!(replacement.is_state());
+        assert_eq!(replacement.ack_nr, 2);
+        assert_eq!(sock.available_data(), 5, "duplicate data was delivered");
+
+        // Out-of-order data also needs feedback even without a new cumulative ACK.
+        sock.process_packet(Packet::data(101, 4, 0, b"later".to_vec()))
+            .await
+            .unwrap();
+        sock.maybe_send_ack().await.unwrap();
+        let gap_ack = rx
+            .try_recv()
+            .expect("out-of-order data must be acknowledged");
+        let gap_ack = Packet::decode(&gap_ack.0).unwrap();
+        assert_eq!(gap_ack.ack_nr, 2);
+        assert!(gap_ack.selective_ack.unwrap().is_acked(0));
+        assert_eq!(sock.available_data(), 5, "gap was exposed to the reader");
     }
 
     #[tokio::test]
