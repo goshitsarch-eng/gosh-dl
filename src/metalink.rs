@@ -211,10 +211,14 @@ pub fn parse_metalink(xml: &[u8]) -> Result<Vec<MetalinkFile>> {
 
     let mut files = Vec::new();
     let mut saw_root = false;
+    let mut closed_root = false;
 
     loop {
         match reader.read_event().map_err(xml_error)? {
             Event::Start(e) => {
+                if closed_root {
+                    return Err(parse_error("content after </metalink>"));
+                }
                 if !saw_root {
                     if e.local_name().as_ref() != b"metalink" {
                         return Err(parse_error("root element is not <metalink>"));
@@ -228,11 +232,15 @@ pub fn parse_metalink(xml: &[u8]) -> Result<Vec<MetalinkFile>> {
                 }
             }
             Event::Empty(e) => {
+                if closed_root {
+                    return Err(parse_error("content after </metalink>"));
+                }
                 if !saw_root {
                     if e.local_name().as_ref() != b"metalink" {
                         return Err(parse_error("root element is not <metalink>"));
                     }
                     saw_root = true;
+                    closed_root = true;
                 } else if e.local_name().as_ref() == b"file" {
                     // <file name="..."/> — valid name, but no URLs.
                     files.push(MetalinkFile {
@@ -243,6 +251,10 @@ pub fn parse_metalink(xml: &[u8]) -> Result<Vec<MetalinkFile>> {
                     });
                 }
             }
+            Event::End(_) => closed_root = true,
+            Event::Text(t) if !t.decode().map_err(xml_error)?.trim().is_empty() => {
+                return Err(parse_error("unexpected text outside a Metalink element"));
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -250,6 +262,9 @@ pub fn parse_metalink(xml: &[u8]) -> Result<Vec<MetalinkFile>> {
 
     if !saw_root {
         return Err(parse_error("document has no <metalink> root element"));
+    }
+    if !closed_root {
+        return Err(parse_error("unclosed <metalink> root element"));
     }
     Ok(files)
 }
@@ -275,11 +290,18 @@ impl DownloadEngine {
         let files = parse_metalink(xml)?;
         let mut added: Vec<DownloadId> = Vec::new();
 
-        for file in files {
+        for mut file in files {
+            // RFC 5854 permits other transports, but this engine queues HTTP.
+            // An FTP URL with a better priority must not hide usable mirrors.
+            file.urls.retain(|url| {
+                url::Url::parse(url)
+                    .map(|u| matches!(u.scheme(), "http" | "https"))
+                    .unwrap_or(false)
+            });
             if file.urls.is_empty() {
                 tracing::warn!(
                     file = %file.name,
-                    "Skipping metalink file with no download URLs"
+                    "Skipping metalink file with no supported HTTP/HTTPS URLs"
                 );
                 continue;
             }

@@ -18,7 +18,7 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 
 ## Features
 
-### Tested & Production-Ready
+### Core Features with Automated Tests
 
 | Feature | Details |
 |---------|---------|
@@ -81,6 +81,11 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | DHT IPv6 | Depends on upstream `mainline` crate |
 | MSE responder (inbound encryption) | Outgoing MSE works (incl. PadB handling); inbound connections are plaintext-only for now |
 | Proxy support | Wired via reqwest, not covered by tests |
+
+Release validation uses local protocol fixtures and a Linux/macOS/Windows
+feature matrix. It does not establish interoperability with every public
+torrent swarm, proxy, or directory-index server. See [ROLLOUT.md](ROLLOUT.md)
+for the rollout audit and remaining validation work.
 
 ## Quick Start
 

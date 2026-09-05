@@ -7,11 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-05
+
+Rollout hardening for the 0.6 API. This GitHub release also includes the
+0.6.0 changes listed below, which were previously committed without a
+corresponding GitHub release.
+
+### Fixed
+- Reject unsafe or empty HTTP filenames before enqueueing, so lifecycle
+  operations cannot act on an unvalidated output path.
+- Authenticated HTTP probes now include custom headers, Referer, and cookies.
+  Failed HEAD probes fall back to GET, and error-response metadata is ignored.
+- Single-stream downloads create nested parent directories. Completed download
+  metadata preserves relative subdirectories for readers, verify, repair, and delete.
+- Dropping a streaming reader stops its background task. Missing or truncated
+  completed HTTP files terminate the stream rather than retrying forever.
+- Paused and restored segmented readers expose only the contiguous downloaded
+  prefix, preventing preallocated gaps from being returned as valid data.
+- Paused torrents release their queue slot, and queued torrents remain paused
+  until explicitly resumed. Resume reconstructs a worker and re-enters the queue.
+- Torrent repair restarts the worker instead of merely changing engine state;
+  this allows seeding, completed, and failed live handles to fetch bad pieces again.
+- Restored torrents can be verified and streamed from persisted metainfo without
+  starting network peers first.
+- Verification rejects queued downloads and no longer accepts directories as
+  valid HTTP files when checking size.
+- Metalink parsing rejects unclosed and multiple roots. Unsupported transport
+  URLs no longer hide a usable HTTP/HTTPS mirror with a lower priority.
+
+### Release engineering
+- Added regression tests for HTTP, streaming, torrent lifecycle, and Metalink defects.
+- Added recursive HTTP and combined optional-feature coverage to the Linux,
+  macOS, and Windows CI matrix; checks use the committed lockfile.
+- Added a GitHub release workflow gated on the complete CI suite, with versioned
+  changelog notes and a verified Rust source package attached to the release.
+
 ## [0.6.0] - 2026-08-22
 
-This release closes out a full audit of the engine: every feature the README
-advertises is now implemented, wired, and tested. It contains security fixes;
-upgrading is recommended for all users.
+This version adds the engine features and security fixes listed below.
+Testing varies by feature; see the README for coverage and limitations.
 
 ### Security
 - Server-supplied filenames (Content-Disposition, percent-decoded URL

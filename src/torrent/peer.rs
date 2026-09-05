@@ -909,10 +909,8 @@ impl PeerConnection {
             PeerMessage::NotInterested => {
                 self.peer_interested = false;
             }
-            PeerMessage::Have { piece_index } => {
-                if (*piece_index as usize) < self.num_pieces {
-                    self.peer_pieces.set(*piece_index as usize, true);
-                }
+            PeerMessage::Have { piece_index } if (*piece_index as usize) < self.num_pieces => {
+                self.peer_pieces.set(*piece_index as usize, true);
             }
             PeerMessage::Bitfield { bitfield } => {
                 // Validate bitfield size (should be ceil(num_pieces / 8) bytes)

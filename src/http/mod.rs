@@ -84,6 +84,15 @@ pub(crate) fn partial_path_for(save_path: &Path) -> PathBuf {
 /// allowed; `..`, absolute paths, and Windows prefixes are not.
 pub(crate) fn validate_filename_components(final_filename: &str) -> Result<()> {
     use std::path::Component;
+    if !Path::new(final_filename)
+        .components()
+        .any(|c| matches!(c, Component::Normal(_)))
+    {
+        return Err(EngineError::invalid_input(
+            "filename",
+            "Filename must name a file",
+        ));
+    }
     for component in Path::new(final_filename).components() {
         match component {
             Component::ParentDir => {
@@ -271,6 +280,12 @@ impl HttpDownloader {
 
         // Send HEAD request first to get metadata
         let mut head_request = self.client().head(url).header("User-Agent", ua);
+        if let Some(referer) = referer {
+            head_request = head_request.header("Referer", referer);
+        }
+        for (name, value) in headers {
+            head_request = head_request.header(name.as_str(), value.as_str());
+        }
         if let Some(cookie_list) = cookies {
             if !cookie_list.is_empty() {
                 head_request = head_request.header("Cookie", cookie_list.join("; "));
@@ -281,7 +296,7 @@ impl HttpDownloader {
 
         let (content_length, supports_range, suggested_filename, etag, last_modified) =
             match head_response {
-                Ok(resp) => {
+                Ok(resp) if resp.status().is_success() => {
                     #[cfg(feature = "recursive-http")]
                     if let Some(scope) = redirect_scope.as_ref() {
                         crate::http::crawl::validate_redirect_scope(resp.url(), scope)?;
@@ -320,7 +335,7 @@ impl HttpDownloader {
 
                     (length, supports_range, suggested, etag, last_modified)
                 }
-                Err(_) => {
+                _ => {
                     // HEAD failed, we'll get metadata from GET response
                     (None, false, None, None, None)
                 }
@@ -364,6 +379,9 @@ impl HttpDownloader {
         validate_filename_components(&final_filename)?;
 
         let save_path = save_dir.join(&final_filename);
+        if let Some(parent) = save_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
 
         // Use .part extension during download
         let part_path = partial_path_for(&save_path);
@@ -842,7 +860,26 @@ impl HttpDownloader {
         let saved_validators = validators.as_ref().map(|cell| cell.read().clone());
 
         // Probe server capabilities
-        let capabilities = probe_server(self.client(), url, ua).await?;
+        let mut probe = self.client().head(url).header("User-Agent", ua);
+        if let Some(referer) = referer {
+            probe = probe.header("Referer", referer);
+        }
+        for (name, value) in headers {
+            probe = probe.header(name.as_str(), value.as_str());
+        }
+        if let Some(cookies) = cookies.filter(|c| !c.is_empty()) {
+            probe = probe.header("Cookie", cookies.join("; "));
+        }
+        let capabilities = segment::probe_request(probe).await.unwrap_or_else(|err| {
+            tracing::debug!("HEAD probe failed for {} ({}); trying GET", url, err);
+            ServerCapabilities {
+                content_length: None,
+                supports_range: false,
+                etag: None,
+                last_modified: None,
+                suggested_filename: None,
+            }
+        });
 
         // NOTE: the shared cell must keep the *saved* validators until the
         // segmented-vs-single decision below — the single-connection fallback
