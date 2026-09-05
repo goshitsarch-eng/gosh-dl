@@ -17,6 +17,7 @@ at audit time was 0.5.0. No open GitHub issues were returned.
 | Torrent pause/resume | Queued torrents could start after pause; paused torrents held concurrency slots. | Stop the old worker and resume through a fresh queued worker. |
 | Torrent repair | Changing the engine state did not restart a finished worker or leave seeding mode. | Reconstruct the downloader with its metainfo and restart through the queue. |
 | Torrent restart APIs | Verify and streaming depended on a live downloader handle. | Build a verified piece bitmap from persisted metainfo without starting peers. |
+| uTP packet loss | A lost ACK could stall a transfer because duplicate and out-of-order data did not cause fresh feedback. | Re-ack data regardless of cumulative ACK advancement and include selective ACK gaps. |
 | Verification | Queued downloads could be verified while about to start; directories could satisfy an HTTP size-only check. | Reject queued verification and require regular files. |
 | Metalink | Truncated/multiple roots were accepted; an FTP URL could prevent use of an available HTTP mirror. | Enforce root closure and choose supported transports. |
 | CI and release | Recursive HTTP was absent from platform tests; no automated release gate existed; fuzz lockfile still described 0.5.0. | Expand the matrix, refresh lockfiles, and gate source-package releases on CI. |
@@ -25,6 +26,11 @@ The first five new HTTP regressions were run against the unmodified
 implementation and all failed. The corrected implementation passes them.
 Further tests cover restored segmented reads, torrent queue/repair/restart,
 and malformed or mixed-transport Metalinks.
+
+The first release validation run exposed a uTP packet-loss timeout on macOS.
+A deterministic lost-ACK regression then failed against that code; the fix
+restores acknowledgments for duplicate and out-of-order data without relaxing
+the packet-loss test or the release gate.
 
 ## Validation and release gate
 
