@@ -22,8 +22,11 @@ jobs:
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Prepare version and release notes
@@ -45,6 +48,46 @@ jobs:
           PY
       - name: Build and verify source package
         run: cargo package --locked --all-features
+      - name: Check registry publication
+        id: registry
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, urllib.error, urllib.request
+          version = os.environ['RELEASE_VERSION']
+          request = urllib.request.Request(
+              f'https://crates.io/api/v1/crates/gosh-dl/{version}',
+              headers={'User-Agent': 'gosh-dl-release (https://github.com/goshitsarch-eng/gosh-dl)'},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  published = json.load(response)['version']
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              exists = False
+          else:
+              package = pathlib.Path(f'target/package/gosh-dl-{version}.crate')
+              checksum = hashlib.sha256(package.read_bytes()).hexdigest()
+              if published['num'] != version or published['checksum'] != checksum:
+                  raise SystemExit('Published version differs from this package; choose a new version')
+              if published.get('yanked'):
+                  raise SystemExit('Published version is yanked; choose a new version')
+              exists = True
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'exists={str(exists).lower()}\n')
+          PY
+      - name: Authenticate with crates.io
+        if: steps.registry.outputs.exists == 'false'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish to crates.io
+        if: steps.registry.outputs.exists == 'false'
+        run: cargo publish --locked --all-features --registry crates-io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

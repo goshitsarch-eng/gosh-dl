@@ -43,9 +43,10 @@ the packet-loss test or the release gate.
 - GitHub CI runs the feature matrix on Linux, macOS, and Windows, plus the
   four existing fuzz smoke targets. The release workflow runs this suite
   before creating a version tag and attaching the `.crate` source package.
-- This is a library release, not a standalone application binary. Publishing
-  to crates.io requires a separate registry publishing setup; the workflow
-  publishes a GitHub release only.
+- This is a library release, not a standalone application binary. Version 0.6.1
+  was published on GitHub only. Starting with 0.6.2, the workflow publishes to
+  crates.io through Trusted Publishing before creating the GitHub release.
+  See the README for the one-time crate-owner configuration.
 
 ## Remaining scope and validation work
 
