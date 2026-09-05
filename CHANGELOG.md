@@ -45,6 +45,8 @@ corresponding GitHub release.
   changelog notes and a verified Rust source package attached to the release.
 - Changelog updates also trigger the release gate so corrections to an unpublished
   version can be validated and released from the corrected commit.
+- Release-note extraction stops the version heading at its newline, preserving
+  the selected version's notes when the changelog contains multiple releases.
 
 ### Documentation
 - Updated installation, filename precedence, pause/resume, streaming EOF,

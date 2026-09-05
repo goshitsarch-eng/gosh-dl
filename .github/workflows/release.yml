@@ -36,7 +36,7 @@ jobs:
           if not re.fullmatch(r'\d+\.\d+\.\d+', version):
               raise SystemExit('Stable release requires a numeric major.minor.patch version')
           changelog = pathlib.Path('CHANGELOG.md').read_text()
-          match = re.search(r'^## \[' + re.escape(version) + r'\].*\n(.*?)(?=^## \[|\Z)', changelog, re.M | re.S)
+          match = re.search(r'^## \[' + re.escape(version) + r'\][^\n]*\n(.*?)(?=^## \[|\Z)', changelog, re.M | re.S)
           if not match or not match.group(1).strip():
               raise SystemExit('Missing release notes for ' + version)
           pathlib.Path(os.environ['RUNNER_TEMP'], 'release-notes.md').write_text(match.group(1).strip() + '\n')
