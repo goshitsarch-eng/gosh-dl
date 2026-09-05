@@ -52,6 +52,11 @@ impl std::str::FromStr for DownloadPriority {
 /// Options for adding a new download
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DownloadOptions {
+    /// Create the download in `Paused` state without starting a worker.
+    /// Call `DownloadEngine::resume` to start it. Recursive HTTP discovery
+    /// still runs, but discovered file transfers remain paused.
+    #[serde(default)]
+    pub start_paused: bool,
     /// Download priority (affects queue ordering)
     #[serde(default)]
     pub priority: DownloadPriority,

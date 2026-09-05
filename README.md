@@ -94,7 +94,7 @@ Requires Rust 1.85 or newer. Add the published crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-dl = "0.6.2"
+gosh-dl = "0.6.3"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -103,7 +103,7 @@ Optional features: `recursive-http` (directory mirroring) and `metalink`
 
 ```toml
 [dependencies]
-gosh-dl = { version = "0.6.2", features = ["recursive-http"] }
+gosh-dl = { version = "0.6.3", features = ["recursive-http"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -637,3 +637,12 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 - Built with [Tokio](https://tokio.rs/) for async runtime
 - Uses [mainline](https://crates.io/crates/mainline) for DHT support
+
+### Adding work without starting transfers
+
+Set `DownloadOptions { start_paused: true, ..Default::default() }` to create
+HTTP, torrent, or magnet downloads in `DownloadState::Paused`. Call
+`engine.resume(id).await?` to start them later. Recursive HTTP jobs still fetch
+directory listings during discovery, but their child file transfers remain
+paused. Options and torrent metadata are retained for resume; persistent
+storage is required to resume across process exits.

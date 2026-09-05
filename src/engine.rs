@@ -54,6 +54,9 @@ struct ManagedDownload {
     /// sequential mode, connection caps, and speed limits instead of
     /// rebuilding them from defaults.
     options: Option<DownloadOptions>,
+    /// Metainfo retained for torrents added paused without persistent storage.
+    #[cfg(feature = "torrent")]
+    cached_torrent_data: Option<Vec<u8>>,
     /// Lifetime torrent transfer totals restored from storage, consumed when
     /// the torrent (re)starts.
     restored_totals: Option<(u64, u64)>,
@@ -615,6 +618,8 @@ impl DownloadEngine {
                     status: restored_status,
                     handle: None,
                     options: restored_options,
+                    #[cfg(feature = "torrent")]
+                    cached_torrent_data: None,
                     restored_totals,
                     #[cfg(feature = "http")]
                     cached_segments,
@@ -784,7 +789,11 @@ impl DownloadEngine {
         let status = DownloadStatus {
             id,
             kind: DownloadKind::Http,
-            state: DownloadState::Queued,
+            state: if options.start_paused {
+                DownloadState::Paused
+            } else {
+                DownloadState::Queued
+            },
             priority: options.priority,
             progress: DownloadProgress::default(),
             metadata: DownloadMetadata {
@@ -827,6 +836,8 @@ impl DownloadEngine {
                     status: status.clone(),
                     handle: None,
                     options: Some(options.clone()),
+                    #[cfg(feature = "torrent")]
+                    cached_torrent_data: None,
                     restored_totals: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
@@ -862,8 +873,10 @@ impl DownloadEngine {
         let _ = self.event_tx.send(DownloadEvent::Added { id });
 
         // Start the download (no saved segments for new downloads)
-        self.start_download(id, url.to_string(), options, None)
-            .await?;
+        if !options.start_paused {
+            self.start_download(id, url.to_string(), options, None)
+                .await?;
+        }
 
         Ok(id)
     }
@@ -1381,7 +1394,11 @@ impl DownloadEngine {
         let status = DownloadStatus {
             id,
             kind: DownloadKind::Torrent,
-            state: DownloadState::Queued,
+            state: if options.start_paused {
+                DownloadState::Paused
+            } else {
+                DownloadState::Queued
+            },
             priority: options.priority,
             progress: DownloadProgress::default(),
             metadata: DownloadMetadata {
@@ -1415,6 +1432,8 @@ impl DownloadEngine {
                     status: status.clone(),
                     handle: None,
                     options: Some(options.clone()),
+                    #[cfg(feature = "torrent")]
+                    cached_torrent_data: options.start_paused.then(|| torrent_data.to_vec()),
                     restored_totals: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
@@ -1456,7 +1475,9 @@ impl DownloadEngine {
         let _ = self.event_tx.send(DownloadEvent::Added { id });
 
         // Start the torrent download
-        self.start_torrent(id, metainfo, save_dir, options).await?;
+        if !options.start_paused {
+            self.start_torrent(id, metainfo, save_dir, options).await?;
+        }
 
         Ok(id)
     }
@@ -1484,7 +1505,11 @@ impl DownloadEngine {
         let status = DownloadStatus {
             id,
             kind: DownloadKind::Magnet,
-            state: DownloadState::Queued,
+            state: if options.start_paused {
+                DownloadState::Paused
+            } else {
+                DownloadState::Queued
+            },
             priority: options.priority,
             progress: DownloadProgress::default(),
             metadata: DownloadMetadata {
@@ -1518,6 +1543,8 @@ impl DownloadEngine {
                     status: status.clone(),
                     handle: None,
                     options: Some(options.clone()),
+                    #[cfg(feature = "torrent")]
+                    cached_torrent_data: None,
                     restored_totals: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
@@ -1555,7 +1582,9 @@ impl DownloadEngine {
         let _ = self.event_tx.send(DownloadEvent::Added { id });
 
         // Start the magnet download
-        self.start_magnet(id, magnet, save_dir, options).await?;
+        if !options.start_paused {
+            self.start_magnet(id, magnet, save_dir, options).await?;
+        }
 
         Ok(id)
     }
@@ -2701,11 +2730,7 @@ impl DownloadEngine {
                         }
                     } else {
                         // No live handle (crash recovery) — try reconstructing from stored data
-                        let torrent_data = if let Some(ref storage) = self.storage {
-                            storage.load_torrent_data(id).await.unwrap_or(None)
-                        } else {
-                            None
-                        };
+                        let torrent_data = self.load_torrent_data(id).await?;
 
                         if let Some(data) = torrent_data {
                             let metainfo = Metainfo::parse(&data)?;
@@ -3058,18 +3083,33 @@ impl DownloadEngine {
             }
             download.status.metadata.save_dir.clone()
         };
-        let data = match &self.storage {
-            Some(storage) => storage.load_torrent_data(id).await?,
-            None => None,
-        }
-        .ok_or_else(|| EngineError::InvalidState {
-            action: "read torrent data",
-            current_state: "torrent metadata is not available".into(),
-        })?;
+        let data = self
+            .load_torrent_data(id)
+            .await?
+            .ok_or_else(|| EngineError::InvalidState {
+                action: "read torrent data",
+                current_state: "torrent metadata is not available".into(),
+            })?;
         Ok(Arc::new(crate::torrent::PieceManager::new(
             Arc::new(Metainfo::parse(&data)?),
             save_dir,
         )))
+    }
+
+    #[cfg(feature = "torrent")]
+    async fn load_torrent_data(&self, id: DownloadId) -> Result<Option<Vec<u8>>> {
+        let cached = self
+            .downloads
+            .read()
+            .get(&id)
+            .and_then(|d| d.cached_torrent_data.clone());
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        match &self.storage {
+            Some(storage) => storage.load_torrent_data(id).await,
+            None => Ok(None),
+        }
     }
 
     /// Re-verify a download's on-disk data.

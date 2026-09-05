@@ -1322,3 +1322,11 @@ pub enum AllocationMode {
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+## Paused creation (0.6.3)
+
+`DownloadOptions::start_paused` defaults to false. When true, add operations
+persist a Paused status and options without spawning transfer workers. The
+flag affects creation only; explicit resume starts the worker normally.
+Recursive discovery is independent of child transfer startup. Raw torrent
+metainfo is retained for paused torrents even without a storage backend.
