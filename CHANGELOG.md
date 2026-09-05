@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-05
+
+### Added
+- `DownloadOptions::start_paused` creates HTTP, torrent, magnet, and recursive
+  child downloads paused without starting transfer workers. Explicit resume
+  starts them; recursive directory discovery still performs requests.
+
+### Fixed
+- Retain metainfo for torrents created paused without storage, allowing later
+  verification and resume without a live worker.
+
+### Compatibility
+- The new option defaults to false, including when reading older saved options.
+  Existing struct literals should use `..Default::default()` or provide
+  `start_paused: false` explicitly.
+
 ## [0.6.2] - 2026-09-05
 
 This release includes the download and streaming fixes from
@@ -479,7 +495,7 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.3...HEAD
 [0.6.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/d475e65feedf1fd5da88bb9e29d99bc8696467a0...v0.6.1
 [0.6.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.5.0...d475e65feedf1fd5da88bb9e29d99bc8696467a0
@@ -505,3 +521,5 @@ adds proper infrastructure, and restructures the public API.
 [0.1.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/goshitsarch-eng/gosh-dl/releases/tag/v0.1.0
+
+[0.6.3]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.2...v0.6.3

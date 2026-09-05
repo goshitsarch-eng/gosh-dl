@@ -63,3 +63,11 @@ the packet-loss test or the release gate.
 The 0.6.1 patch addresses the reproducible failures above. It does not claim
 that every optional feature is production-proven, and it is not a 1.0 API
 stability declaration.
+
+## 0.6.3 queue creation
+
+The CLI review exposed a race when an application starts downloads and then
+pauses them to simulate queue-only work. `DownloadOptions::start_paused` now
+creates paused records before any worker exists. Regressions verify no HTTP
+requests before resume, paused recursive children, restart recovery, and
+in-memory torrent/magnet creation and resume.

@@ -1493,3 +1493,74 @@ async fn test_torrent_transfer_over_utp() {
     leecher.stop().await.ok();
     seeder.stop().await.ok();
 }
+
+#[tokio::test]
+async fn start_paused_torrent_keeps_metainfo_without_storage() {
+    use gosh_dl::{torrent::BencodeValue, DownloadState};
+    let dir = TempDir::new().unwrap();
+    let engine = DownloadEngine::new(EngineConfig {
+        download_dir: dir.path().into(),
+        enable_dht: false,
+        enable_pex: false,
+        enable_lpd: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let (data, _, _) = build_test_torrent("paused-new", 16384, 1);
+    let mut value = BencodeValue::parse_exact(&data).unwrap();
+    if let BencodeValue::Dict(ref mut dict) = value {
+        dict.remove(b"announce".as_slice());
+    }
+    let id = engine
+        .add_torrent(
+            &value.encode(),
+            DownloadOptions {
+                start_paused: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(engine.status(id).unwrap().state, DownloadState::Paused);
+    assert!(!engine.verify(id).await.unwrap().valid);
+    engine.resume(id).await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while engine.status(id).unwrap().state != DownloadState::Downloading {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("paused torrent must retain metainfo for resume");
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn start_paused_magnet_does_not_start_discovery() {
+    use gosh_dl::DownloadState;
+    let dir = TempDir::new().unwrap();
+    let engine = DownloadEngine::new(EngineConfig {
+        download_dir: dir.path().into(),
+        enable_dht: false,
+        enable_lpd: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let id = engine
+        .add_magnet(
+            "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+            DownloadOptions {
+                start_paused: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(engine.status(id).unwrap().state, DownloadState::Paused);
+    engine.resume(id).await.unwrap();
+    assert_ne!(engine.status(id).unwrap().state, DownloadState::Paused);
+    engine.shutdown().await.unwrap();
+}

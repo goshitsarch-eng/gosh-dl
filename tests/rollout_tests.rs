@@ -256,3 +256,98 @@ async fn restored_segmented_reader_stops_at_the_first_hole() {
     drop(reader);
     engine.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn start_paused_makes_no_requests_and_resumes_after_restart() {
+    use std::sync::Arc;
+    let dir = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("queued"))
+        .mount(&server)
+        .await;
+    let storage = Arc::new(gosh_dl::MemoryStorage::new());
+    let config = EngineConfig {
+        download_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let engine = DownloadEngine::with_storage(config.clone(), storage.clone())
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        ids.push(
+            engine
+                .add_http(
+                    &format!("{}/file-{i}", server.uri()),
+                    DownloadOptions {
+                        start_paused: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(engine
+        .list()
+        .iter()
+        .all(|s| s.state == DownloadState::Paused));
+    engine.shutdown().await.unwrap();
+    drop(engine);
+    let engine = DownloadEngine::with_storage(config, storage).await.unwrap();
+    engine.resume(ids[0]).await.unwrap();
+    completed(&engine, ids[0]).await;
+    assert_eq!(
+        tokio::fs::read(dir.path().join("file-0")).await.unwrap(),
+        b"queued"
+    );
+    assert!(ids[1..]
+        .iter()
+        .all(|id| engine.status(*id).unwrap().state == DownloadState::Paused));
+    engine.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "recursive-http")]
+#[tokio::test]
+async fn start_paused_mirror_discovers_without_transferring_children() {
+    use wiremock::matchers::path;
+    let dir = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/files/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string("<a href=\"one.bin\">one</a><a href=\"two.bin\">two</a>"),
+        )
+        .mount(&server)
+        .await;
+    let engine = engine(&dir).await;
+    let job = engine
+        .add_http_recursive(
+            &format!("{}/files/", server.uri()),
+            DownloadOptions {
+                start_paused: true,
+                ..Default::default()
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(job.child_ids.len(), 2);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(engine
+        .list()
+        .iter()
+        .all(|s| s.state == DownloadState::Paused));
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.url.path() == "/files/"));
+    engine.shutdown().await.unwrap();
+}
