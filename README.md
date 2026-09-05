@@ -90,12 +90,11 @@ for the rollout audit and remaining validation work.
 
 ## Quick Start
 
-Requires Rust 1.85 or newer. The 0.6.1 release is published on GitHub as a
-source package. To use that release directly, add to your `Cargo.toml`:
+Requires Rust 1.85 or newer. Add the published crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-dl = { git = "https://github.com/goshitsarch-eng/gosh-dl", tag = "v0.6.1" }
+gosh-dl = "0.6.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -104,12 +103,12 @@ Optional features: `recursive-http` (directory mirroring) and `metalink`
 
 ```toml
 [dependencies]
-gosh-dl = { git = "https://github.com/goshitsarch-eng/gosh-dl", tag = "v0.6.1", features = ["recursive-http"] }
+gosh-dl = { version = "0.6.2", features = ["recursive-http"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
-GitHub releases do not automatically publish to crates.io or update docs.rs.
-The registry badges above refer to the separately published registry version.
+Starting with 0.6.2, the release workflow publishes to crates.io before creating
+the GitHub release. Version 0.6.1 was distributed on GitHub only.
 
 Basic usage:
 
@@ -499,13 +498,38 @@ cargo doc --locked --all-features --open
 
 ## Releasing
 
-The release workflow runs when a change to `Cargo.toml` reaches `main`, or
-when manually dispatched on `main`. It runs the complete CI suite, checks
-the version's changelog entry, and verifies `cargo package --all-features`
-before creating the GitHub tag/release and attaching the `.crate` source
-package. Existing releases are left unchanged. This workflow does not
-publish to crates.io. See [ROLLOUT.md](ROLLOUT.md) for rollout scope and
-remaining validation work.
+The release workflow runs when `Cargo.toml` or `CHANGELOG.md` changes on
+`main`, or when manually dispatched on `main`. It runs the complete CI suite,
+extracts the version's changelog entry, and verifies the source package before
+publishing to crates.io through Trusted Publishing. Only after registry
+publication succeeds does it create the GitHub tag/release and attach the
+`.crate` source package.
+
+A crate owner must configure this once under the `gosh-dl` crate's **Settings →
+Trusted Publishing** on [crates.io](https://crates.io/crates/gosh-dl):
+
+| Setting | Value |
+| --- | --- |
+| Provider | GitHub |
+| Repository owner | `goshitsarch-eng` |
+| Repository name | `gosh-dl` |
+| Workflow filename | `release.yml` (not the full path) |
+| Environment | Leave empty; this workflow does not use an environment |
+
+The workflow requests a short-lived token using GitHub OIDC immediately before
+publishing; the authentication action revokes it when the job finishes. No
+`cargo login` or permanent GitHub secret is required. See the official
+[Trusted Publishing guide](https://crates.io/docs/trusted-publishing).
+
+After configuring the publisher, merge the version/changelog update. If an
+attempt fails before authorization is configured, save the configuration and
+rerun the failed jobs in GitHub Actions. If registry publication succeeded but
+GitHub release creation failed, a rerun verifies the registry checksum against
+the locally built package before skipping publication and completing the
+GitHub release. A checksum mismatch stops the job; published versions cannot
+be overwritten. Existing GitHub releases are left unchanged.
+
+See [ROLLOUT.md](ROLLOUT.md) for rollout scope and remaining validation work.
 
 See [technical_spec.md](technical_spec.md) for architecture details.
 

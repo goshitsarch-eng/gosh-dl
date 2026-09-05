@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-05
+
+This release includes the download and streaming fixes from
+[0.6.1](https://github.com/goshitsarch-eng/gosh-dl/releases/tag/v0.6.1),
+which was distributed on GitHub only, and enables automated registry publishing.
+
+### Release engineering
+- Publish to crates.io using GitHub OIDC Trusted Publishing after the complete
+  CI suite and source-package verification pass. No stored API token is needed.
+- Create the GitHub release after registry publication succeeds. A rerun skips
+  an already-published crate only when its checksum matches the verified package.
+- Pin the crates.io authentication action and restrict its temporary token to
+  the publishing step.
+
+### Documentation
+- Use crates.io installation examples for 0.6.2 and document the one-time
+  Trusted Publisher configuration and release recovery process.
+
 ## [0.6.1] - 2026-09-05
 
 Rollout hardening for the 0.6 API. This GitHub release also includes the
@@ -461,7 +479,8 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/d475e65feedf1fd5da88bb9e29d99bc8696467a0...v0.6.1
 [0.6.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.5.0...d475e65feedf1fd5da88bb9e29d99bc8696467a0
 [0.5.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.4.0...v0.5.0

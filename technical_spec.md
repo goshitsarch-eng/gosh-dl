@@ -2,7 +2,7 @@
 
 A native Rust download engine supporting HTTP/HTTPS and BitTorrent protocols.
 
-Current implementation reference: **0.6.1**, requiring Rust **1.85+**.
+Current implementation reference: **0.6.2**, requiring Rust **1.85+**.
 See [ROLLOUT.md](ROLLOUT.md) for validation scope and remaining feature limits.
 
 ---
@@ -228,7 +228,7 @@ impl DownloadEngine {
 
 ### Lifecycle and Integrity Semantics
 
-| Operation | 0.6.1 behaviour |
+| Operation | 0.6.2 behaviour |
 | --- | --- |
 | Torrent pause | Stops the worker and releases its queue slot. A queued task cannot start after pause. |
 | Torrent resume | Reconstructs the worker from metainfo or the original magnet URI, preserves options and lifetime totals, and reacquires a priority-queue permit. Startup checks existing pieces. |
