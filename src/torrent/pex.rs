@@ -20,6 +20,13 @@ use crate::torrent::bencode::BencodeValue;
 /// Extension name for PEX in BEP 10 handshake.
 pub const PEX_EXTENSION_NAME: &str = "ut_pex";
 
+/// Maximum number of addresses taken from each list (`added`, `dropped`,
+/// `added6`, `dropped6`) of a single received PEX message; the excess is
+/// ignored. libtorrent sends at most 50-100 per message, so this bounds
+/// what one hostile peer can make us allocate and dial without affecting
+/// well-behaved clients.
+const MAX_PEERS_PER_LIST: usize = 100;
+
 /// PEX flag bits for the added.f field.
 pub mod flags {
     /// Peer prefers encrypted connections.
@@ -71,11 +78,11 @@ impl PexMessage {
             .map(parse_compact_peers_v4)
             .unwrap_or_default();
 
-        // Parse added flags
+        // Parse added flags (one byte per added peer, capped like the peers)
         let added_flags = dict
             .get(b"added.f".as_slice())
             .and_then(|v| v.as_bytes())
-            .map(|b| b.to_vec())
+            .map(|b| b.iter().copied().take(MAX_PEERS_PER_LIST).collect())
             .unwrap_or_default();
 
         // Parse IPv4 dropped peers
@@ -96,7 +103,7 @@ impl PexMessage {
         let added6_flags = dict
             .get(b"added6.f".as_slice())
             .and_then(|v| v.as_bytes())
-            .map(|b| b.to_vec())
+            .map(|b| b.iter().copied().take(MAX_PEERS_PER_LIST).collect())
             .unwrap_or_default();
 
         // Parse IPv6 dropped peers
@@ -208,8 +215,11 @@ impl PexMessage {
 }
 
 /// Parse compact IPv4 peers (6 bytes per peer: 4 IP + 2 port big-endian).
+///
+/// At most [`MAX_PEERS_PER_LIST`] addresses are returned.
 fn parse_compact_peers_v4(data: &[u8]) -> Vec<SocketAddr> {
     data.chunks_exact(6)
+        .take(MAX_PEERS_PER_LIST)
         .map(|chunk| {
             let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
             let port = u16::from_be_bytes([chunk[4], chunk[5]]);
@@ -219,8 +229,11 @@ fn parse_compact_peers_v4(data: &[u8]) -> Vec<SocketAddr> {
 }
 
 /// Parse compact IPv6 peers (18 bytes per peer: 16 IP + 2 port big-endian).
+///
+/// At most [`MAX_PEERS_PER_LIST`] addresses are returned.
 fn parse_compact_peers_v6(data: &[u8]) -> Vec<SocketAddr> {
     data.chunks_exact(18)
+        .take(MAX_PEERS_PER_LIST)
         .map(|chunk| {
             let ip_bytes: [u8; 16] = chunk[0..16].try_into().unwrap();
             let ip = Ipv6Addr::from(ip_bytes);
@@ -519,6 +532,66 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             6881
         ))));
+    }
+
+    #[test]
+    fn test_parse_caps_oversized_peer_lists() {
+        // 250 v4 added, 250 v4 dropped, 150 v6 added, 150 v6 dropped, and
+        // 250 flag bytes: everything past MAX_PEERS_PER_LIST is ignored.
+        let v4 = |n: usize| -> Vec<u8> {
+            (0..n)
+                .flat_map(|i| {
+                    let i = i as u16;
+                    [10, (i >> 8) as u8, i as u8, 1, 0x1a, 0xe1]
+                })
+                .collect()
+        };
+        let v6 = |n: usize| -> Vec<u8> {
+            (0..n)
+                .flat_map(|i| {
+                    let mut entry = [0u8; 18];
+                    entry[0] = 0x20;
+                    entry[1] = 0x01;
+                    entry[14..16].copy_from_slice(&(i as u16).to_be_bytes());
+                    entry[16..18].copy_from_slice(&0x1ae1u16.to_be_bytes());
+                    entry
+                })
+                .collect()
+        };
+
+        let mut dict = BTreeMap::new();
+        dict.insert(b"added".to_vec(), BencodeValue::Bytes(v4(250)));
+        dict.insert(b"added.f".to_vec(), BencodeValue::Bytes(vec![0x02; 250]));
+        dict.insert(b"dropped".to_vec(), BencodeValue::Bytes(v4(250)));
+        dict.insert(b"added6".to_vec(), BencodeValue::Bytes(v6(150)));
+        dict.insert(b"added6.f".to_vec(), BencodeValue::Bytes(vec![0x02; 150]));
+        dict.insert(b"dropped6".to_vec(), BencodeValue::Bytes(v6(150)));
+        let encoded = BencodeValue::Dict(dict).encode();
+
+        let msg = PexMessage::parse(&encoded).unwrap();
+        assert_eq!(msg.added.len(), MAX_PEERS_PER_LIST);
+        assert_eq!(msg.added_flags.len(), MAX_PEERS_PER_LIST);
+        assert_eq!(msg.dropped.len(), MAX_PEERS_PER_LIST);
+        assert_eq!(msg.added6.len(), MAX_PEERS_PER_LIST);
+        assert_eq!(msg.added6_flags.len(), MAX_PEERS_PER_LIST);
+        assert_eq!(msg.dropped6.len(), MAX_PEERS_PER_LIST);
+        assert_eq!(msg.all_added().len(), 2 * MAX_PEERS_PER_LIST);
+
+        // The first entries are kept, in order
+        assert_eq!(
+            msg.added[0],
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 6881))
+        );
+        assert_eq!(
+            msg.added[99],
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 99, 1), 6881))
+        );
+
+        // Lists within the limit are untouched
+        let mut dict = BTreeMap::new();
+        dict.insert(b"added".to_vec(), BencodeValue::Bytes(v4(100)));
+        let msg = PexMessage::parse(&BencodeValue::Dict(dict).encode()).unwrap();
+        assert_eq!(msg.added.len(), 100);
     }
 
     #[test]

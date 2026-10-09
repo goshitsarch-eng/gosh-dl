@@ -49,7 +49,10 @@ fn file_name_attr(e: &BytesStart<'_>) -> Result<String> {
     for attr in e.attributes() {
         let attr = attr.map_err(xml_error)?;
         if attr.key.local_name().as_ref() == b"name" {
-            let name = attr.unescape_value().map_err(xml_error)?.into_owned();
+            let name = attr
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_err(xml_error)?
+                .into_owned();
             if name.is_empty() {
                 return Err(parse_error("<file> name attribute is empty"));
             }
@@ -66,7 +69,11 @@ fn attr_by_local_name(e: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>> 
     for attr in e.attributes() {
         let attr = attr.map_err(xml_error)?;
         if attr.key.local_name().as_ref() == key {
-            return Ok(Some(attr.unescape_value().map_err(xml_error)?.into_owned()));
+            return Ok(Some(
+                attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    .map_err(xml_error)?
+                    .into_owned(),
+            ));
         }
     }
     Ok(None)
@@ -266,6 +273,17 @@ pub fn parse_metalink(xml: &[u8]) -> Result<Vec<MetalinkFile>> {
     if !closed_root {
         return Err(parse_error("unclosed <metalink> root element"));
     }
+    // Two <file> elements with the same name would become two concurrent
+    // downloads writing the same `.part` file.
+    let mut names = std::collections::HashSet::new();
+    for file in &files {
+        if !names.insert(file.name.as_str()) {
+            return Err(parse_error(format!(
+                "duplicate file name in metalink: {}",
+                file.name
+            )));
+        }
+    }
     Ok(files)
 }
 
@@ -385,6 +403,15 @@ mod tests {
             md5 = MD5_A,
             sha = SHA256_A,
         )
+    }
+
+    #[test]
+    fn rejects_duplicate_file_names() {
+        let err = parse_metalink(
+            br#"<metalink><file name="x"><url>http://example.com/x</url></file><file name="x"><url>http://example.com/y</url></file></metalink>"#,
+        )
+        .expect_err("two files with the same name would share one .part file");
+        assert!(err.to_string().contains("duplicate"), "{err}");
     }
 
     #[test]

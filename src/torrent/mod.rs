@@ -270,7 +270,18 @@ pub struct TorrentDownloader {
     listen_port: std::sync::atomic::AtomicU16,
     /// Tasks driving inbound peer connections, aborted on stop().
     inbound_tasks: RwLock<Vec<tokio::task::JoinHandle<()>>>,
+    /// Tasks driving outbound peer connections (addr -> task). Owned here,
+    /// not by `run_peer_loop`, so `stop()` can abort them even when the
+    /// peer loop task itself was aborted and never ran its cleanup.
+    peer_tasks: Arc<RwLock<HashMap<SocketAddr, tokio::task::JoinHandle<()>>>>,
+    /// Bounds inbound connections that have been accepted but have not yet
+    /// completed the handshake; `max_peers` only counts handshaken peers, so
+    /// without this a flood of idle connections could exhaust descriptors.
+    inbound_handshakes: Arc<Semaphore>,
 }
+
+/// Maximum inbound connections waiting for their BitTorrent handshake.
+const MAX_PENDING_INBOUND_HANDSHAKES: usize = 64;
 
 /// Information about a connected peer
 #[derive(Debug)]
@@ -381,6 +392,8 @@ impl TorrentDownloader {
             peer_backoff: RwLock::new(HashMap::new()),
             listen_port: std::sync::atomic::AtomicU16::new(0),
             inbound_tasks: RwLock::new(Vec::new()),
+            peer_tasks: Arc::new(RwLock::new(HashMap::new())),
+            inbound_handshakes: Arc::new(Semaphore::new(MAX_PENDING_INBOUND_HANDSHAKES)),
         })
     }
 
@@ -438,6 +451,8 @@ impl TorrentDownloader {
             peer_backoff: RwLock::new(HashMap::new()),
             listen_port: std::sync::atomic::AtomicU16::new(0),
             inbound_tasks: RwLock::new(Vec::new()),
+            peer_tasks: Arc::new(RwLock::new(HashMap::new())),
+            inbound_handshakes: Arc::new(Semaphore::new(MAX_PENDING_INBOUND_HANDSHAKES)),
         })
     }
 
@@ -1017,6 +1032,12 @@ impl TorrentDownloader {
                 None => continue,
             };
 
+            let Ok(handshake_permit) = Arc::clone(&self.inbound_handshakes).try_acquire_owned()
+            else {
+                tracing::debug!("Rejecting inbound uTP peer (too many pending handshakes)");
+                continue;
+            };
+
             let downloader = Arc::clone(&self);
             let shared_stats = Arc::clone(&self.shared_peer_stats);
             let choking_decisions = Arc::clone(&self.choking_decisions);
@@ -1024,7 +1045,10 @@ impl TorrentDownloader {
             let info_hash = self.info_hash;
             let handle = tokio::spawn(async move {
                 let addr = socket.peer_addr().ok();
-                match PeerConnection::connect_utp(socket, info_hash, peer_id, num_pieces).await {
+                let accepted =
+                    PeerConnection::connect_utp(socket, info_hash, peer_id, num_pieces).await;
+                drop(handshake_permit);
+                match accepted {
                     Ok(conn) => {
                         let addr = conn.addr();
                         tracing::info!("Accepted inbound uTP peer {}", addr);
@@ -1102,13 +1126,25 @@ impl TorrentDownloader {
                 }
             };
 
+            let Ok(handshake_permit) = Arc::clone(&self.inbound_handshakes).try_acquire_owned()
+            else {
+                tracing::debug!(
+                    "Rejecting inbound peer {} (too many pending handshakes)",
+                    addr
+                );
+                continue;
+            };
+
             let downloader = Arc::clone(&self);
             let shared_stats = Arc::clone(&self.shared_peer_stats);
             let choking_decisions = Arc::clone(&self.choking_decisions);
             let peer_id = *self.tracker_client.peer_id();
             let info_hash = self.info_hash;
             let handle = tokio::spawn(async move {
-                match PeerConnection::accept(stream, addr, info_hash, peer_id, num_pieces).await {
+                let accepted =
+                    PeerConnection::accept(stream, addr, info_hash, peer_id, num_pieces).await;
+                drop(handshake_permit);
+                match accepted {
                     Ok(conn) => {
                         tracing::info!("Accepted inbound peer {}", addr);
                         if let Err(e) = Self::run_connection_loop(
@@ -1242,6 +1278,13 @@ impl TorrentDownloader {
             handle.abort();
         }
 
+        // Abort outbound peer connection tasks. They check the shutdown flag
+        // only between messages, so without this a peer mid-block would
+        // still write its piece to disk after the caller deleted the files.
+        for (_, handle) in self.peer_tasks.write().drain() {
+            handle.abort();
+        }
+
         // Announce stopped
         self.announce_to_trackers(AnnounceEvent::Stopped).await?;
 
@@ -1321,9 +1364,9 @@ impl TorrentDownloader {
         let mut connect_interval = tokio::time::interval(connect_duration);
         let mut choking_interval = tokio::time::interval(choking_duration);
 
-        // Active peer connections (addr -> connection task handle)
-        let active_connections: Arc<RwLock<HashMap<SocketAddr, tokio::task::JoinHandle<()>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        // Active peer connections (addr -> connection task handle), owned by
+        // the downloader so stop() can abort them.
+        let active_connections = Arc::clone(&self.peer_tasks);
 
         loop {
             tokio::select! {

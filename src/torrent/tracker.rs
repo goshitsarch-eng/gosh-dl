@@ -3,7 +3,7 @@
 //! This module implements communication with BitTorrent trackers using
 //! both HTTP (BEP 3) and UDP (BEP 15) protocols.
 
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -50,6 +50,12 @@ const MIN_ANNOUNCE_INTERVAL: u32 = 60;
 /// Maximum allowed announce interval (3600 seconds = 1 hour)
 /// Prevents excessively long intervals that could make peers stale
 const MAX_ANNOUNCE_INTERVAL: u32 = 3600;
+
+/// Maximum number of peers accepted from a single announce response
+///
+/// Bounds the memory a hostile or buggy tracker can make us allocate; real
+/// trackers return at most a few hundred peers per announce.
+const MAX_PEERS_PER_RESPONSE: usize = 1000;
 
 /// Tracker client for HTTP and UDP trackers
 pub struct TrackerClient {
@@ -149,12 +155,28 @@ pub struct PeerAddr {
 }
 
 impl PeerAddr {
-    /// Convert to socket address
+    /// Convert to socket address.
+    ///
+    /// Never blocks: `ip` must be an IPv4 or IPv6 literal (optionally
+    /// bracketed, e.g. `[::1]`). Hostnames are not resolved and yield
+    /// `None`, because callers invoke this from synchronous code (including
+    /// while holding locks) where a DNS lookup would stall the engine.
     pub fn to_socket_addr(&self) -> Option<SocketAddr> {
-        format!("{}:{}", self.ip, self.port)
-            .to_socket_addrs()
-            .ok()?
-            .next()
+        let literal = self
+            .ip
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(&self.ip);
+        match literal.parse::<IpAddr>() {
+            Ok(ip) => Some(SocketAddr::new(ip, self.port)),
+            Err(_) => {
+                tracing::debug!(
+                    "Ignoring tracker peer with non-literal address {:?}",
+                    self.ip
+                );
+                None
+            }
+        }
     }
 }
 
@@ -306,52 +328,7 @@ impl TrackerClient {
         tracker_url: &str,
         request: &AnnounceRequest,
     ) -> Result<AnnounceResponse> {
-        // Build the announce URL with query parameters
-        let mut url = tracker_url.to_string();
-        if url.contains('?') {
-            url.push('&');
-        } else {
-            url.push('?');
-        }
-
-        // Add info_hash (URL-encoded)
-        url.push_str("info_hash=");
-        for byte in &request.info_hash {
-            url.push_str(&format!("%{:02X}", byte));
-        }
-
-        // Add peer_id (URL-encoded)
-        url.push_str("&peer_id=");
-        for byte in &request.peer_id {
-            url.push_str(&format!("%{:02X}", byte));
-        }
-
-        // Add other parameters
-        url.push_str(&format!("&port={}", request.port));
-        url.push_str(&format!("&uploaded={}", request.uploaded));
-        url.push_str(&format!("&downloaded={}", request.downloaded));
-        url.push_str(&format!("&left={}", request.left));
-
-        if request.compact {
-            url.push_str("&compact=1");
-        }
-
-        let event_str = request.event.to_http_string();
-        if !event_str.is_empty() {
-            url.push_str(&format!("&event={}", event_str));
-        }
-
-        if let Some(numwant) = request.numwant {
-            url.push_str(&format!("&numwant={}", numwant));
-        }
-
-        if let Some(key) = request.key {
-            url.push_str(&format!("&key={}", key));
-        }
-
-        if let Some(ref tracker_id) = request.tracker_id {
-            url.push_str(&format!("&trackerid={}", tracker_id));
-        }
+        let url = build_http_announce_url(tracker_url, request);
 
         // Make the request
         let response = self.http_client.get(&url).send().await.map_err(|e| {
@@ -448,6 +425,7 @@ impl TrackerClient {
         // Parse IPv6 peers (BEP 7)
         let peers6 = self.parse_peers_ipv6(dict.get(b"peers6".as_slice()))?;
         peers.extend(peers6);
+        peers.truncate(MAX_PEERS_PER_RESPONSE);
 
         Ok(AnnounceResponse {
             interval,
@@ -478,6 +456,7 @@ impl TrackerClient {
 
                 let peers = data
                     .chunks_exact(6)
+                    .take(MAX_PEERS_PER_RESPONSE)
                     .map(|chunk| {
                         let ip = format!("{}.{}.{}.{}", chunk[0], chunk[1], chunk[2], chunk[3]);
                         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
@@ -492,38 +471,36 @@ impl TrackerClient {
                 Ok(peers)
             }
 
-            // Dictionary format
+            // Dictionary format. A malformed entry (not a dict, missing or
+            // non-string ip, missing/non-integer/out-of-range port) is
+            // skipped rather than failing the whole response.
             BencodeValue::List(list) => {
                 let mut peers = Vec::new();
 
                 for item in list {
-                    let dict = item.as_dict().ok_or_else(|| {
-                        EngineError::protocol(
-                            ProtocolErrorKind::TrackerError,
-                            "Peer entry must be a dictionary",
-                        )
-                    })?;
+                    if peers.len() >= MAX_PEERS_PER_RESPONSE {
+                        break;
+                    }
 
-                    let ip = dict
-                        .get(b"ip".as_slice())
-                        .and_then(|v| v.as_string())
-                        .ok_or_else(|| {
-                            EngineError::protocol(
-                                ProtocolErrorKind::TrackerError,
-                                "Peer missing 'ip'",
-                            )
-                        })?
-                        .to_string();
+                    let Some(dict) = item.as_dict() else {
+                        tracing::debug!("Skipping non-dict peer entry in tracker response");
+                        continue;
+                    };
 
-                    let port = dict
+                    let Some(ip) = dict.get(b"ip".as_slice()).and_then(|v| v.as_string()) else {
+                        tracing::debug!("Skipping tracker peer entry without 'ip'");
+                        continue;
+                    };
+                    let ip = ip.to_string();
+
+                    let Some(port) = dict
                         .get(b"port".as_slice())
                         .and_then(|v| v.as_uint())
-                        .ok_or_else(|| {
-                            EngineError::protocol(
-                                ProtocolErrorKind::TrackerError,
-                                "Peer missing 'port'",
-                            )
-                        })? as u16;
+                        .and_then(|p| u16::try_from(p).ok())
+                    else {
+                        tracing::debug!("Skipping tracker peer entry with invalid 'port'");
+                        continue;
+                    };
 
                     let peer_id = dict.get(b"peer id".as_slice()).and_then(|v| {
                         v.as_bytes().and_then(|b| {
@@ -569,6 +546,7 @@ impl TrackerClient {
 
                 let peers = data
                     .chunks_exact(18)
+                    .take(MAX_PEERS_PER_RESPONSE)
                     .map(|chunk| {
                         let mut octets = [0u8; 16];
                         octets.copy_from_slice(&chunk[..16]);
@@ -858,6 +836,7 @@ impl TrackerClient {
         let peers_data = &response[20..len];
         let peers = peers_data
             .chunks_exact(6)
+            .take(MAX_PEERS_PER_RESPONSE)
             .map(|chunk| {
                 let ip = format!("{}.{}.{}.{}", chunk[0], chunk[1], chunk[2], chunk[3]);
                 let port = u16::from_be_bytes([chunk[4], chunk[5]]);
@@ -1000,6 +979,7 @@ impl TrackerClient {
         let peers = match ws_response.peers {
             Some(WsPeers::Dict(list)) => list
                 .into_iter()
+                .take(MAX_PEERS_PER_RESPONSE)
                 .map(|p| PeerAddr {
                     ip: p.ip,
                     port: p.port,
@@ -1023,6 +1003,7 @@ impl TrackerClient {
                 }
 
                 data.chunks_exact(6)
+                    .take(MAX_PEERS_PER_RESPONSE)
                     .map(|c| PeerAddr {
                         ip: format!("{}.{}.{}.{}", c[0], c[1], c[2], c[3]),
                         port: u16::from_be_bytes([c[4], c[5]]),
@@ -1315,6 +1296,63 @@ impl Default for TrackerClient {
     }
 }
 
+/// Build the HTTP announce URL (BEP 3) for `request`
+///
+/// Binary parameters (`info_hash`, `peer_id`) are percent-encoded byte by
+/// byte; `trackerid` is opaque text supplied by the tracker's previous
+/// response and is percent-encoded so it cannot inject extra query
+/// parameters or break the URL.
+fn build_http_announce_url(tracker_url: &str, request: &AnnounceRequest) -> String {
+    let mut url = tracker_url.to_string();
+    if url.contains('?') {
+        url.push('&');
+    } else {
+        url.push('?');
+    }
+
+    // Add info_hash (URL-encoded)
+    url.push_str("info_hash=");
+    for byte in &request.info_hash {
+        url.push_str(&format!("%{:02X}", byte));
+    }
+
+    // Add peer_id (URL-encoded)
+    url.push_str("&peer_id=");
+    for byte in &request.peer_id {
+        url.push_str(&format!("%{:02X}", byte));
+    }
+
+    // Add other parameters
+    url.push_str(&format!("&port={}", request.port));
+    url.push_str(&format!("&uploaded={}", request.uploaded));
+    url.push_str(&format!("&downloaded={}", request.downloaded));
+    url.push_str(&format!("&left={}", request.left));
+
+    if request.compact {
+        url.push_str("&compact=1");
+    }
+
+    let event_str = request.event.to_http_string();
+    if !event_str.is_empty() {
+        url.push_str(&format!("&event={}", event_str));
+    }
+
+    if let Some(numwant) = request.numwant {
+        url.push_str(&format!("&numwant={}", numwant));
+    }
+
+    if let Some(key) = request.key {
+        url.push_str(&format!("&key={}", key));
+    }
+
+    if let Some(ref tracker_id) = request.tracker_id {
+        url.push_str("&trackerid=");
+        url.push_str(&urlencoding::encode(tracker_id));
+    }
+
+    url
+}
+
 /// Whether a UDP tracker connection ID obtained at `obtained_at` is still
 /// usable at `now`
 ///
@@ -1458,6 +1496,169 @@ mod tests {
 
         let addr = peer.to_socket_addr().unwrap();
         assert_eq!(addr.port(), 6881);
+    }
+
+    #[test]
+    fn test_peer_addr_to_socket_addr_is_literal_only() {
+        // IPv6 literal, bare and bracketed
+        for ip in ["::1", "[::1]"] {
+            let peer = PeerAddr {
+                ip: ip.to_string(),
+                port: 6881,
+                peer_id: None,
+            };
+            let addr = peer.to_socket_addr().expect(ip);
+            assert!(addr.is_ipv6());
+            assert_eq!(addr.port(), 6881);
+        }
+
+        // Hostnames must not trigger (blocking) DNS resolution: callers run
+        // this under locks. "localhost" would resolve if we still used
+        // to_socket_addrs().
+        for ip in ["localhost", "tracker.example", "", "not an ip"] {
+            let peer = PeerAddr {
+                ip: ip.to_string(),
+                port: 6881,
+                peer_id: None,
+            };
+            assert_eq!(peer.to_socket_addr(), None, "{:?} must not resolve", ip);
+        }
+    }
+
+    #[test]
+    fn test_announce_response_caps_peer_count() {
+        let client = TrackerClient::new().unwrap();
+
+        // 1500 compact IPv4 peers + 100 compact IPv6 peers in one response
+        let mut v4 = Vec::with_capacity(1500 * 6);
+        for i in 0..1500u32 {
+            v4.extend_from_slice(&[10, (i >> 8) as u8, i as u8, 1, 0x1A, 0xE1]);
+        }
+        let mut v6 = Vec::with_capacity(100 * 18);
+        for i in 0..100u16 {
+            let mut octets = [0u8; 16];
+            octets[0] = 0x20;
+            octets[1] = 0x01;
+            octets[14..16].copy_from_slice(&i.to_be_bytes());
+            v6.extend_from_slice(&octets);
+            v6.extend_from_slice(&0x1AE1u16.to_be_bytes());
+        }
+
+        let mut dict = std::collections::BTreeMap::new();
+        dict.insert(b"interval".to_vec(), BencodeValue::Integer(1800));
+        dict.insert(b"peers".to_vec(), BencodeValue::Bytes(v4.clone()));
+        dict.insert(b"peers6".to_vec(), BencodeValue::Bytes(v6));
+        let body = BencodeValue::Dict(dict).encode();
+
+        let response = client.parse_http_response(&body).unwrap();
+        assert_eq!(response.peers.len(), MAX_PEERS_PER_RESPONSE);
+        // The first peers are kept, in order
+        assert_eq!(response.peers[0].ip, "10.0.0.1");
+        assert_eq!(response.peers[999].ip, "10.3.231.1");
+
+        // The individual parsers are capped as well
+        let peers = client.parse_peers(Some(&BencodeValue::Bytes(v4))).unwrap();
+        assert_eq!(peers.len(), MAX_PEERS_PER_RESPONSE);
+
+        // Dictionary format too
+        let list: Vec<BencodeValue> = (0..1200u32)
+            .map(|i| {
+                let mut d = std::collections::BTreeMap::new();
+                d.insert(
+                    b"ip".to_vec(),
+                    BencodeValue::Bytes(format!("10.1.{}.{}", i >> 8, i & 0xff).into_bytes()),
+                );
+                d.insert(b"port".to_vec(), BencodeValue::Integer(6881));
+                BencodeValue::Dict(d)
+            })
+            .collect();
+        let peers = client.parse_peers(Some(&BencodeValue::List(list))).unwrap();
+        assert_eq!(peers.len(), MAX_PEERS_PER_RESPONSE);
+    }
+
+    #[test]
+    fn test_http_announce_url_encodes_tracker_id() {
+        let request = AnnounceRequest {
+            info_hash: [0xAB; 20],
+            peer_id: *b"-GD0001-abcdefghijkl",
+            port: 6881,
+            uploaded: 1,
+            downloaded: 2,
+            left: 3,
+            event: AnnounceEvent::Started,
+            compact: true,
+            numwant: Some(50),
+            key: Some(7),
+            // Tracker-supplied text that would otherwise inject parameters
+            tracker_id: Some("a b&left=0#frag/é".to_string()),
+        };
+
+        let url = build_http_announce_url("http://tracker.example/announce", &request);
+
+        assert!(url.starts_with("http://tracker.example/announce?info_hash=%AB%AB"));
+        assert!(url.ends_with("&trackerid=a%20b%26left%3D0%23frag%2F%C3%A9"));
+        // Exactly one `left=` parameter survives
+        assert_eq!(url.matches("&left=").count(), 1);
+        assert!(url.contains("&left=3&"));
+        assert!(url.contains("&event=started"));
+
+        // Existing query strings are extended, not duplicated
+        let url = build_http_announce_url("http://tracker.example/announce?x=1", &request);
+        assert!(url.starts_with("http://tracker.example/announce?x=1&info_hash="));
+    }
+
+    #[test]
+    fn test_parse_dict_peers_skips_malformed_entries() {
+        let client = TrackerClient::new().unwrap();
+
+        fn entry(fields: &[(&[u8], BencodeValue)]) -> BencodeValue {
+            let mut d = std::collections::BTreeMap::new();
+            for (k, v) in fields {
+                d.insert(k.to_vec(), v.clone());
+            }
+            BencodeValue::Dict(d)
+        }
+
+        let list = vec![
+            entry(&[
+                (b"ip", BencodeValue::Bytes(b"10.0.0.1".to_vec())),
+                (b"port", BencodeValue::Integer(6881)),
+            ]),
+            // Missing port
+            entry(&[(b"ip", BencodeValue::Bytes(b"10.0.0.2".to_vec()))]),
+            // Port is a string, not an integer
+            entry(&[
+                (b"ip", BencodeValue::Bytes(b"10.0.0.3".to_vec())),
+                (b"port", BencodeValue::Bytes(b"6881".to_vec())),
+            ]),
+            // Port out of range
+            entry(&[
+                (b"ip", BencodeValue::Bytes(b"10.0.0.4".to_vec())),
+                (b"port", BencodeValue::Integer(70000)),
+            ]),
+            // Negative port
+            entry(&[
+                (b"ip", BencodeValue::Bytes(b"10.0.0.5".to_vec())),
+                (b"port", BencodeValue::Integer(-1)),
+            ]),
+            // Missing ip
+            entry(&[(b"port", BencodeValue::Integer(6881))]),
+            // Not a dictionary at all
+            BencodeValue::Integer(42),
+            entry(&[
+                (b"ip", BencodeValue::Bytes(b"10.0.0.6".to_vec())),
+                (b"port", BencodeValue::Integer(6882)),
+            ]),
+        ];
+
+        let peers = client
+            .parse_peers(Some(&BencodeValue::List(list)))
+            .expect("malformed entries must be skipped, not fail the response");
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].ip, "10.0.0.1");
+        assert_eq!(peers[0].port, 6881);
+        assert_eq!(peers[1].ip, "10.0.0.6");
+        assert_eq!(peers[1].port, 6882);
     }
 
     #[test]

@@ -244,7 +244,9 @@ impl MetadataFetcher {
 
     /// Process a received metadata message.
     ///
-    /// Returns true if the metadata is now complete and valid.
+    /// Returns true when this message completed the metadata (assembled and
+    /// verified against the info hash). Data messages arriving after that
+    /// are ignored and return false, so callers act on completion once.
     pub async fn process_message(&self, msg: MetadataMessage) -> Result<bool> {
         match msg.msg_type {
             MetadataMessageType::Request => {
@@ -260,6 +262,12 @@ impl MetadataFetcher {
             }
 
             MetadataMessageType::Data => {
+                // Assembly already done: late or duplicate pieces must not
+                // disturb the verified result (or trigger re-assembly).
+                if self.metadata.read().await.is_some() {
+                    return Ok(false);
+                }
+
                 let Some(total_size) = msg.total_size else {
                     return Err(EngineError::protocol(
                         ProtocolErrorKind::MetadataError,
@@ -315,11 +323,24 @@ impl MetadataFetcher {
                     ));
                 }
 
-                // Store total_size if we didn't know it
+                // Store total_size if we didn't know it; once known, every
+                // peer must agree. Pieces are sized and indexed relative to
+                // total_size, so accepting a different claim would let one
+                // peer corrupt the assembly built from the others.
                 {
                     let mut size = self.total_size.write().await;
-                    if size.is_none() {
-                        *size = Some(total_size);
+                    match *size {
+                        None => *size = Some(total_size),
+                        Some(known) if known != total_size => {
+                            return Err(EngineError::protocol(
+                                ProtocolErrorKind::MetadataError,
+                                format!(
+                                    "Metadata total_size {} conflicts with known size {}",
+                                    total_size, known
+                                ),
+                            ));
+                        }
+                        Some(_) => {}
                     }
                 }
 
@@ -377,9 +398,12 @@ impl MetadataFetcher {
                 self.info_hash,
                 hash
             );
-            // Clear pieces to retry
+            // Clear pieces to retry. The size is forgotten too: it came from
+            // whichever peer answered first, and if that peer lied, keeping
+            // it would reject every honest peer's pieces forever.
             drop(pieces);
             self.pieces.write().await.clear();
+            *self.total_size.write().await = None;
             return Ok(false);
         }
 
@@ -534,6 +558,69 @@ mod tests {
         // counted toward the completion check.
         let msg = MetadataMessage::data(7, 5, vec![0u8; 5]);
         assert!(fetcher.process_message(msg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_metadata_rejects_total_size_mismatch() {
+        let fetcher = MetadataFetcher::new([0u8; 20]);
+
+        // First peer: 40000 bytes => 3 pieces
+        let msg = MetadataMessage::data(0, 40_000, vec![1u8; METADATA_PIECE_SIZE]);
+        assert!(!fetcher.process_message(msg).await.unwrap());
+        assert_eq!(fetcher.total_size().await, Some(40_000));
+        assert_eq!(fetcher.received_count().await, 1);
+
+        // Second peer claims a different size for a valid-looking piece 1:
+        // must be rejected and must not change what we know.
+        let msg = MetadataMessage::data(1, 50_000, vec![2u8; METADATA_PIECE_SIZE]);
+        assert!(fetcher.process_message(msg).await.is_err());
+        assert_eq!(fetcher.total_size().await, Some(40_000));
+        assert_eq!(fetcher.received_count().await, 1);
+
+        // Same size is still fine
+        let msg = MetadataMessage::data(1, 40_000, vec![3u8; METADATA_PIECE_SIZE]);
+        assert!(!fetcher.process_message(msg).await.unwrap());
+        assert_eq!(fetcher.received_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_metadata_forgets_size_after_failed_verification() {
+        // A peer that lies about the size can only be recovered from if the
+        // size is re-learned after the assembled data fails verification.
+        let fetcher = MetadataFetcher::new([0u8; 20]);
+        let msg = MetadataMessage::data(0, 5, vec![9u8; 5]);
+        assert!(!fetcher.process_message(msg).await.unwrap());
+        assert_eq!(fetcher.total_size().await, None);
+        assert_eq!(fetcher.received_count().await, 0);
+        assert_eq!(fetcher.get_needed_pieces().await, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn test_metadata_ignores_data_after_complete() {
+        let test_metadata = b"d4:name4:test12:piece lengthi16384ee";
+        let mut hasher = Sha1::new();
+        hasher.update(test_metadata);
+        let info_hash: [u8; 20] = hasher.finalize().into();
+
+        let fetcher = MetadataFetcher::new(info_hash);
+        let msg = MetadataMessage::data(0, test_metadata.len(), test_metadata.to_vec());
+        assert!(fetcher.process_message(msg).await.unwrap());
+
+        // A late/duplicate piece with different bytes (same size) must be
+        // ignored: not stored, not re-assembled, and not reported as a
+        // fresh completion (the caller re-initialises on `true`).
+        let junk = vec![0u8; test_metadata.len()];
+        let msg = MetadataMessage::data(0, test_metadata.len(), junk);
+        assert!(!fetcher.process_message(msg).await.unwrap());
+        assert!(fetcher.is_complete().await);
+        assert_eq!(fetcher.get_metadata().await.unwrap(), test_metadata);
+        assert_eq!(fetcher.received_count().await, 1);
+        assert_eq!(fetcher.total_size().await, Some(test_metadata.len()));
+
+        // Even a wrongly sized claim is ignored rather than an error
+        let msg = MetadataMessage::data(0, 999, vec![0u8; 999]);
+        assert!(!fetcher.process_message(msg).await.unwrap());
+        assert_eq!(fetcher.total_size().await, Some(test_metadata.len()));
     }
 
     #[tokio::test]

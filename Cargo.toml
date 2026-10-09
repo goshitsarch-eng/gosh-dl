@@ -1,6 +1,6 @@
 [package]
 name = "gosh-dl"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2021"
 rust-version = "1.85"
 description = "A fast, embeddable download engine for Rust. HTTP/HTTPS with multi-connection acceleration and full BitTorrent protocol support."
@@ -30,7 +30,7 @@ urlencoding = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli"], optional = true }
 
 # Metalink XML parsing (optional — enabled by "metalink" feature)
-quick-xml = { version = "0.39", optional = true }
+quick-xml = { version = "0.41", optional = true }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -119,6 +119,14 @@ required-features = ["torrent"]
 [[test]]
 name = "integration_tests"
 required-features = ["http"]
+
+[[test]]
+name = "audit_regressions"
+required-features = ["http"]
+
+[[test]]
+name = "audit_torrent_regressions"
+required-features = ["torrent"]
 
 [[example]]
 name = "magnet_smoke"

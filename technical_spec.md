@@ -236,6 +236,11 @@ impl DownloadEngine {
 | `repair` | Returns the pre-repair report. Invalid HTTP data is restarted from zero; invalid torrent data causes worker reconstruction and re-checking/refetching. Callers observe events/status for completion. |
 | `open_reader` | HTTP serves only a gap-free prefix, using saved segment state when paused/restored. Torrents serve verified pieces and can reconstruct a bitmap from persisted metainfo without starting peers. |
 | Reader termination | Dropping the reader aborts its pump. EOF can also signal a failed/removed download or an unreadable completed file; compare bytes read with the known size minus the opening offset. |
+| HTTP pause / cancel (0.6.4) | Every wait on the HTTP path (probes, sends, body chunks, limiter debt, back-off) is cancellable. `pause` and `cancel` drain the worker (10 s bound; a straggler is re-awaited before the next lifecycle action) before returning or deleting files. |
+| Torrent stop (0.6.4) | `TorrentDownloader::stop()` aborts outbound and inbound peer tasks in addition to discovery tasks, so no peer can write a piece after cancel-with-delete. |
+| `resume` from `Error` (0.6.4) | Accepted for HTTP (uses the segments saved on failure) and torrents (reconstructs the worker). `resume_all` only resumes `Paused`. |
+| `cancel(id, true)` (0.6.4) | Re-validates the output name. HTTP: removes the `.part`, and the final file only if the download completed; never recurses into a directory. Torrent: removes the torrent's file/directory; a metadata-less magnet deletes nothing. |
+| After `shutdown()` (0.6.4) | `add_*` and `resume` return `EngineError::Shutdown`. |
 
 `DownloadReader::total_size()` is a snapshot at open time and can be `None`.
 Size-only verification cannot detect corruption that leaves the file length
@@ -316,6 +321,8 @@ pub struct TrackedRecursiveJob {
     pub created_at: DateTime<Utc>,
 }
 
+// Running/Queued/Paused are reported while any child can still change state;
+// Completed/Failed/Partial are terminal (0.6.4).
 pub enum RecursiveJobState {
     Empty,
     Queued,
@@ -996,10 +1003,18 @@ pub struct EncryptionConfig {
 ```
 
 **Handshake process:**
-1. Diffie-Hellman key exchange (768-bit prime)
+1. Diffie-Hellman key exchange (768-bit prime); a peer public value of 0, 1,
+   or p-1 is rejected
 2. Derive RC4 keys from shared secret + info_hash
 3. Discard first 1024 bytes of RC4 keystream (RC4-drop1024)
 4. Optional random padding for obfuscation
+
+**Fallback (0.6.4):** any failure before crypto negotiation completes is
+reported as `MseHandshakeResult::Failed`. The socket already carries our DH
+public key, so it cannot be reused for plaintext; under `Allowed`/`Preferred`
+with `allow_plaintext`, `PeerConnection::connect_with_encryption` opens a
+fresh TCP connection and performs a plaintext handshake. Inbound connections
+are plaintext-only (no MSE responder).
 
 ### WebSeeds (BEP 17/19)
 
@@ -1322,6 +1337,17 @@ pub enum AllocationMode {
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+## Audit hardening (0.6.4)
+
+See the 0.6.4 changelog entry for the full list. Behavioural rules added by
+the audit: output names from URLs, torrent metainfo, magnet URIs, and
+recursive manifests are validated (`fsutil::check_relative_path`) before they
+are used for any filesystem operation, including deletion; untrusted peer,
+tracker, LPD, PEX, metadata, web-seed, and uTP input is size-bounded; the
+default `Preferred` encryption policy falls back to plaintext over a new
+connection; and recursive discovery bounds its frontier (1024 pages, 10,000
+files, 120 s per page) and compares origins for `same_host_only`.
 
 ## Paused creation (0.6.3)
 

@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use reqwest::Client;
 use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinHandle;
 
 use super::metainfo::{FileInfo, Metainfo, Sha1Hash};
 use super::piece::PieceManager;
@@ -265,18 +266,24 @@ pub struct WebSeedManager {
     shutdown: Arc<AtomicBool>,
     /// Total bytes downloaded via webseeds
     downloaded_bytes: Arc<AtomicU64>,
+    /// In-flight piece download tasks, aborted on shutdown
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl WebSeedManager {
     /// Create a new WebSeedManager
+    ///
+    /// `config.max_connections` is clamped to at least 1: zero connections
+    /// would make the download loop a no-op and the event channel unbuildable.
     ///
     /// Returns an error if the HTTP client cannot be created (e.g., due to
     /// invalid TLS configuration or system resource constraints).
     pub fn new(
         metainfo: Arc<Metainfo>,
         piece_manager: Arc<PieceManager>,
-        config: WebSeedConfig,
+        mut config: WebSeedConfig,
     ) -> Result<(Self, mpsc::Receiver<WebSeedEvent>)> {
+        config.max_connections = config.max_connections.max(1);
         let channel_capacity = config.max_connections * 2;
         let (event_tx, event_rx) = mpsc::channel(channel_capacity);
 
@@ -313,6 +320,7 @@ impl WebSeedManager {
                 webseed_pending: Arc::new(RwLock::new(HashSet::new())),
                 shutdown: Arc::new(AtomicBool::new(false)),
                 downloaded_bytes: Arc::new(AtomicU64::new(0)),
+                tasks: Mutex::new(Vec::new()),
             },
             event_rx,
         ))
@@ -347,6 +355,8 @@ impl WebSeedManager {
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 tracing::debug!("WebSeedManager shutting down");
+                // Cover a task spawned between shutdown()'s abort and here
+                self.abort_tasks();
                 break;
             }
 
@@ -356,26 +366,32 @@ impl WebSeedManager {
                 break;
             }
 
+            // Acquire a connection slot before claiming any work, so a seed
+            // and a piece are never marked busy without a task to serve them.
+            let permit = match semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    // All connections busy, wait a bit
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+
             // Find an idle seed and a needed piece
             if let Some((seed, piece_index)) = self.find_work() {
-                let permit = match semaphore.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        // All connections busy, wait a bit
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        continue;
-                    }
-                };
-
                 let this = Arc::clone(&self);
                 let seed = Arc::clone(&seed);
 
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     let _permit = permit;
                     this.download_piece(seed, piece_index).await;
                 });
+                let mut tasks = self.tasks.lock();
+                tasks.retain(|h| !h.is_finished());
+                tasks.push(handle);
             } else {
-                // No work available, wait briefly
+                // No work available, release the slot and wait briefly
+                drop(permit);
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
@@ -485,13 +501,11 @@ impl WebSeedManager {
 
         let piece_length = end - start;
 
-        // For GetRight multi-file torrents, check if the piece spans multiple files.
-        // If so, use the cross-file download path which makes separate HTTP requests per file.
+        // BEP 19 multi-file torrents are served one URL per file, so every
+        // piece (not only one spanning several files) must be requested with
+        // per-file offsets rather than the torrent-global range below.
         if seed.seed_type == WebSeedType::GetRight && !self.metainfo.info.is_single_file {
-            let files = self.metainfo.files_for_piece(piece_index as usize);
-            if files.len() > 1 {
-                return self.download_multifile_piece(seed, piece_index).await;
-            }
+            return self.download_multifile_piece(seed, piece_index).await;
         }
 
         // Build URL based on seed type and torrent structure
@@ -542,13 +556,14 @@ impl WebSeedManager {
             ));
         }
 
-        // Read response body
-        let data = response.bytes().await.map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::ConnectionReset,
-                format!("Failed to read response: {}", e),
-            )
-        })?;
+        // Read response body, bounded by what this request may legitimately
+        // return: the piece for a 206, or the whole file for a 200.
+        let max_len = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            piece_length
+        } else {
+            self.metainfo.info.total_size
+        };
+        let data = read_body_bounded(response, max_len).await?;
 
         // If server sent full content, we need to extract our piece
         let piece_data = if data.len() as u64 == piece_length {
@@ -615,9 +630,15 @@ impl WebSeedManager {
                         &self.metainfo.info.name,
                     ))
                 } else {
-                    // For multi-file, we need to determine which file(s)
-                    // this piece spans and construct appropriate URL
-                    self.build_multifile_url(seed, piece_index)
+                    // Multi-file pieces have no single URL: they are fetched
+                    // file by file in download_multifile_piece()
+                    Err(EngineError::protocol(
+                        ProtocolErrorKind::InvalidTorrent,
+                        format!(
+                            "Piece {} of a multi-file torrent has no single URL",
+                            piece_index
+                        ),
+                    ))
                 }
             }
             WebSeedType::Hoffman => {
@@ -633,41 +654,17 @@ impl WebSeedManager {
         getright_multi_file_url(&seed.url, &self.metainfo.info.name, &file.path)
     }
 
-    /// Build URL for multi-file torrent piece (BEP 19)
-    ///
-    /// Returns the URL for a single-file piece. For cross-file pieces,
-    /// use `download_multifile_piece` which makes separate requests per file.
-    fn build_multifile_url(&self, seed: &WebSeed, piece_index: u32) -> Result<String> {
-        // Get files that this piece spans
-        let files = self.metainfo.files_for_piece(piece_index as usize);
-
-        if files.is_empty() {
-            return Err(EngineError::protocol(
-                ProtocolErrorKind::InvalidTorrent,
-                format!("No files for piece {}", piece_index),
-            ));
-        }
-
-        if files.len() == 1 {
-            // Piece is entirely within one file
-            let (file_idx, _file_offset, _length) = files[0];
-            let file = &self.metainfo.info.files[file_idx];
-            Ok(self.build_file_url(seed, file))
-        } else {
-            // Cross-file pieces are handled by download_multifile_piece()
-            Err(EngineError::protocol(
-                ProtocolErrorKind::InvalidResponse,
-                format!("Piece {} spans {} files", piece_index, files.len()),
-            ))
-        }
-    }
-
-    /// Download a piece that spans multiple files via separate HTTP requests (BEP 19)
+    /// Download a piece of a multi-file torrent via one HTTP request per file (BEP 19)
     async fn download_multifile_piece(&self, seed: &WebSeed, piece_index: u32) -> Result<Vec<u8>> {
         let files = self.metainfo.files_for_piece(piece_index as usize);
         let mut piece_data = Vec::new();
 
         for (file_idx, file_offset, length) in &files {
+            // An empty file inside the piece contributes no bytes (and has
+            // no valid byte range to request)
+            if *length == 0 {
+                continue;
+            }
             let file = &self.metainfo.info.files[*file_idx];
             let url = self.build_file_url(seed, file);
             let end_byte = file_offset + length - 1;
@@ -706,12 +703,13 @@ impl WebSeedManager {
                 ));
             }
 
-            let data = response.bytes().await.map_err(|e| {
-                EngineError::network(
-                    NetworkErrorKind::ConnectionReset,
-                    format!("Failed to read cross-file response: {}", e),
-                )
-            })?;
+            // Bound the body by the requested range (206) or this file (200)
+            let max_len = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                *length
+            } else {
+                file.length
+            };
+            let data = read_body_bounded(response, max_len).await?;
 
             // A compliant server answers the Range request with 206 and only
             // the requested bytes. A server that ignores Range replies 200
@@ -759,9 +757,26 @@ impl WebSeedManager {
     /// Shutdown the web seed manager
     ///
     /// Idempotent and cheap: sets an atomic flag that the download loop
-    /// checks, so it is safe to call multiple times (e.g. from `stop()`).
+    /// checks and aborts in-flight piece downloads, so it is safe to call
+    /// multiple times (e.g. from `stop()`).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.abort_tasks();
+    }
+
+    /// Abort every in-flight piece download task
+    fn abort_tasks(&self) {
+        let tasks = std::mem::take(&mut *self.tasks.lock());
+        for handle in &tasks {
+            handle.abort();
+        }
+    }
+
+    /// Number of piece download tasks still running
+    pub(crate) fn active_task_count(&self) -> usize {
+        let mut tasks = self.tasks.lock();
+        tasks.retain(|h| !h.is_finished());
+        tasks.len()
     }
 
     /// Get total bytes downloaded via webseeds
@@ -823,11 +838,51 @@ fn getright_multi_file_url(base_url: &str, name: &str, file_path: &Path) -> Stri
 }
 
 /// Build the request URL for a piece from a seed server (BEP 17 Hoffman style)
+///
+/// The parameters are appended to any query string the base URL already has.
 fn hoffman_piece_url(base_url: &str, info_hash_urlencoded: &str, piece_index: u32) -> String {
+    let separator = if base_url.contains('?') { '&' } else { '?' };
     format!(
-        "{}?info_hash={}&piece={}",
-        base_url, info_hash_urlencoded, piece_index
+        "{}{}info_hash={}&piece={}",
+        base_url, separator, info_hash_urlencoded, piece_index
     )
+}
+
+/// Read a response body into memory, failing once it exceeds `max_len` bytes
+///
+/// The declared Content-Length is checked up front, and the body is read in
+/// chunks so an oversized or unbounded response is rejected as soon as the
+/// limit is passed rather than buffered in full.
+async fn read_body_bounded(mut response: reqwest::Response, max_len: u64) -> Result<Vec<u8>> {
+    if let Some(declared) = response.content_length() {
+        if declared > max_len {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::InvalidResponse,
+                format!(
+                    "WebSeed response too large: Content-Length {} exceeds {}",
+                    declared, max_len
+                ),
+            ));
+        }
+    }
+
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        EngineError::network(
+            NetworkErrorKind::ConnectionReset,
+            format!("Failed to read response: {}", e),
+        )
+    })? {
+        if (data.len() as u64).saturating_add(chunk.len() as u64) > max_len {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::InvalidResponse,
+                format!("WebSeed response too large: exceeds {} bytes", max_len),
+            ));
+        }
+        data.extend_from_slice(&chunk);
+    }
+
+    Ok(data)
 }
 
 /// Extract the requested byte window from a per-file web seed response body
@@ -1275,5 +1330,443 @@ mod tests {
     fn test_extract_file_range_200_too_short_is_error() {
         let data = vec![0u8; 50];
         assert!(extract_file_range(&data, false, 60, 20).is_err());
+    }
+
+    // ========================================================================
+    // HTTP-level regression tests (wiremock)
+    // ========================================================================
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// Serves a file honouring `Range: bytes=a-b` (206), answering 416 for a
+    /// start past the end, and the whole file (200) without a Range header.
+    struct RangeFile(Vec<u8>);
+
+    impl Respond for RangeFile {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let len = self.0.len() as u64;
+            let range = request
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("bytes="))
+                .and_then(|v| {
+                    let (start, end) = v.split_once('-')?;
+                    Some((start.parse::<u64>().ok()?, end.parse::<u64>().ok()?))
+                });
+            match range {
+                None => ResponseTemplate::new(200).set_body_bytes(self.0.clone()),
+                Some((start, end)) if start >= len || end < start => ResponseTemplate::new(416)
+                    .insert_header("Content-Range", format!("bytes */{}", len)),
+                Some((start, end)) => {
+                    let end = end.min(len - 1);
+                    ResponseTemplate::new(206)
+                        .insert_header("Content-Range", format!("bytes {}-{}/{}", start, end, len))
+                        .set_body_bytes(self.0[start as usize..=end as usize].to_vec())
+                }
+            }
+        }
+    }
+
+    /// Build a metainfo whose piece hashes match the given file contents.
+    /// A single entry makes a single-file torrent named `name`; several
+    /// entries make a multi-file torrent under the directory `name`.
+    fn content_metainfo(
+        name: &str,
+        piece_length: u64,
+        files: &[(&str, Vec<u8>)],
+        url_list: Vec<String>,
+    ) -> Metainfo {
+        let mut all = Vec::new();
+        let mut infos = Vec::new();
+        for (file_path, content) in files {
+            infos.push(FileInfo {
+                path: PathBuf::from(file_path),
+                length: content.len() as u64,
+                offset: all.len() as u64,
+                md5sum: None,
+            });
+            all.extend_from_slice(content);
+        }
+        let mut metainfo = test_metainfo(url_list, Vec::new());
+        metainfo.info = Info {
+            name: name.to_string(),
+            piece_length,
+            pieces: all
+                .chunks(piece_length as usize)
+                .map(WebSeedManager::sha1_hash)
+                .collect(),
+            files: infos,
+            total_size: all.len() as u64,
+            is_single_file: files.len() == 1,
+            private: false,
+        };
+        metainfo
+    }
+
+    type TestManager = (
+        Arc<WebSeedManager>,
+        mpsc::Receiver<WebSeedEvent>,
+        Arc<PieceManager>,
+        tempfile::TempDir,
+    );
+
+    fn test_manager(metainfo: Metainfo, config: WebSeedConfig) -> TestManager {
+        let dir = tempfile::tempdir().unwrap();
+        let metainfo = Arc::new(metainfo);
+        let pm = Arc::new(PieceManager::new(
+            Arc::clone(&metainfo),
+            dir.path().to_path_buf(),
+        ));
+        let (manager, rx) = WebSeedManager::new(metainfo, Arc::clone(&pm), config).unwrap();
+        (Arc::new(manager), rx, pm, dir)
+    }
+
+    #[tokio::test]
+    async fn test_bep19_multifile_piece_inside_second_file_uses_file_range() {
+        let server = MockServer::start().await;
+        let a: Vec<u8> = (0u8..16).collect();
+        let b: Vec<u8> = (16u8..32).collect();
+        Mock::given(method("GET"))
+            .and(path("/dir/a.bin"))
+            .respond_with(RangeFile(a.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/dir/b.bin"))
+            .respond_with(RangeFile(b.clone()))
+            .mount(&server)
+            .await;
+
+        let metainfo = content_metainfo(
+            "dir",
+            16,
+            &[("a.bin", a), ("b.bin", b.clone())],
+            vec![format!("{}/", server.uri())],
+        );
+        let (manager, _rx, _pm, _dir) = test_manager(metainfo, WebSeedConfig::default());
+        let seed = Arc::clone(&manager.seeds[0]);
+
+        // Piece 1 lies entirely inside b.bin: it must be requested with the
+        // file-relative range 0-15, not the torrent-global range 16-31
+        let data = manager
+            .do_download_piece(&seed, 1)
+            .await
+            .expect("piece inside the second file must download");
+        assert_eq!(data, b);
+
+        let requests = server.received_requests().await.unwrap();
+        let req = requests
+            .iter()
+            .find(|r| r.url.path() == "/dir/b.bin")
+            .expect("piece 1 must be fetched from /dir/b.bin");
+        assert_eq!(
+            req.headers.get("range").unwrap().to_str().unwrap(),
+            "bytes=0-15"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_with_more_seeds_than_connections_completes_all_pieces() {
+        let server = MockServer::start().await;
+        let content: Vec<u8> = (0u8..32).collect();
+        for p in ["/one/file.bin", "/two/file.bin"] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(RangeFile(content.clone()))
+                .mount(&server)
+                .await;
+        }
+
+        let metainfo = content_metainfo(
+            "file.bin",
+            16,
+            &[("file.bin", content)],
+            vec![
+                format!("{}/one/file.bin", server.uri()),
+                format!("{}/two/file.bin", server.uri()),
+            ],
+        );
+        let config = WebSeedConfig {
+            max_connections: 1,
+            ..WebSeedConfig::default()
+        };
+        let (manager, mut event_rx, pm, _dir) = test_manager(metainfo, config);
+        assert_eq!(manager.seeds.len(), 2);
+
+        let run_handle = tokio::spawn(Arc::clone(&manager).run());
+        let writer_pm = Arc::clone(&pm);
+        let writer = tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                if let WebSeedEvent::PieceComplete {
+                    piece_index, data, ..
+                } = event
+                {
+                    writer_pm
+                        .write_piece_from_webseed(piece_index, &data)
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        // With two seeds but one connection, the second seed must not be
+        // left stuck in Downloading with a piece nobody fetches
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pm.is_complete() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both pieces must complete with max_connections=1 and two seeds");
+
+        tokio::time::timeout(Duration::from_secs(2), run_handle)
+            .await
+            .expect("run loop must stop once the download is complete")
+            .unwrap()
+            .unwrap();
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn test_oversized_full_response_is_rejected_by_content_length() {
+        let server = MockServer::start().await;
+        // The file is 16 bytes but the server answers 200 with 4 KiB
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 4096]))
+            .mount(&server)
+            .await;
+
+        let metainfo = content_metainfo(
+            "file.bin",
+            16,
+            &[("file.bin", (0u8..16).collect())],
+            vec![format!("{}/file.bin", server.uri())],
+        );
+        let (manager, _rx, _pm, _dir) = test_manager(metainfo, WebSeedConfig::default());
+        let seed = Arc::clone(&manager.seeds[0]);
+
+        let err = manager.do_download_piece(&seed, 0).await.unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected a size rejection, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oversized_range_response_is_rejected_by_content_length() {
+        let server = MockServer::start().await;
+        // A 16-byte range is requested but the 206 body is 4 KiB
+        Mock::given(method("GET"))
+            .and(path("/dir/a.bin"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", "bytes 0-15/16")
+                    .set_body_bytes(vec![0u8; 4096]),
+            )
+            .mount(&server)
+            .await;
+
+        let metainfo = content_metainfo(
+            "dir",
+            16,
+            &[
+                ("a.bin", (0u8..16).collect()),
+                ("b.bin", (16u8..32).collect()),
+            ],
+            vec![format!("{}/", server.uri())],
+        );
+        let (manager, _rx, _pm, _dir) = test_manager(metainfo, WebSeedConfig::default());
+        let seed = Arc::clone(&manager.seeds[0]);
+
+        let err = manager.do_download_piece(&seed, 0).await.unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected a size rejection, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oversized_chunked_body_is_rejected_while_streaming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A raw HTTP/1.1 server with no Content-Length: the body arrives in
+        // 512-byte chunks, so the bound can only be enforced while reading
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 || {
+                    req.extend_from_slice(&buf[..n]);
+                    req.windows(4).any(|w| w == b"\r\n\r\n")
+                } {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = [0u8; 512];
+            for _ in 0..8 {
+                if socket.write_all(b"200\r\n").await.is_err()
+                    || socket.write_all(&chunk).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+
+        let metainfo = content_metainfo(
+            "file.bin",
+            16,
+            &[("file.bin", (0u8..16).collect())],
+            vec![format!("http://{}/file.bin", addr)],
+        );
+        let (manager, _rx, _pm, _dir) = test_manager(metainfo, WebSeedConfig::default());
+        let seed = Arc::clone(&manager.seeds[0]);
+
+        let err = manager.do_download_piece(&seed, 0).await.unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected a size rejection, got: {}",
+            err
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    }
+
+    #[tokio::test]
+    async fn test_bep19_zero_length_file_inside_piece_is_skipped() {
+        let server = MockServer::start().await;
+        let a: Vec<u8> = (0u8..100).collect();
+        let c: Vec<u8> = (100u8..200).collect();
+        Mock::given(method("GET"))
+            .and(path("/dir/a.bin"))
+            .respond_with(RangeFile(a.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/dir/c.bin"))
+            .respond_with(RangeFile(c.clone()))
+            .mount(&server)
+            .await;
+
+        // b.bin is empty and sits strictly inside piece 0 (bytes 0-127)
+        let metainfo = content_metainfo(
+            "dir",
+            128,
+            &[
+                ("a.bin", a.clone()),
+                ("b.bin", Vec::new()),
+                ("c.bin", c.clone()),
+            ],
+            vec![format!("{}/", server.uri())],
+        );
+        assert_eq!(metainfo.files_for_piece(0).len(), 3);
+        let (manager, _rx, _pm, _dir) = test_manager(metainfo, WebSeedConfig::default());
+        let seed = Arc::clone(&manager.seeds[0]);
+
+        let data = manager
+            .do_download_piece(&seed, 0)
+            .await
+            .expect("an empty file inside the piece must be skipped");
+        let mut expected = a;
+        expected.extend_from_slice(&c[..28]);
+        assert_eq!(data, expected);
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().all(|r| r.url.path() != "/dir/b.bin"),
+            "the empty file must not be requested"
+        );
+    }
+
+    #[test]
+    fn test_bep17_hoffman_url_with_existing_query() {
+        assert_eq!(
+            hoffman_piece_url("http://seed.example.com/seed.php?key=1", "%AA%BB", 7),
+            "http://seed.example.com/seed.php?key=1&info_hash=%AA%BB&piece=7"
+        );
+    }
+
+    #[test]
+    fn test_new_clamps_zero_max_connections() {
+        let metainfo = Arc::new(test_metainfo(
+            vec!["http://mirror.example.com/linux.iso".to_string()],
+            Vec::new(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Arc::new(PieceManager::new(
+            Arc::clone(&metainfo),
+            dir.path().to_path_buf(),
+        ));
+        let config = WebSeedConfig {
+            max_connections: 0,
+            ..WebSeedConfig::default()
+        };
+        let (manager, _rx) =
+            WebSeedManager::new(metainfo, pm, config).expect("zero max_connections must not panic");
+        assert_eq!(manager.config.max_connections, 1);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_aborts_in_flight_downloads() {
+        let server = MockServer::start().await;
+        let content: Vec<u8> = (0u8..16).collect();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", "bytes 0-15/16")
+                    .set_body_bytes(content.clone())
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let metainfo = content_metainfo(
+            "file.bin",
+            16,
+            &[("file.bin", content)],
+            vec![format!("{}/file.bin", server.uri())],
+        );
+        let (manager, _rx, _pm, _dir) = test_manager(metainfo, WebSeedConfig::default());
+        let run_handle = tokio::spawn(Arc::clone(&manager).run());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.active_task_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a piece download must be in flight");
+
+        let started = Instant::now();
+        manager.shutdown();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while manager.active_task_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("in-flight download must be aborted by shutdown");
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        tokio::time::timeout(Duration::from_secs(1), run_handle)
+            .await
+            .expect("run loop must stop after shutdown")
+            .unwrap()
+            .unwrap();
     }
 }

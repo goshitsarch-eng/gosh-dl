@@ -13,9 +13,13 @@ use uuid::Uuid;
 /// Options that control recursive HTTP/HTTPS discovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecursiveOptions {
-    /// Maximum traversal depth, starting at the root page.
+    /// Maximum traversal depth, starting at the root page. Directory pages
+    /// are followed while `depth < max_depth`, so `max_depth: 1` downloads
+    /// the files linked from the root page only; `0` disables crawling.
     pub max_depth: usize,
-    /// Restrict discovery to the same host as the root URL.
+    /// Restrict discovery to the root URL's origin (scheme, host, and port),
+    /// so headers and cookies given for the root are never replayed to
+    /// another port or over a different scheme.
     pub same_host_only: bool,
     /// Optional path prefix that discovered URLs must remain under.
     pub allowed_prefix: Option<String>,
@@ -25,7 +29,10 @@ pub struct RecursiveOptions {
     /// Glob-like exclude patterns evaluated against discovered paths.
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
-    /// Preserve the remote relative directory structure locally.
+    /// Preserve the remote relative directory structure locally. When
+    /// `false`, every discovered file is saved directly under the download
+    /// root using only its file name; name collisions are reported (or
+    /// resolved by `overwrite_existing`).
     pub preserve_paths: bool,
     /// Permit overwriting colliding local files during manifest construction.
     pub overwrite_existing: bool,
@@ -112,17 +119,18 @@ impl TrackedRecursiveJob {
 pub enum RecursiveJobState {
     /// The job has no child downloads.
     Empty,
-    /// All known children are queued.
+    /// No child is active, at least one is queued (others may have finished).
     Queued,
-    /// One or more children are actively connecting/downloading.
+    /// At least one child is actively connecting/downloading; see the
+    /// progress counters for children that have already finished or failed.
     Running,
-    /// The job is currently stopped with paused children and no active work.
+    /// No child is active or queued, at least one is paused.
     Paused,
-    /// All children completed successfully.
+    /// Terminal: all children completed successfully.
     Completed,
-    /// All children failed or were removed.
+    /// Terminal: all children failed or were removed.
     Failed,
-    /// The job has a mix of successful, failed, removed, or still-pending children.
+    /// Terminal: a mix of completed and failed/removed children.
     Partial,
 }
 

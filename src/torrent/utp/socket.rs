@@ -451,11 +451,39 @@ impl UtpSocketInner {
         }
     }
 
+    /// Bytes currently held for the reader: ordered data plus buffered
+    /// out-of-order packets. Everything the peer may still send fits in
+    /// `recv_window` minus this.
+    fn buffered_bytes(&self) -> usize {
+        self.recv_buffer.len() + self.ooo_packets.values().map(Vec::len).sum::<usize>()
+    }
+
+    /// Whether a payload of `len` bytes still fits in our receive window.
+    ///
+    /// A peer that ignores the window we advertise (or spoofs sequence
+    /// numbers) could otherwise grow `recv_buffer`/`ooo_packets` without
+    /// bound while nobody reads.
+    fn fits_recv_window(&self, len: usize) -> bool {
+        self.buffered_bytes().saturating_add(len) <= self.recv_window as usize
+    }
+
     /// Receive data into buffer, handling out-of-order
     fn receive_data(&mut self, seq_nr: u16, payload: Vec<u8>) -> io::Result<()> {
         let expected = self.ack_nr.wrapping_add(1);
 
         if seq_nr == expected {
+            if !self.fits_recv_window(payload.len()) {
+                // Window overrun: drop without advancing ack_nr so the peer
+                // retransmits once the reader has drained the buffer.
+                tracing::trace!(
+                    "uTP recv window full ({} buffered, {} window); dropping seq {}",
+                    self.buffered_bytes(),
+                    self.recv_window,
+                    seq_nr
+                );
+                return Ok(());
+            }
+
             // In-order packet
             self.stats.bytes_received += payload.len() as u64;
             self.recv_buffer.extend(&payload);
@@ -472,8 +500,11 @@ impl UtpSocketInner {
                     break;
                 }
             }
-        } else if seq_after(seq_nr, expected) && self.ooo_packets.len() < MAX_OOO_PACKETS {
-            // Out-of-order packet - buffer it
+        } else if seq_after(seq_nr, expected)
+            && self.ooo_packets.len() < MAX_OOO_PACKETS
+            && self.fits_recv_window(payload.len())
+        {
+            // Out-of-order packet - buffer it (bounded by count and window)
             self.ooo_packets.insert(seq_nr, payload);
         }
         // Else: duplicate or too old, ignore (the ACK we send re-informs)
@@ -731,6 +762,23 @@ fn seq_after(seq_a: u16, seq_b: u16) -> bool {
 /// multiplexer to deregister the connection.
 pub type CleanupFn = Box<dyn FnOnce() + Send>;
 
+/// Owns the cleanup callback for the lifetime of the driver future.
+///
+/// `Drop for UtpSocket` aborts the driver task, which drops the future
+/// without running the code after its loop; a plain "call cleanup at the
+/// end" therefore leaked the multiplexer's `(addr, conn_id)` entry for every
+/// socket dropped while still connected. Running the callback from `Drop`
+/// covers normal exit, abort, and runtime shutdown alike.
+struct CleanupGuard(Option<CleanupFn>);
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.0.take() {
+            cleanup();
+        }
+    }
+}
+
 /// High-level uTP socket
 pub struct UtpSocket {
     inner: Arc<Mutex<UtpSocketInner>>,
@@ -790,7 +838,12 @@ impl UtpSocket {
 
         let driver_inner = Arc::clone(&inner);
         let driver_wakeup = Arc::clone(&wakeup);
+        // Built outside the async block so it is part of the future's
+        // captured state: it runs even if the task is aborted before its
+        // first poll.
+        let cleanup = CleanupGuard(cleanup);
         let driver = tokio::spawn(async move {
+            let _cleanup = cleanup;
             let mut tick = tokio::time::interval(DRIVER_TICK);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -834,9 +887,7 @@ impl UtpSocket {
                 }
             }
             driver_wakeup.notify_waiters();
-            if let Some(cleanup) = cleanup {
-                cleanup();
-            }
+            // `_cleanup` drops here and deregisters the connection.
         });
 
         Self {
@@ -1091,6 +1142,60 @@ mod tests {
         assert_eq!(gap_ack.ack_nr, 2);
         assert!(gap_ack.selective_ack.unwrap().is_acked(0));
         assert_eq!(sock.available_data(), 5, "gap was exposed to the reader");
+    }
+
+    #[tokio::test]
+    async fn test_receive_window_bounds_buffered_data() {
+        let (tx, _rx) = mpsc::channel(64);
+        let config = UtpConfig {
+            recv_window: 10,
+            ..UtpConfig::default()
+        };
+        let mut sock =
+            UtpSocketInner::new_incoming("127.0.0.1:1".parse().unwrap(), 100, 1, tx, config);
+        sock.state = ConnectionState::Connected;
+
+        // 5 bytes fit (window 10)
+        sock.process_packet(Packet::data(101, 2, 0, b"12345".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(sock.ack_nr, 2);
+        assert_eq!(sock.available_data(), 5);
+
+        // The next in-order packet would overrun the window: it must be
+        // dropped and NOT acknowledged, so the peer retransmits later.
+        sock.process_packet(Packet::data(101, 3, 0, b"678901".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(sock.ack_nr, 2, "window overrun must not be acked");
+        assert_eq!(
+            sock.available_data(),
+            5,
+            "window overrun must not be buffered"
+        );
+
+        // Out-of-order packets are bounded by the same window
+        sock.process_packet(Packet::data(101, 5, 0, b"abcde".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(sock.ooo_packets.len(), 1, "5 ooo bytes fit (5 + 5 <= 10)");
+        sock.process_packet(Packet::data(101, 6, 0, b"f".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            sock.ooo_packets.len(),
+            1,
+            "ooo packet beyond the window must be dropped"
+        );
+
+        // Once the reader drains the buffer the retransmission is accepted
+        let mut buf = [0u8; 16];
+        assert_eq!(sock.read_data(&mut buf), 5);
+        sock.process_packet(Packet::data(101, 3, 0, b"6789".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(sock.ack_nr, 3);
+        assert_eq!(sock.available_data(), 4);
     }
 
     #[tokio::test]

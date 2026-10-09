@@ -7,6 +7,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-10-09
+
+Application audit release: every item below was reproduced with a failing
+test against 0.6.3 before being fixed, and the new tests ship in
+`tests/audit_regressions.rs`, `tests/audit_torrent_regressions.rs`, and the
+affected modules.
+
+### Security
+- `cancel(id, true)` joined the raw torrent `name` or magnet `dn` onto the
+  download directory and called `remove_dir_all`, so a magnet such as
+  `dn=..%2Fvictim` could delete a directory outside the download root. The
+  output path is now re-validated before any deletion, magnets have no
+  output name until metadata arrives, and `Metainfo::parse` rejects names
+  and file paths containing `..`, absolute components, or nothing at all.
+- HTTP `cancel(id, true)` no longer recursively deletes a directory, or a
+  pre-existing file, that merely shares the download's final name; an
+  incomplete download only owns its `.part` file.
+- URL-derived filenames are percent-decoded before validation, so an encoded
+  traversal (`..%2F..%2Fevil`) is rejected instead of being saved verbatim.
+- Hardened untrusted torrent input: piece lengths above 256 MiB and file
+  sizes that overflow are rejected at parse time; a Local Peer Discovery
+  datagram with multi-byte UTF-8 in the info-hash no longer panics the LPD
+  listener; the BEP 9 metadata assembler rejects `total_size` changes
+  mid-fetch; PEX messages, tracker peer lists, and pre-handshake inbound
+  connections are capped; web-seed responses are size-bounded before they
+  are buffered; the uTP receive buffer honours the advertised window and
+  dropped uTP sockets no longer leak multiplexer entries; a degenerate DH
+  public value from a peer aborts the MSE handshake.
+- Tracker peer entries are parsed as IP literals only; hostnames no longer
+  trigger blocking DNS lookups inside the engine's peer lock. `trackerid`
+  values are percent-encoded before being echoed to the tracker.
+- Dependency updates for published advisories: `rustls` 0.23.45
+  (RUSTSEC-2026-0285), `h2` 0.4.20 (RUSTSEC-2026-0258), `quinn-proto`
+  0.11.19 (RUSTSEC-2026-0185), and `quick-xml` 0.41 (RUSTSEC-2026-0194/0195).
+
+### Fixed
+- With the default `Preferred` encryption policy the engine could not
+  download from plaintext-only peers: a failed MSE exchange was reported as
+  "plaintext" on the same, already-poisoned socket. Failures now trigger the
+  documented fallback, a fresh plaintext connection.
+- `pause()` and `cancel()` returned before the HTTP worker had stopped, so a
+  worker stalled in a rate-limiter or back-off wait could append to the
+  `.part` file after `resume()` had reopened it, corrupting the result (or
+  leaving the partial file behind on cancel). Every wait on the HTTP path is
+  now cancellable and lifecycle operations drain the worker (bounded).
+- Cancelling or pausing an active torrent aborted the peer loop without its
+  per-peer connection tasks, which could write pieces back to disk after the
+  files had been deleted. `stop()` now aborts them.
+- Streaming readers stalled forever on torrents with pieces larger than
+  16 KiB (every real-world torrent) because they requested 64 KiB blocks
+  that the piece manager rejects; and could end early when the final rename
+  raced a read of the `.part` file.
+- `resume(id)` refused downloads in the `Error` state, so the segment
+  progress saved on failure was unreachable and the only recovery was
+  `repair()`, which discards it. Failed downloads can now be resumed.
+- `DownloadOptions { max_connections: Some(0) }` hung forever on a
+  zero-permit semaphore; it is now rejected before enqueueing.
+- `add_*` and `resume` after `shutdown()` started work whose progress and
+  persistence tasks were gone; they now return `EngineError::Shutdown`.
+- Global bandwidth limits set through `set_config` / the scheduler reached the
+  limiters only with the `http` feature enabled.
+- `with_retry` never attempted the request at all when `max_retries` was 0
+  (recursive discovery reported "Max retries exceeded" without a request).
+- Web seeds: BEP 19 multi-file ranges used torrent-global offsets for pieces
+  inside a non-first file (416 or wrong bytes); seeds beyond
+  `max_connections` got stuck in `Downloading` with their piece never
+  reselected; a zero-length file inside a piece underflowed; BEP 17 URLs
+  with an existing query were malformed; `max_connections: 0` panicked;
+  in-flight piece tasks survived `shutdown()`.
+- `read_block` read a whole piece from disk to serve one 16 KiB block.
+- Peers advertising more than 262,144 pieces had their bitfield rejected by
+  the 32 KiB message limit; the limit now scales with the piece count.
+- The info-hash locator matched `4:infod` inside string values (e.g. a
+  comment), producing a wrong info-hash for such torrents.
+- Recursive HTTP: `preserve_paths: false` was ignored; `same_host_only`
+  ignored scheme and port (credentials could be replayed over plaintext or
+  to another port); link text was not percent-decoded; directory pages at
+  `max_depth` were fetched but never parsed; the crawl frontier was neither
+  deduplicated nor bounded; a slow page could block discovery forever
+  (now 120 s per page); a child enqueued after its fail-fast group had
+  already tripped still ran; a restored tripped group could trip again;
+  `remove_recursive_job` aborted on a child that was concurrently removed;
+  one unreadable persisted recursive record prevented engine startup;
+  aggregate job state reported the terminal-looking `Partial` while
+  children were still paused or queued; progress-driven job events are now
+  coalesced to four per second per job.
+- Metalink documents with duplicate `<file name>` entries are rejected
+  instead of starting two downloads onto one `.part` file.
+- `EngineConfig::validate` rejects `torrent.webseed.max_connections: 0`.
+- Retry back-off arithmetic saturates instead of overflowing on huge
+  configured delays.
+
+### Changed
+- `DownloadStatus::metadata.filename` is `None` for magnets until metadata
+  is received (`metadata.name` still carries the `dn` display name).
+- `RecursiveJobState`: `Running`/`Queued`/`Paused` are reported while any
+  child can still change state; `Completed`/`Failed`/`Partial` are terminal.
+- `RecursiveOptions::same_host_only` compares the full origin.
+
+### Documentation
+- README: broadcast-channel `Lagged` handling in the event loops, resume-
+  from-error, cancel/delete semantics, torrent `Seeding` vs `Completed`,
+  which `set_config` fields apply live, recursive option semantics, and the
+  known gaps (web seeds ignore the HTTP proxy settings; `io-uring` is a
+  reserved no-op). The uTP config doc no longer calls the transport
+  non-functional.
+
 ## [0.6.3] - 2026-09-05
 
 ### Added

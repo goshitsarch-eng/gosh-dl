@@ -83,36 +83,24 @@ pub(crate) fn partial_path_for(save_path: &Path) -> PathBuf {
 /// joining the name onto `save_dir`. Relative subpaths (`sub/file.bin`) are
 /// allowed; `..`, absolute paths, and Windows prefixes are not.
 pub(crate) fn validate_filename_components(final_filename: &str) -> Result<()> {
-    use std::path::Component;
-    if !Path::new(final_filename)
-        .components()
-        .any(|c| matches!(c, Component::Normal(_)))
-    {
-        return Err(EngineError::invalid_input(
-            "filename",
-            "Filename must name a file",
-        ));
+    crate::fsutil::validate_output_name(final_filename)
+}
+
+/// Run `fut` unless `token` is cancelled first.
+///
+/// Every wait on the HTTP transfer path (probes, request sends, body
+/// chunks, rate-limiter debt, retry back-off) goes through this so that
+/// `pause()` and `cancel()` can rely on the worker exiting promptly instead
+/// of racing a new worker or a file deletion.
+pub(crate) async fn cancellable<F: std::future::Future>(
+    token: &CancellationToken,
+    fut: F,
+) -> Result<F::Output> {
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => Err(EngineError::Shutdown),
+        value = fut => Ok(value),
     }
-    for component in Path::new(final_filename).components() {
-        match component {
-            Component::ParentDir => {
-                return Err(EngineError::storage(
-                    StorageErrorKind::PathTraversal,
-                    Path::new(final_filename),
-                    "Invalid filename: contains parent directory reference (..)",
-                ));
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(EngineError::storage(
-                    StorageErrorKind::PathTraversal,
-                    Path::new(final_filename),
-                    "Invalid filename: contains absolute path",
-                ));
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 /// HTTP Downloader
@@ -292,7 +280,7 @@ impl HttpDownloader {
             }
         }
         head_request = head_request.header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY);
-        let head_response = head_request.send().await;
+        let head_response = cancellable(&cancel_token, head_request.send()).await?;
 
         let (content_length, supports_range, suggested_filename, etag, last_modified) =
             match head_response {
@@ -454,7 +442,7 @@ impl HttpDownloader {
             }
 
             // Send the request
-            let response = attempt_request.send().await?;
+            let response = cancellable(&cancel_token, attempt_request.send()).await??;
             #[cfg(feature = "recursive-http")]
             if let Some(scope) = redirect_scope.as_ref() {
                 crate::http::crawl::validate_redirect_scope(response.url(), scope)?;
@@ -644,7 +632,7 @@ impl HttpDownloader {
                             // Server doesn't support ranges — must restart from byte 0
                             allow_resume = false;
                         }
-                        tokio::time::sleep(delay).await;
+                        cancellable(&cancel_token, tokio::time::sleep(delay)).await?;
                         continue;
                     }
                     return Err(e);
@@ -684,10 +672,17 @@ impl HttpDownloader {
 
             let chunk_len = chunk.len() as u64;
 
-            // Apply rate limiting if configured (global, then per-download)
-            self.pool.acquire_download(chunk_len).await;
-            if let Some(limiter) = extra_limiter.as_ref() {
-                limiter.acquire(chunk_len).await;
+            // Apply rate limiting if configured (global, then per-download).
+            // A limiter wait can be long; it must not outlive a cancel.
+            let limited = async {
+                self.pool.acquire_download(chunk_len).await;
+                if let Some(limiter) = extra_limiter.as_ref() {
+                    limiter.acquire(chunk_len).await;
+                }
+            };
+            if cancellable(&cancel_token, limited).await.is_err() {
+                file.flush().await.ok();
+                return Err(EngineError::Shutdown);
             }
 
             // Write chunk to file
@@ -870,16 +865,18 @@ impl HttpDownloader {
         if let Some(cookies) = cookies.filter(|c| !c.is_empty()) {
             probe = probe.header("Cookie", cookies.join("; "));
         }
-        let capabilities = segment::probe_request(probe).await.unwrap_or_else(|err| {
-            tracing::debug!("HEAD probe failed for {} ({}); trying GET", url, err);
-            ServerCapabilities {
-                content_length: None,
-                supports_range: false,
-                etag: None,
-                last_modified: None,
-                suggested_filename: None,
-            }
-        });
+        let capabilities = cancellable(&cancel_token, segment::probe_request(probe))
+            .await?
+            .unwrap_or_else(|err| {
+                tracing::debug!("HEAD probe failed for {} ({}); trying GET", url, err);
+                ServerCapabilities {
+                    content_length: None,
+                    supports_range: false,
+                    etag: None,
+                    last_modified: None,
+                    suggested_filename: None,
+                }
+            });
 
         // NOTE: the shared cell must keep the *saved* validators until the
         // segmented-vs-single decision below — the single-connection fallback

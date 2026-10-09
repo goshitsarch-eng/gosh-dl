@@ -394,6 +394,12 @@ impl PieceManager {
 
         let piece_length = self.metainfo.info.piece_length;
         let num_pieces = self.num_pieces();
+        if num_pieces == 0 || piece_length == 0 {
+            // Nothing to select (e.g. a magnet download before its metadata
+            // arrived): `num_pieces - 1` and the division below would panic.
+            *self.wanted_pieces.write() = None;
+            return;
+        }
         let mut wanted = bitvec![u8, Msb0; 0; num_pieces];
 
         // For each selected file, mark the pieces that contain its data
@@ -1000,11 +1006,28 @@ impl PieceManager {
             ));
         }
 
-        // Read the full piece data from disk (same logic as verify_piece_on_disk)
+        // Read only the requested byte range: walk the file segments making
+        // up this piece and copy each one's overlap with
+        // [block_start, block_end). Reading the whole piece (up to several
+        // MiB) to serve one <=16 KiB block would be a per-request
+        // amplification under upload load.
+        let block_start = offset as u64;
         let files_for_piece = self.metainfo.files_for_piece(piece_index as usize);
-        let mut piece_data = Vec::with_capacity(piece_length as usize);
+        let mut block = Vec::with_capacity(length as usize);
+        // Offset of the current segment within the piece
+        let mut piece_pos = 0u64;
 
-        for (file_idx, file_offset, file_length) in files_for_piece {
+        for (file_idx, file_offset, segment_len) in files_for_piece {
+            let seg_start = piece_pos;
+            let seg_end = piece_pos + segment_len;
+            piece_pos = seg_end;
+
+            let read_start = seg_start.max(block_start);
+            let read_end = seg_end.min(block_end);
+            if read_start >= read_end {
+                continue; // Segment lies entirely outside the block
+            }
+
             let file_info = &self.metainfo.info.files[file_idx];
 
             // Build and validate file path (security check)
@@ -1033,9 +1056,10 @@ impl PieceManager {
                 )
             })?;
 
-            file.seek(SeekFrom::Start(file_offset)).await?;
+            file.seek(SeekFrom::Start(file_offset + (read_start - seg_start)))
+                .await?;
 
-            let mut buf = vec![0u8; file_length as usize];
+            let mut buf = vec![0u8; (read_end - read_start) as usize];
             file.read_exact(&mut buf)
                 .await
                 .map_err(|e: std::io::Error| {
@@ -1045,14 +1069,26 @@ impl PieceManager {
                         format!("Failed to read block data: {}", e),
                     )
                 })?;
-            piece_data.extend_from_slice(&buf);
+            block.extend_from_slice(&buf);
+
+            if seg_end >= block_end {
+                break; // Remaining segments are past the block
+            }
         }
 
-        // Extract just the requested block
-        let block_start = offset as usize;
-        let block_end = block_start + length as usize;
+        if block.len() != length as usize {
+            // Files do not cover the piece range (inconsistent metainfo);
+            // never hand out a short block.
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::InvalidTorrent,
+                format!(
+                    "Piece {} block at offset {} (len {}) is not covered by torrent files",
+                    piece_index, offset, length
+                ),
+            ));
+        }
 
-        Ok(piece_data[block_start..block_end].to_vec())
+        Ok(block)
     }
 
     /// Write piece data received from a webseed (already verified)
@@ -1193,6 +1229,155 @@ impl PieceProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::torrent::metainfo::{FileInfo, Info};
+
+    /// Multi-file metainfo named "multi" with files `f0.bin`, `f1.bin`, ...
+    /// of the given lengths and all-zero piece hashes.
+    fn multi_file_metainfo(piece_length: u64, lengths: &[u64]) -> Metainfo {
+        let mut files = Vec::new();
+        let mut offset = 0u64;
+        for (i, &length) in lengths.iter().enumerate() {
+            files.push(FileInfo {
+                path: PathBuf::from(format!("f{}.bin", i)),
+                length,
+                offset,
+                md5sum: None,
+            });
+            offset += length;
+        }
+        let total_size = offset;
+        let num_pieces = if piece_length == 0 {
+            0
+        } else {
+            total_size.div_ceil(piece_length) as usize
+        };
+        Metainfo {
+            info_hash: [0u8; 20],
+            info: Info {
+                name: "multi".to_string(),
+                piece_length,
+                pieces: vec![[0u8; 20]; num_pieces],
+                files,
+                total_size,
+                is_single_file: false,
+                private: false,
+            },
+            announce: None,
+            announce_list: Vec::new(),
+            creation_date: None,
+            comment: None,
+            created_by: None,
+            encoding: None,
+            url_list: Vec::new(),
+            httpseeds: Vec::new(),
+        }
+    }
+
+    fn pattern_a(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn pattern_b(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 7 + 3) % 253) as u8).collect()
+    }
+
+    /// Piece 0 = f0[0..10000] ++ f1[0..6384]; piece 1 = f1[6384..20000].
+    const PIECE_LEN: u64 = 16384;
+    const F0_LEN: usize = 10_000;
+    const F1_LEN: usize = 20_000;
+
+    #[tokio::test]
+    async fn test_read_block_spanning_file_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("multi");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = pattern_a(F0_LEN);
+        let b = pattern_b(F1_LEN);
+        std::fs::write(root.join("f0.bin"), &a).unwrap();
+        std::fs::write(root.join("f1.bin"), &b).unwrap();
+
+        let metainfo = multi_file_metainfo(PIECE_LEN, &[F0_LEN as u64, F1_LEN as u64]);
+        assert_eq!(metainfo.info.pieces.len(), 2);
+        let pm = PieceManager::new(Arc::new(metainfo), dir.path().to_path_buf());
+        {
+            let mut have = pm.have.write();
+            have.set(0, true);
+            have.set(1, true);
+        }
+
+        // Straddles the f0/f1 boundary (piece offset 10000)
+        let block = pm.read_block(0, 9000, 2000).await.unwrap();
+        let mut expected = a[9000..10000].to_vec();
+        expected.extend_from_slice(&b[0..1000]);
+        assert_eq!(block, expected);
+
+        // Fully inside f1
+        let block = pm.read_block(0, 12000, 1000).await.unwrap();
+        assert_eq!(block, &b[2000..3000]);
+
+        // Fully inside f0
+        let block = pm.read_block(0, 0, 1000).await.unwrap();
+        assert_eq!(block, &a[0..1000]);
+
+        // Second (shorter) piece starts at f1 offset 6384
+        let block = pm.read_block(1, 0, 1000).await.unwrap();
+        assert_eq!(block, &b[6384..7384]);
+        let block = pm.read_block(1, 13000, 616).await.unwrap();
+        assert_eq!(block, &b[F1_LEN - 616..F1_LEN]);
+
+        // Existing bounds checks are preserved
+        assert!(
+            pm.read_block(1, 13000, 617).await.is_err(),
+            "past piece end"
+        );
+        assert!(pm.read_block(2, 0, 1).await.is_err(), "no such piece");
+        assert!(
+            pm.read_block(0, 0, BLOCK_SIZE + 1025).await.is_err(),
+            "oversized block"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_block_reads_only_requested_range() {
+        // f1 is truncated on disk to 3000 bytes and f0 is absent: a block
+        // must be served from exactly the bytes it covers, not by loading
+        // the whole piece (which would fail on both files).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("multi");
+        std::fs::create_dir_all(&root).unwrap();
+        let b = pattern_b(3000);
+        std::fs::write(root.join("f1.bin"), &b).unwrap();
+
+        let metainfo = multi_file_metainfo(PIECE_LEN, &[F0_LEN as u64, F1_LEN as u64]);
+        let pm = PieceManager::new(Arc::new(metainfo), dir.path().to_path_buf());
+        pm.have.write().set(0, true);
+
+        let block = pm.read_block(0, 12000, 1000).await.unwrap();
+        assert_eq!(block, &b[2000..3000]);
+
+        // A block that needs bytes which are missing on disk still errors
+        assert!(pm.read_block(0, 9000, 2000).await.is_err());
+        assert!(pm.read_block(0, 12500, 1000).await.is_err());
+    }
+
+    #[test]
+    fn test_set_selected_files_zero_pieces_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let metainfo = multi_file_metainfo(PIECE_LEN, &[0]);
+        assert_eq!(metainfo.info.pieces.len(), 0);
+        let pm = PieceManager::new(Arc::new(metainfo), dir.path().to_path_buf());
+
+        // Used to underflow `num_pieces - 1`
+        pm.set_selected_files(Some(&[0]));
+        assert!(pm.is_complete());
+        assert!(pm.is_piece_wanted(0));
+
+        // piece_length 0 must not divide by zero either
+        let metainfo = multi_file_metainfo(0, &[10]);
+        let pm = PieceManager::new(Arc::new(metainfo), dir.path().to_path_buf());
+        pm.set_selected_files(Some(&[0]));
+        assert!(pm.is_complete());
+    }
 
     #[test]
     fn test_pending_piece() {

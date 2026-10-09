@@ -340,11 +340,13 @@ impl std::fmt::Display for TransportPolicy {
 /// uTP (Micro Transport Protocol) configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UtpConfigSettings {
-    /// Enable uTP transport.
+    /// Enable uTP transport (BEP 29).
     ///
-    /// The uTP stack is experimental and currently non-functional for real
-    /// data transfer; a config file that omits this key gets the same `false`
-    /// default as `UtpConfigSettings::default()`.
+    /// Opt-in and still considered experimental: the stack passes loopback,
+    /// packet-loss, and full-transfer fixture tests but has not been
+    /// validated against real-world swarms or lossy WAN paths. A config file
+    /// that omits this key gets the same `false` default as
+    /// `UtpConfigSettings::default()`.
     #[serde(default)]
     pub enabled: bool,
 
@@ -569,6 +571,14 @@ impl EngineConfig {
             ));
         }
 
+        // A zero-capacity webseed manager cannot be constructed.
+        if self.torrent.webseed.max_connections == 0 {
+            return Err(EngineError::invalid_input(
+                "torrent.webseed.max_connections",
+                "Must be at least 1",
+            ));
+        }
+
         // Check port range
         if self.torrent.listen_port_range.0 > self.torrent.listen_port_range.1 {
             return Err(EngineError::invalid_input(
@@ -621,6 +631,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = EngineConfig::new().download_dir(dir.path());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_zero_webseed_connections_is_invalid() {
+        let dir = tempdir().unwrap();
+        let mut config = EngineConfig::new().download_dir(dir.path());
+        config.torrent.webseed.max_connections = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

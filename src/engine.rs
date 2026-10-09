@@ -63,6 +63,11 @@ struct ManagedDownload {
     /// Cached HTTP segment state for in-memory pause/resume (no storage needed)
     #[cfg(feature = "http")]
     cached_segments: Option<Vec<Segment>>,
+    /// Worker task of a paused or cancelled HTTP download that has not yet
+    /// exited. It is awaited before any new worker may touch the same
+    /// `.part` file and before files are deleted.
+    #[cfg(feature = "http")]
+    draining_http: Option<tokio::task::JoinHandle<Result<()>>>,
     #[cfg(all(feature = "http", feature = "recursive-http"))]
     redirect_scope: Option<crawl::RedirectScope>,
     #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -164,6 +169,10 @@ pub struct DownloadEngine {
     recursive_jobs: RwLock<HashMap<Uuid, crate::types::TrackedRecursiveJob>>,
     #[cfg(all(feature = "http", feature = "recursive-http"))]
     recursive_job_membership: RwLock<HashMap<DownloadId, HashSet<Uuid>>>,
+    /// Last time a progress tick produced an `Updated` event per job, so a
+    /// job with thousands of children is not re-aggregated on every tick.
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    recursive_job_progress_emits: RwLock<HashMap<Uuid, std::time::Instant>>,
 
     /// HTTP downloader
     #[cfg(feature = "http")]
@@ -196,6 +205,81 @@ impl DownloadEngine {
     /// Obtain a strong `Arc<Self>` reference for spawning background tasks.
     fn arc(&self) -> Result<Arc<Self>> {
         self.self_ref.upgrade().ok_or(EngineError::Shutdown)
+    }
+
+    /// Reject new work once [`shutdown`](Self::shutdown) has run: the
+    /// persistence and torrent progress tasks are gone, so a download
+    /// started afterwards would silently stop reporting progress and never
+    /// be persisted.
+    fn ensure_accepting_work(&self) -> Result<()> {
+        if self.shutdown.is_cancelled() {
+            Err(EngineError::Shutdown)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Push the scheduler's current limits into the global limiters shared
+    /// by every transfer path (HTTP and torrent), independent of features.
+    fn apply_bandwidth_limits(&self, limits: BandwidthLimits) {
+        self.global_download_limiter.set_limit(limits.download);
+        self.global_upload_limiter.set_limit(limits.upload);
+    }
+
+    /// Wait (bounded) for a cancelled HTTP worker to exit so that a new
+    /// worker or a file deletion cannot race its final writes. A worker that
+    /// is still running after the timeout is parked on the download and
+    /// awaited again before the next lifecycle action.
+    #[cfg(feature = "http")]
+    async fn drain_http_worker(
+        &self,
+        id: DownloadId,
+        mut task: tokio::task::JoinHandle<Result<()>>,
+    ) {
+        const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+        if tokio::time::timeout(DRAIN_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "HTTP worker for {} is still running {:?} after cancellation; \
+                 it will be awaited before the next lifecycle action",
+                id,
+                DRAIN_TIMEOUT
+            );
+            if let Some(download) = self.downloads.write().get_mut(&id) {
+                download.draining_http = Some(task);
+            }
+        }
+    }
+
+    /// Cancel and drain whatever HTTP worker a download still owns (a
+    /// finished task, a paused worker, or one parked by a timed-out drain).
+    #[cfg(feature = "http")]
+    async fn retire_http_worker(&self, id: DownloadId) {
+        let (stale, pending) = {
+            let mut downloads = self.downloads.write();
+            match downloads.get_mut(&id) {
+                Some(download) => {
+                    let stale = match download.handle.take() {
+                        Some(DownloadHandle::Http(h)) => Some(h),
+                        other => {
+                            download.handle = other;
+                            None
+                        }
+                    };
+                    (stale, download.draining_http.take())
+                }
+                None => (None, None),
+            }
+        };
+        if let Some(handle) = stale {
+            handle.cancel_token.cancel();
+            self.drain_http_worker(id, handle.task).await;
+        }
+        if let Some(task) = pending {
+            self.drain_http_worker(id, task).await;
+        }
     }
 
     /// Create a new download engine with the given configuration
@@ -311,6 +395,8 @@ impl DownloadEngine {
             recursive_jobs: RwLock::new(HashMap::new()),
             #[cfg(all(feature = "http", feature = "recursive-http"))]
             recursive_job_membership: RwLock::new(HashMap::new()),
+            #[cfg(all(feature = "http", feature = "recursive-http"))]
+            recursive_job_progress_emits: RwLock::new(HashMap::new()),
             #[cfg(feature = "http")]
             http,
             event_tx,
@@ -411,10 +497,7 @@ impl DownloadEngine {
                         let Some(engine) = weak.upgrade() else { break };
                         if engine.scheduler.read().update() {
                             let limits = engine.scheduler.read().get_limits();
-                            #[cfg(feature = "http")]
-                            engine
-                                .http
-                                .set_bandwidth_limits(limits.download, limits.upload);
+                            engine.apply_bandwidth_limits(limits);
                         }
                     }
                     _ = shutdown.cancelled() => {
@@ -525,6 +608,8 @@ impl DownloadEngine {
         let runtime_metadata = storage.load_all_runtime_metadata().await?;
         #[cfg(all(feature = "http", feature = "recursive-http"))]
         let mut restored_groups = HashMap::new();
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        let mut tripped_groups: HashSet<Uuid> = HashSet::new();
 
         for status in persisted {
             // For active/downloading states, mark as paused (crashed mid-download)
@@ -569,33 +654,46 @@ impl DownloadEngine {
                 .as_ref()
                 .and_then(|r| r.recursive_child.clone())
             {
-                Some(recursive_child) => (
-                    Some(crawl::RedirectScope::from_persisted(
-                        recursive_child.redirect_scope,
-                    )?),
-                    recursive_child.recursive_group_id,
-                    recursive_child.fail_fast,
-                ),
+                Some(recursive_child) => {
+                    match crawl::RedirectScope::from_persisted(recursive_child.redirect_scope) {
+                        Ok(scope) => (
+                            Some(scope),
+                            recursive_child.recursive_group_id,
+                            recursive_child.fail_fast,
+                        ),
+                        Err(e) => {
+                            // One corrupt record must not prevent startup;
+                            // the download is restored as a plain HTTP one.
+                            tracing::warn!(
+                                "Ignoring unreadable recursive scope for {}: {}",
+                                status.id,
+                                e
+                            );
+                            (None, None, false)
+                        }
+                    }
+                }
                 None => (None, None, false),
             };
 
             #[cfg(all(feature = "http", feature = "recursive-http"))]
             if let Some(group_id) = recursive_group_id {
-                if recursive_fail_fast
-                    && !matches!(
-                        restored_status.state,
-                        DownloadState::Completed | DownloadState::Error { .. }
-                    )
-                {
-                    restored_groups
-                        .entry(group_id)
-                        .or_insert_with(|| RecursiveGroup {
-                            child_ids: HashSet::new(),
-                            fail_fast: true,
-                            failed: false,
-                        })
-                        .child_ids
-                        .insert(status.id);
+                if recursive_fail_fast {
+                    if matches!(restored_status.state, DownloadState::Error { .. }) {
+                        // A child already failed: the group has tripped and
+                        // must not trip (and abort siblings) a second time.
+                        tripped_groups.insert(group_id);
+                    } else if !matches!(restored_status.state, DownloadState::Completed) {
+                        restored_groups
+                            .entry(group_id)
+                            .or_insert_with(|| RecursiveGroup {
+                                child_ids: HashSet::new(),
+                                fail_fast: true,
+                                failed: false,
+                            })
+                            .child_ids
+                            .insert(status.id);
+                    }
                 }
             }
 
@@ -623,6 +721,8 @@ impl DownloadEngine {
                     restored_totals,
                     #[cfg(feature = "http")]
                     cached_segments,
+                    #[cfg(feature = "http")]
+                    draining_http: None,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
                     redirect_scope,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -640,6 +740,11 @@ impl DownloadEngine {
 
         #[cfg(all(feature = "http", feature = "recursive-http"))]
         {
+            for group_id in tripped_groups {
+                if let Some(group) = restored_groups.get_mut(&group_id) {
+                    group.failed = true;
+                }
+            }
             self.recursive_groups.write().extend(restored_groups);
         }
 
@@ -737,6 +842,8 @@ impl DownloadEngine {
         >,
         #[cfg(all(feature = "http", feature = "recursive-http"))] recursive_group_id: Option<Uuid>,
     ) -> Result<DownloadId> {
+        self.ensure_accepting_work()?;
+
         // Validate URL
         let parsed_url = Url::parse(url)
             .map_err(|e| EngineError::invalid_input("url", format!("Invalid URL: {}", e)))?;
@@ -750,6 +857,15 @@ impl DownloadEngine {
                     format!("Unsupported scheme: {}", scheme),
                 ));
             }
+        }
+
+        // Zero connections would create a permit-less worker that never makes
+        // a request and never finishes.
+        if options.max_connections == Some(0) {
+            return Err(EngineError::invalid_input(
+                "max_connections",
+                "Must be at least 1",
+            ));
         }
 
         #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -771,13 +887,19 @@ impl DownloadEngine {
             .clone()
             .unwrap_or_else(|| self.config.read().download_dir.clone());
 
-        // Extract filename from URL or options
+        // Extract filename from URL or options. URL segments are
+        // percent-decoded (`file%20name.zip` -> `file name.zip`); the decoded
+        // name is validated below so an encoded traversal cannot slip through.
         let filename = options.filename.clone().or_else(|| {
             parsed_url
                 .path_segments()
                 .and_then(|mut segments| segments.next_back())
-                .map(|s| s.to_string())
                 .filter(|s| !s.is_empty())
+                .map(|s| {
+                    urlencoding::decode(s)
+                        .map(|decoded| decoded.into_owned())
+                        .unwrap_or_else(|_| s.to_string())
+                })
         });
 
         let name = filename.clone().unwrap_or_else(|| "download".to_string());
@@ -841,6 +963,8 @@ impl DownloadEngine {
                     restored_totals: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
+                    #[cfg(feature = "http")]
+                    draining_http: None,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
                     redirect_scope,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -872,6 +996,22 @@ impl DownloadEngine {
         // Emit event
         let _ = self.event_tx.send(DownloadEvent::Added { id });
 
+        // A sibling may already have failed while this manifest was still
+        // being enqueued; fail-fast must cover late children too.
+        #[cfg(all(feature = "http", feature = "recursive-http"))]
+        if let Some(group_id) = recursive_group_id {
+            let tripped = self
+                .recursive_groups
+                .read()
+                .get(&group_id)
+                .map(|group| group.fail_fast && group.failed)
+                .unwrap_or(false);
+            if tripped {
+                self.fail_late_recursive_child(id, group_id).await;
+                return Ok(id);
+            }
+        }
+
         // Start the download (no saved segments for new downloads)
         if !options.start_paused {
             self.start_download(id, url.to_string(), options, None)
@@ -879,6 +1019,35 @@ impl DownloadEngine {
         }
 
         Ok(id)
+    }
+
+    /// Mark a child created after its fail-fast group already tripped as
+    /// failed, exactly like the siblings aborted by the original failure.
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    async fn fail_late_recursive_child(&self, id: DownloadId, group_id: Uuid) {
+        let message = "Aborted because a recursive sibling download had already failed".to_string();
+        let new_state = DownloadState::Error {
+            kind: "RecursiveFailFast".to_string(),
+            message: message.clone(),
+            retryable: false,
+        };
+        if self.update_state(id, new_state).is_err() {
+            return;
+        }
+        if let Some(ref storage) = self.storage {
+            let status = self.downloads.read().get(&id).map(|d| d.status.clone());
+            if let Some(status) = status {
+                if let Err(e) = storage.save_download(&status).await {
+                    tracing::debug!("Failed to persist fail-fast state for {}: {}", id, e);
+                }
+            }
+        }
+        let _ = self.event_tx.send(DownloadEvent::Failed {
+            id,
+            error: message,
+            retryable: false,
+        });
+        self.remove_recursive_group_member(Some(group_id), id);
     }
 
     /// Discover files reachable from an HTTP/HTTPS directory-like root URL.
@@ -1072,6 +1241,39 @@ impl DownloadEngine {
         }
     }
 
+    /// Progress ticks arrive several times per second per child; aggregate
+    /// status is O(children), so coalesce progress-driven updates per job.
+    /// State changes always go through the unthrottled path above.
+    #[cfg(all(feature = "http", feature = "recursive-http"))]
+    fn emit_recursive_job_progress_for_child(&self, child_id: DownloadId) {
+        const MIN_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+        let job_ids = self
+            .recursive_job_membership
+            .read()
+            .get(&child_id)
+            .cloned()
+            .unwrap_or_default();
+        if job_ids.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        for job_id in job_ids {
+            let due = {
+                let mut emits = self.recursive_job_progress_emits.write();
+                match emits.get(&job_id) {
+                    Some(last) if now.duration_since(*last) < MIN_PROGRESS_INTERVAL => false,
+                    _ => {
+                        emits.insert(job_id, now);
+                        true
+                    }
+                }
+            };
+            if due {
+                self.emit_recursive_job_update(job_id);
+            }
+        }
+    }
+
     /// Cancel all currently present child downloads for a tracked recursive job.
     ///
     /// This leaves the tracked recursive job record intact so callers can still
@@ -1083,8 +1285,9 @@ impl DownloadEngine {
             .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
 
         for child_id in job.child_ids {
-            if self.status(child_id).is_some() {
-                self.cancel(child_id, delete_files).await?;
+            match self.cancel(child_id, delete_files).await {
+                Ok(()) | Err(EngineError::NotFound(_)) => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -1099,12 +1302,14 @@ impl DownloadEngine {
             .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
 
         for child_id in &job.child_ids {
-            if self.status(*child_id).is_some() {
-                self.cancel(*child_id, delete_files).await?;
+            match self.cancel(*child_id, delete_files).await {
+                Ok(()) | Err(EngineError::NotFound(_)) => {}
+                Err(e) => return Err(e),
             }
         }
 
         self.recursive_jobs.write().remove(&id);
+        self.recursive_job_progress_emits.write().remove(&id);
         self.unregister_recursive_job_membership(&job);
         if let Some(ref storage) = self.storage {
             if let Err(e) = storage.delete_recursive_job(id).await {
@@ -1167,20 +1372,21 @@ impl DownloadEngine {
             None
         };
 
+        // Work still pending (active, queued, paused) is reported before any
+        // terminal classification, so `Partial`/`Failed`/`Completed` are
+        // only ever reported once no child can change state on its own.
         let state = if progress.total_children == 0 {
             crate::types::RecursiveJobState::Empty
+        } else if progress.active_children > 0 {
+            crate::types::RecursiveJobState::Running
+        } else if progress.queued_children > 0 {
+            crate::types::RecursiveJobState::Queued
+        } else if progress.paused_children > 0 {
+            crate::types::RecursiveJobState::Paused
         } else if progress.completed_children == progress.total_children {
             crate::types::RecursiveJobState::Completed
         } else if progress.failed_children + progress.missing_children == progress.total_children {
             crate::types::RecursiveJobState::Failed
-        } else if progress.failed_children > 0 || progress.missing_children > 0 {
-            crate::types::RecursiveJobState::Partial
-        } else if progress.active_children > 0 {
-            crate::types::RecursiveJobState::Running
-        } else if progress.paused_children > 0 {
-            crate::types::RecursiveJobState::Paused
-        } else if progress.queued_children > 0 {
-            crate::types::RecursiveJobState::Queued
         } else {
             crate::types::RecursiveJobState::Partial
         };
@@ -1378,7 +1584,9 @@ impl DownloadEngine {
         torrent_data: &[u8],
         options: DownloadOptions,
     ) -> Result<DownloadId> {
-        // Parse torrent file
+        self.ensure_accepting_work()?;
+
+        // Parse torrent file (rejects names/paths that escape the save dir)
         let metainfo = Metainfo::parse(torrent_data)?;
 
         // Generate download ID
@@ -1437,6 +1645,8 @@ impl DownloadEngine {
                     restored_totals: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
+                    #[cfg(feature = "http")]
+                    draining_http: None,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
                     redirect_scope: None,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -1489,6 +1699,8 @@ impl DownloadEngine {
         magnet_uri: &str,
         options: DownloadOptions,
     ) -> Result<DownloadId> {
+        self.ensure_accepting_work()?;
+
         // Parse magnet URI
         let magnet = MagnetUri::parse(magnet_uri)?;
 
@@ -1518,7 +1730,11 @@ impl DownloadEngine {
                 magnet_uri: Some(magnet_uri.to_string()),
                 info_hash: Some(hex::encode(magnet.info_hash)),
                 save_dir: save_dir.clone(),
-                filename: magnet.display_name.clone(),
+                // The `dn` parameter is a display hint from an untrusted URI,
+                // not an output path. The real name is filled in from the
+                // metainfo once metadata arrives; until then nothing is on
+                // disk, so there is nothing a lifecycle path could refer to.
+                filename: None,
                 user_agent: options.user_agent.clone(),
                 referer: None,
                 headers: Vec::new(),
@@ -1548,6 +1764,8 @@ impl DownloadEngine {
                     restored_totals: None,
                     #[cfg(feature = "http")]
                     cached_segments: None,
+                    #[cfg(feature = "http")]
+                    draining_http: None,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
                     redirect_scope: None,
                     #[cfg(all(feature = "http", feature = "recursive-http"))]
@@ -2136,6 +2354,9 @@ impl DownloadEngine {
         saved_segments: Option<Vec<crate::storage::Segment>>,
     ) -> Result<()> {
         let engine = self.arc()?;
+        // A previous worker (finished, paused, or still draining) must be
+        // fully gone before a new one touches the same `.part` file.
+        self.retire_http_worker(id).await;
         let http = Arc::clone(&self.http);
         let priority_queue = Arc::clone(&self.priority_queue);
         let priority = options.priority;
@@ -2259,7 +2480,7 @@ impl DownloadEngine {
                     .event_tx
                     .send(DownloadEvent::Progress { id, progress });
                 #[cfg(feature = "recursive-http")]
-                engine_clone.emit_recursive_job_updates_for_child(id);
+                engine_clone.emit_recursive_job_progress_for_child(id);
             });
 
             // Get config for segmented downloads
@@ -2268,6 +2489,7 @@ impl DownloadEngine {
                 (
                     options
                         .max_connections
+                        .filter(|n| *n > 0)
                         .unwrap_or(config.max_connections_per_download),
                     config.min_segment_size,
                 )
@@ -2482,10 +2704,16 @@ impl DownloadEngine {
         Ok(())
     }
 
-    /// Pause a download
+    /// Pause a download.
+    ///
+    /// Returns once the download's worker has stopped (bounded wait), so a
+    /// following [`resume`](Self::resume) never races the old worker's
+    /// final writes to the partial file.
     pub async fn pause(&self, id: DownloadId) -> Result<()> {
         #[cfg(feature = "torrent")]
         let mut torrent_to_stop = None;
+        #[cfg(feature = "http")]
+        let mut http_to_drain = None;
         let (status_to_save, segments_to_save) = {
             let mut downloads = self.downloads.write();
             let download = downloads
@@ -2520,7 +2748,8 @@ impl DownloadEngine {
                     #[cfg(feature = "http")]
                     DownloadHandle::Http(h) => {
                         h.cancel_token.cancel();
-                        // Don't await the task here to avoid blocking
+                        // Awaited below, outside the lock.
+                        http_to_drain = Some(h.task);
                     }
                     #[cfg(feature = "torrent")]
                     DownloadHandle::Torrent(h) => {
@@ -2563,6 +2792,11 @@ impl DownloadEngine {
             self.priority_queue.remove(id);
         }
 
+        #[cfg(feature = "http")]
+        if let Some(task) = http_to_drain {
+            self.drain_http_worker(id, task).await;
+        }
+
         // Persist to database
         if let Some(ref storage) = self.storage {
             if let Err(e) = storage.save_download(&status_to_save).await {
@@ -2583,8 +2817,15 @@ impl DownloadEngine {
         Ok(())
     }
 
-    /// Resume a paused download
+    /// Resume a paused download, or retry one that ended in `Error`.
+    ///
+    /// A failed HTTP download continues from the segment progress saved
+    /// when it failed (when the server still supports ranges and the remote
+    /// file is unchanged); a failed torrent re-checks its pieces on disk and
+    /// re-enters the queue. Completed downloads are not resumable.
     pub async fn resume(&self, id: DownloadId) -> Result<()> {
+        self.ensure_accepting_work()?;
+
         // Get download info and determine type
         #[allow(unused_variables)]
         let (kind, url, options, has_torrent_handle) = {
@@ -2593,8 +2834,11 @@ impl DownloadEngine {
                 .get(&id)
                 .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
 
-            // Check if can be resumed
-            if download.status.state != DownloadState::Paused {
+            // Check if can be resumed (retrying a failure is a resume too)
+            if !matches!(
+                download.status.state,
+                DownloadState::Paused | DownloadState::Error { .. }
+            ) {
                 return Err(EngineError::InvalidState {
                     action: "resume",
                     current_state: format!("{:?}", download.status.state),
@@ -2781,25 +3025,48 @@ impl DownloadEngine {
         Ok(())
     }
 
-    /// Cancel a download and optionally delete files
+    /// Cancel a download and optionally delete its files.
+    ///
+    /// With `delete_files`, the output path is re-validated before anything
+    /// is removed, and the download's worker is stopped first so it cannot
+    /// recreate the files afterwards. Torrents that never received metadata
+    /// have no output name and nothing on disk, so nothing is deleted.
     pub async fn cancel(&self, id: DownloadId, delete_files: bool) -> Result<()> {
-        let (handle, save_path, recursive_group_id) = {
+        let (handle, save_path, recursive_group_id, pending_http) = {
             let mut downloads = self.downloads.write();
             let download = downloads
                 .remove(&id)
                 .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
 
             let save_path = if delete_files {
-                Some(
-                    download.status.metadata.save_dir.join(
+                // HTTP downloads always carry a name ("download" is the
+                // engine's own fallback); torrents without metadata have
+                // nothing on disk and must not fall back to a shared name.
+                let is_torrent = download.status.kind != crate::types::DownloadKind::Http;
+                let name = if is_torrent {
+                    download.status.metadata.filename.as_deref()
+                } else {
+                    Some(
                         download
                             .status
                             .metadata
                             .filename
                             .as_deref()
                             .unwrap_or("download"),
-                    ),
-                )
+                    )
+                };
+                let completed = download.status.state == DownloadState::Completed;
+                name.and_then(|name| match crate::fsutil::validate_output_name(name) {
+                    Ok(()) => Some((
+                        download.status.metadata.save_dir.join(name),
+                        is_torrent,
+                        completed,
+                    )),
+                    Err(e) => {
+                        tracing::warn!("Refusing to delete files for {}: {}", id, e);
+                        None
+                    }
+                })
             } else {
                 None
             };
@@ -2811,6 +3078,10 @@ impl DownloadEngine {
                 download.recursive_group_id,
                 #[cfg(not(all(feature = "http", feature = "recursive-http")))]
                 None::<uuid::Uuid>,
+                #[cfg(feature = "http")]
+                download.draining_http,
+                #[cfg(not(feature = "http"))]
+                None::<()>,
             )
         };
 
@@ -2820,6 +3091,8 @@ impl DownloadEngine {
                 #[cfg(feature = "http")]
                 DownloadHandle::Http(h) => {
                     h.cancel_token.cancel();
+                    // The worker must be gone before its files are deleted.
+                    self.drain_http_worker(id, h.task).await;
                 }
                 #[cfg(feature = "torrent")]
                 DownloadHandle::Torrent(h) => {
@@ -2838,29 +3111,41 @@ impl DownloadEngine {
             }
         }
 
+        #[cfg(feature = "http")]
+        if let Some(task) = pending_http {
+            self.drain_http_worker(id, task).await;
+        }
+        #[cfg(not(feature = "http"))]
+        let _ = pending_http;
+
         // If the task was aborted while still waiting for a concurrency slot,
         // its queue entry would otherwise sit at the head forever.
         self.priority_queue.remove(id);
 
         // Delete files and segments if requested
-        if let Some(path) = save_path {
-            if path.exists() {
+        if let Some((path, is_torrent, completed)) = save_path {
+            if is_torrent {
+                // Torrent data is written straight to its final paths: a
+                // directory for multi-file torrents, a file otherwise.
                 if path.is_dir() {
-                    // Multi-file torrent: remove entire directory
                     tokio::fs::remove_dir_all(&path).await.ok();
-                } else {
-                    // Single file: remove the file
+                } else if path.is_file() {
                     tokio::fs::remove_file(&path).await.ok();
                 }
-            }
-            // Also try to remove the partial file, using the same naming
-            // scheme as the HTTP layer (`file.zip` -> `file.zip.part`);
-            // `with_extension` would target an unrelated `file.part`.
-            #[cfg(feature = "http")]
-            {
-                let partial_path = crate::http::partial_path_for(&path);
-                if partial_path.exists() {
-                    tokio::fs::remove_file(&partial_path).await.ok();
+            } else {
+                // HTTP: the final path is only ours once the download
+                // completed (the `.part` is renamed onto it). Before that an
+                // existing file or directory of the same name belongs to
+                // someone else and must survive; the `.part` is always ours.
+                if completed && path.is_file() {
+                    tokio::fs::remove_file(&path).await.ok();
+                }
+                #[cfg(feature = "http")]
+                {
+                    let partial_path = crate::http::partial_path_for(&path);
+                    if partial_path.is_file() {
+                        tokio::fs::remove_file(&partial_path).await.ok();
+                    }
                 }
             }
         }
@@ -2923,8 +3208,10 @@ impl DownloadEngine {
 
     /// Resume every paused download.
     ///
-    /// Downloads that change state while the batch is in flight are reported
-    /// as skipped. Per-download `Resumed` events are emitted as usual.
+    /// Failed downloads are left alone; retry those individually with
+    /// [`resume`](Self::resume). Downloads that change state while the batch
+    /// is in flight are reported as skipped. Per-download `Resumed` events
+    /// are emitted as usual.
     pub async fn resume_all(&self) -> BatchResult {
         let ids: Vec<DownloadId> = {
             let downloads = self.downloads.read();
@@ -2972,6 +3259,7 @@ impl DownloadEngine {
                 let mut recursive_jobs = self.recursive_jobs.write();
                 recursive_jobs.drain().map(|(_, job)| job).collect()
             };
+            self.recursive_job_progress_emits.write().clear();
             for job in jobs {
                 self.unregister_recursive_job_membership(&job);
                 if let Some(ref storage) = self.storage {
@@ -3342,6 +3630,9 @@ impl DownloadEngine {
                     HttpFile {
                         path: std::path::PathBuf,
                         available_end: u64,
+                        /// Reading the `.part` file: a read error after the
+                        /// download completed means it was renamed, not lost.
+                        is_partial: bool,
                     },
                     #[cfg(feature = "torrent")]
                     Torrent {
@@ -3393,11 +3684,13 @@ impl DownloadEngine {
                                         Source::HttpFile {
                                             path: final_path,
                                             available_end: end,
+                                            is_partial: false,
                                         }
                                     } else if let Some(sd) = segmented {
                                         Source::HttpFile {
                                             path: crate::http::partial_path_for(sd.save_path()),
                                             available_end: sd.contiguous_available(),
+                                            is_partial: true,
                                         }
                                     } else {
                                         // Paused/restored segments can have holes;
@@ -3430,6 +3723,7 @@ impl DownloadEngine {
                                         Source::HttpFile {
                                             path: crate::http::partial_path_for(&final_path),
                                             available_end,
+                                            is_partial: true,
                                         }
                                     }
                                 }
@@ -3484,6 +3778,7 @@ impl DownloadEngine {
                     Source::HttpFile {
                         path,
                         available_end,
+                        is_partial,
                     } => {
                         if available_end <= pos {
                             // Nothing new. Completed + fully drained = EOF.
@@ -3522,14 +3817,21 @@ impl DownloadEngine {
                                 pos += len as u64;
                             }
                             Err(e) => {
-                                // A rename can race an in-flight download,
-                                // but a missing/truncated final file cannot heal.
-                                if engine
-                                    .status(id)
-                                    .map(|d| d.state == DownloadState::Completed)
-                                    .unwrap_or(true)
-                                {
-                                    break 'pump;
+                                // The `.part` -> final rename can race a read
+                                // of the partial path; the next iteration
+                                // re-resolves to the final file. A missing or
+                                // truncated *final* file cannot heal.
+                                match engine.status(id) {
+                                    None => break 'pump,
+                                    Some(d) if matches!(d.state, DownloadState::Error { .. }) => {
+                                        break 'pump
+                                    }
+                                    Some(d)
+                                        if d.state == DownloadState::Completed && !is_partial =>
+                                    {
+                                        break 'pump
+                                    }
+                                    Some(_) => {}
                                 }
                                 tracing::debug!(
                                     "Streaming read of {:?} at {} failed ({}); retrying",
@@ -3567,7 +3869,13 @@ impl DownloadEngine {
                         let piece = (pos / piece_len) as u32;
                         let begin = (pos % piece_len) as u32;
                         let piece_end = ((piece as u64 + 1) * piece_len).min(pm.total_size());
-                        let len = (available_end.min(piece_end) - pos).min(CHUNK) as u32;
+                        // `read_block` serves at most one wire block; larger
+                        // requests are rejected, which previously stalled the
+                        // reader forever on any piece bigger than 16 KiB.
+                        let len = (available_end.min(piece_end) - pos)
+                            .min(CHUNK)
+                            .min(u64::from(crate::torrent::BLOCK_SIZE))
+                            as u32;
                         match pm.read_block(piece, begin, len).await {
                             Ok(data) => {
                                 if writer_half.write_all(&data).await.is_err() {
@@ -3603,7 +3911,14 @@ impl DownloadEngine {
         })
     }
 
-    /// Update engine configuration
+    /// Update engine configuration.
+    ///
+    /// Applied to the live engine immediately: `max_concurrent_downloads`,
+    /// `global_download_limit`, `global_upload_limit`, and `schedule_rules`.
+    /// Downloads started afterwards also pick up `download_dir`,
+    /// `max_connections_per_download`, `min_segment_size`, and the torrent
+    /// settings. HTTP client settings (`user_agent`, timeouts, proxy,
+    /// retries) and `database_path` are fixed when the engine is created.
     pub fn set_config(&self, config: EngineConfig) -> Result<()> {
         config.validate()?;
 
@@ -3619,9 +3934,7 @@ impl DownloadEngine {
         let limits = scheduler.get_limits();
         drop(scheduler);
 
-        #[cfg(feature = "http")]
-        self.http
-            .set_bandwidth_limits(limits.download, limits.upload);
+        self.apply_bandwidth_limits(limits);
 
         *self.config.write() = config;
         Ok(())
@@ -3685,9 +3998,7 @@ impl DownloadEngine {
             scheduler.set_rules(rules);
             scheduler.get_limits()
         };
-        #[cfg(feature = "http")]
-        self.http
-            .set_bandwidth_limits(limits.download, limits.upload);
+        self.apply_bandwidth_limits(limits);
     }
 
     /// Get the current schedule rules

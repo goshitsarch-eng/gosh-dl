@@ -6,18 +6,22 @@
 
 use super::connection::with_retry;
 use super::{HttpDownloader, ACCEPT_ENCODING_IDENTITY};
-use crate::error::{EngineError, Result};
+use crate::error::{EngineError, NetworkErrorKind, Result};
 use crate::types::{DownloadOptions, RecursiveEntry, RecursiveManifest, RecursiveOptions};
 use futures::stream::{FuturesUnordered, StreamExt};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 use url::Url;
 
 const MAX_DISCOVERY_HTML_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DISCOVERED_PAGES: usize = 1024;
 const MAX_DISCOVERED_FILES: usize = 10_000;
+/// Upper bound on fetching one directory page (including retries), so a
+/// slow-drip server cannot keep `add_http_recursive` waiting forever.
+const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 struct DiscoveryResponse {
@@ -135,7 +139,7 @@ impl RedirectScope {
     }
 
     fn contains(&self, url: &Url) -> bool {
-        if self.same_host_only && url.host_str() != self.root_url.host_str() {
+        if self.same_host_only && !same_origin(url, &self.root_url) {
             return false;
         }
 
@@ -185,7 +189,7 @@ fn is_url_in_scope(url: &Url, root: &Url, recursive: &RecursiveOptions, depth: u
         return false;
     }
 
-    if recursive.same_host_only && url.host_str() != root.host_str() {
+    if recursive.same_host_only && !same_origin(url, root) {
         return false;
     }
 
@@ -195,6 +199,13 @@ fn is_url_in_scope(url: &Url, root: &Url, recursive: &RecursiveOptions, depth: u
     };
 
     path_within_prefix(url.path(), &prefix)
+}
+
+/// `same_host_only` compares the full origin (scheme, host, port): headers
+/// and cookies supplied for the root must not be replayed to a different
+/// port or downgraded to plaintext on the same host name.
+fn same_origin(url: &Url, root: &Url) -> bool {
+    url.origin() == root.origin()
 }
 
 fn path_within_prefix(path: &str, prefix: &str) -> bool {
@@ -233,7 +244,22 @@ fn build_relative_path(url: &Url, root: &Url, recursive: &RecursiveOptions) -> R
         ));
     }
 
-    let relative = PathBuf::from(candidate);
+    // Percent-decode each segment so `my%20dir/file%20name.bin` lands on
+    // disk as `my dir/file name.bin` (matching `add_http`). A decoded segment
+    // must not smuggle a separator or NUL; `..` is caught below.
+    let mut relative = PathBuf::new();
+    for segment in candidate.split('/') {
+        let decoded = urlencoding::decode(segment)
+            .map(|decoded| decoded.into_owned())
+            .unwrap_or_else(|_| segment.to_string());
+        if decoded.contains('/') || decoded.contains('\\') || decoded.contains('\0') {
+            return Err(EngineError::invalid_input(
+                "root_url",
+                format!("Discovered invalid path for URL: {}", url),
+            ));
+        }
+        relative.push(decoded);
+    }
     for component in relative.components() {
         match component {
             Component::Normal(_) => {}
@@ -243,6 +269,14 @@ fn build_relative_path(url: &Url, root: &Url, recursive: &RecursiveOptions) -> R
                     format!("Discovered invalid path for URL: {}", url),
                 ));
             }
+        }
+    }
+
+    if !recursive.preserve_paths {
+        // Flatten into the download root; colliding names surface through
+        // `insert_entry` (or are overwritten with `overwrite_existing`).
+        if let Some(file_name) = relative.file_name() {
+            relative = PathBuf::from(file_name);
         }
     }
 
@@ -466,7 +500,9 @@ pub(crate) async fn discover(
     }
 
     let mut queue = VecDeque::from([(parsed_url.clone(), 0usize)]);
-    let mut visited_pages = HashSet::new();
+    // Every page ever enqueued (fetched or not): dedup happens at enqueue
+    // time so the frontier itself is bounded by MAX_DISCOVERED_PAGES.
+    let mut seen_pages: HashSet<String> = HashSet::from([parsed_url.as_str().to_string()]);
     let mut discovered: BTreeMap<String, RecursiveEntry> = BTreeMap::new();
     let mut pages_truncated = false;
     // Fetches run with bounded concurrency; responses are processed (and new
@@ -481,22 +517,22 @@ pub(crate) async fn discover(
                 break;
             };
 
-            if !visited_pages.insert(current_url.as_str().to_string()) {
-                continue;
-            }
-
-            if visited_pages.len() > MAX_DISCOVERED_PAGES {
-                tracing::warn!(
-                    "Recursive discovery reached the page limit ({}); results are truncated",
-                    MAX_DISCOVERED_PAGES
-                );
-                pages_truncated = true;
-                queue.clear();
-                break;
-            }
-
             in_flight.push(async move {
-                let response = fetch_discovery_response(http, &current_url, options).await;
+                let response = match tokio::time::timeout(
+                    PAGE_FETCH_TIMEOUT,
+                    fetch_discovery_response(http, &current_url, options),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(_) => Err(EngineError::network(
+                        NetworkErrorKind::Timeout,
+                        format!(
+                            "discovery page {} did not complete within {:?}",
+                            current_url, PAGE_FETCH_TIMEOUT
+                        ),
+                    )),
+                };
                 (current_url, depth, response)
             });
         }
@@ -541,14 +577,30 @@ pub(crate) async fn discover(
                 }
 
                 if normalized.path().ends_with('/') {
+                    // A directory page at `max_depth` would be fetched but
+                    // never parsed (its links would exceed the depth), so
+                    // don't spend a request or a page-budget slot on it.
+                    if depth + 1 >= recursive.max_depth || pages_truncated {
+                        continue;
+                    }
                     // Autoindex sort links (`?C=N;O=D`, ...) address the same
                     // directory page, so strip the query before dedup/enqueue.
                     // File URLs keep their query: it may be load-bearing.
                     let mut normalized = normalized;
                     normalized.set_query(None);
-                    if !pages_truncated && !visited_pages.contains(normalized.as_str()) {
-                        queue.push_back((normalized, depth + 1));
+                    if seen_pages.contains(normalized.as_str()) {
+                        continue;
                     }
+                    if seen_pages.len() >= MAX_DISCOVERED_PAGES {
+                        tracing::warn!(
+                            "Recursive discovery reached the page limit ({}); results are truncated",
+                            MAX_DISCOVERED_PAGES
+                        );
+                        pages_truncated = true;
+                        continue;
+                    }
+                    seen_pages.insert(normalized.as_str().to_string());
+                    queue.push_back((normalized, depth + 1));
                     continue;
                 }
 
@@ -691,6 +743,48 @@ mod tests {
             &RecursiveOptions::default(),
             1
         ));
+    }
+
+    #[test]
+    fn same_host_only_compares_scheme_and_port_too() {
+        let root = Url::parse("https://example.com/pub/").unwrap();
+        let recursive = RecursiveOptions::default();
+        assert!(is_url_in_scope(
+            &Url::parse("https://example.com/pub/a.bin").unwrap(),
+            &root,
+            &recursive,
+            1
+        ));
+        assert!(!is_url_in_scope(
+            &Url::parse("http://example.com/pub/a.bin").unwrap(),
+            &root,
+            &recursive,
+            1
+        ));
+        assert!(!is_url_in_scope(
+            &Url::parse("https://example.com:8443/pub/a.bin").unwrap(),
+            &root,
+            &recursive,
+            1
+        ));
+    }
+
+    #[test]
+    fn relative_paths_reject_decoded_separators() {
+        let root = Url::parse("https://example.com/pub/").unwrap();
+        let recursive = RecursiveOptions::default();
+        // `%2F` decodes to a separator inside one segment.
+        let url = Url::parse("https://example.com/pub/a%2F..%2Fb.bin").unwrap();
+        assert!(build_relative_path(&url, &root, &recursive).is_err());
+        // `%2e%2e` decodes to `..`.
+        let url = Url::parse("https://example.com/pub/x/%2e%2e%2e/b.bin").unwrap();
+        let rel = build_relative_path(&url, &root, &recursive).unwrap();
+        assert_eq!(rel, PathBuf::from("x/.../b.bin"));
+        let url = Url::parse("https://example.com/pub/my%20dir/file%20name.bin").unwrap();
+        assert_eq!(
+            build_relative_path(&url, &root, &recursive).unwrap(),
+            PathBuf::from("my dir/file name.bin")
+        );
     }
 
     #[test]

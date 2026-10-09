@@ -27,7 +27,7 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | Custom headers | User-Agent, Referer, cookies, arbitrary headers |
 | Checksum verification | MD5, SHA-256 |
 | Concurrent download management | Priority queue (Critical/High/Normal/Low) |
-| Pause / resume / cancel | Full lifecycle control, per download or in batch (`pause_all` / `resume_all` / `cancel_all`) |
+| Pause / resume / cancel | Full lifecycle control, per download or in batch (`pause_all` / `resume_all` / `cancel_all`); `resume(id)` also retries a failed download from its saved progress |
 | Rate limiting | Global + per-download byte-rate limits covering segmented HTTP, single-stream HTTP, torrent peers, and webseeds |
 | Streaming read API | `open_reader(id, offset)` yields an `AsyncRead` over an in-progress download; torrent piece selection follows the read head |
 | Mirror segment striping | Segments download from multiple mirrors in parallel, with per-URL health tracking and size cross-checks |
@@ -62,7 +62,7 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | DHT peer discovery | 5 | Works, disabled in CI tests |
 | Peer Exchange (PEX) | 11 | Implemented, disabled in CI tests |
 | Local Peer Discovery | 14 | Implemented, disabled in CI tests |
-| Message Stream Encryption | MSE/PE | RC4 + DH key exchange, unit tests only |
+| Message Stream Encryption | MSE/PE | Outgoing RC4 + DH key exchange; a peer that rejects MSE is retried over a fresh plaintext connection (default `Preferred` policy), covered by an engine-level test against a plaintext-only peer |
 | WebSeeds | 17, 19 | Hoffman + GetRight, including cross-file pieces |
 | uTP transport | 29 | Driver-task architecture with LEDBAT, retransmission, selective ACK; loopback + packet-loss + full-torrent-transfer tests; opt-in |
 | Endgame mode | — | Duplicate requests to multiple peers with cancels on receipt; toggle via `enable_endgame` |
@@ -81,7 +81,10 @@ A standalone CLI is available in the companion `gosh-dl-cli` project for users w
 | DHT IPv6 | Depends on upstream `mainline` crate |
 | MSE responder (inbound encryption) | Outgoing MSE works (incl. PadB handling); inbound connections are plaintext-only for now |
 
-Proxy support is wired through reqwest but lacks dedicated interoperability tests.
+Proxy support is wired through reqwest for HTTP downloads and trackers but
+lacks dedicated interoperability tests; BitTorrent web seeds use their own
+HTTP client and do not honour `HttpConfig::proxy_url` yet. The `io-uring`
+Cargo feature is a reserved no-op.
 
 Release validation uses local protocol fixtures and a Linux/macOS/Windows
 feature matrix. It does not establish interoperability with every public
@@ -94,7 +97,7 @@ Requires Rust 1.85 or newer. Add the published crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-dl = "0.6.3"
+gosh-dl = "0.6.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -103,7 +106,7 @@ Optional features: `recursive-http` (directory mirroring) and `metalink`
 
 ```toml
 [dependencies]
-gosh-dl = { version = "0.6.3", features = ["recursive-http"] }
+gosh-dl = { version = "0.6.4", features = ["recursive-http"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -127,14 +130,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DownloadOptions::default(),
     ).await?;
 
-    while let Ok(event) = events.recv().await {
-        println!("Event: {:?}", event);
-        match event {
-            gosh_dl::DownloadEvent::Completed { id: event_id } if event_id == id => break,
-            gosh_dl::DownloadEvent::Failed { id: event_id, error, .. } if event_id == id => {
+    loop {
+        match events.recv().await {
+            Ok(gosh_dl::DownloadEvent::Completed { id: event_id }) if event_id == id => break,
+            Ok(gosh_dl::DownloadEvent::Failed { id: event_id, error, .. }) if event_id == id => {
                 return Err(error.into());
             }
-            _ => {}
+            Ok(event) => println!("Event: {:?}", event),
+            // A slow consumer skips older events; the download itself is unaffected.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 
@@ -160,8 +165,8 @@ let torrent_id = engine.add_torrent(&torrent_bytes, options).await?;
 let magnet_id = engine.add_magnet(magnet_uri, options).await?;
 
 // Control
-engine.pause(id).await?;
-engine.resume(id).await?;
+engine.pause(id).await?;   // returns once the worker has stopped
+engine.resume(id).await?;  // also retries a download in the Error state
 engine.cancel(id, delete_files).await?;
 
 // Batch control (aria2 pauseAll/unpauseAll analogs).
@@ -186,24 +191,54 @@ let stats = engine.global_stats();
 ### Output Paths and Download Lifecycle
 
 Set `DownloadOptions::filename` for a deterministic output name. The engine
-otherwise selects the final URL path segment when present; a server's
+otherwise selects the final URL path segment when present (percent-decoded,
+so `file%20name.zip` is saved as `file name.zip`); a server's
 Content-Disposition filename is used only if no filename has already been
 selected. A URL-derived name therefore takes precedence over the header.
 
 Relative names such as `subdir/file.zip` are supported. Empty names, parent
-traversal, and absolute paths are rejected before enqueueing. Both transfer
-paths create parent directories, and completion preserves the relative path
-for subsequent reads, verification, repair, and deletion.
+traversal, and absolute paths are rejected before enqueueing, including when
+they arrive percent-encoded. Both transfer paths create parent directories,
+and completion preserves the relative path for subsequent reads, verification,
+repair, and deletion. `max_connections: Some(0)` is rejected.
+
+`cancel(id, true)` re-validates the output path before deleting anything. For
+an HTTP download it removes the `.part` file, and the final file only if the
+download had completed; a pre-existing file or directory that merely shares
+the name is left alone. For torrents it removes the torrent's file or
+directory; a magnet that never received metadata has nothing on disk and
+nothing is deleted.
+
+`pause(id)` and `cancel(id, ..)` return only after the HTTP worker has stopped
+(bounded wait), so a resume that follows cannot race the previous worker's
+writes to the partial file.
+
+`resume(id)` accepts both `Paused` and `Error` states. A failed HTTP download
+continues from the segment progress saved when it failed, provided the server
+still supports ranges and the remote file is unchanged; a failed torrent
+re-checks its pieces and re-enters the queue. `resume_all()` leaves failed
+downloads alone.
 
 HEAD probes carry the same custom headers, Referer, and cookies as the
 download. If the probe fails, the engine tries GET as a single stream and
 ignores metadata from the failed HEAD response.
 
-Pausing a torrent stops its worker and releases its concurrency slot. Resume
-reconstructs a worker from available metainfo and re-enters the priority
-queue, re-checking existing pieces during startup. A queued torrent remains
-paused until explicitly resumed. File selection, sequential mode, and limits
-are retained.
+Pausing a torrent stops its worker, its peer connections, and releases its
+concurrency slot. Resume reconstructs a worker from available metainfo and
+re-enters the priority queue, re-checking existing pieces during startup. A
+queued torrent remains paused until explicitly resumed. File selection,
+sequential mode, and limits are retained.
+
+A torrent whose data is complete reports `DownloadState::Seeding`; the
+`Completed` state and event follow only when seeding stops (seed ratio
+reached or the download is stopped), matching aria2. Treat the transition to
+`Seeding` as "download finished" when you do not care about seeding. A
+magnet's `metadata.filename` is `None` until its metadata arrives; the `dn`
+parameter is kept as the display `name` only.
+
+Torrent names and file paths are validated when the metainfo is parsed:
+`..`, absolute paths, empty names, piece lengths above 256 MiB, and file
+sizes that overflow are rejected with an `InvalidTorrent` error.
 
 ### Streaming Reads
 
@@ -350,14 +385,25 @@ let recursive = RecursiveOptions {
 Current scope:
 
 - crawls HTML directory/index pages and follows `<a href>` links
-- same-host only by default
+- same-origin (scheme, host, and port) only by default, so headers and cookies
+  given for the root are never replayed elsewhere
 - constrained to the root path prefix by default
+- directory pages are followed while `depth < max_depth`; `max_depth: 1`
+  downloads only the files linked from the root page
+- local paths are percent-decoded; `preserve_paths: false` flattens every
+  file into the download root (name collisions are reported, or resolved with
+  `overwrite_existing`)
+- each directory page fetch is bounded to two minutes including retries; the
+  crawl frontier is deduplicated and capped at 1024 pages / 10,000 files
 - discovered files are queued as ordinary HTTP downloads
 - rolls back already-added child downloads if recursive enqueue fails partway through
 - optional `fail_fast` cancels queued/active sibling child downloads after the first child failure
 - persists recursive child runtime context needed for redirect-scope and fail-fast recovery
 - persists tracked parent recursive jobs and restores them on restart
 - exposes aggregate parent status, lifecycle methods, and a dedicated parent event stream
+  (`Running`, `Queued`, and `Paused` are reported while any child can still
+  change state; `Completed`, `Failed`, and `Partial` are terminal; progress-driven
+  `Updated` events are coalesced to at most four per second per job)
 - propagates headers, cookies, user-agent, and referer during discovery
 - discovery fetches pages concurrently, bounded by `max_discovery_concurrency` (default 4)
 
@@ -377,7 +423,18 @@ Current limitations:
 use gosh_dl::DownloadEvent;
 
 let mut events = engine.subscribe();
-while let Ok(event) = events.recv().await {
+loop {
+    let event = match events.recv().await {
+        Ok(event) => event,
+        // The channel buffers 1024 events; a consumer that falls behind skips
+        // the oldest ones and keeps receiving. Poll `status(id)` for the
+        // authoritative state if that matters to you.
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+            eprintln!("missed {} events", skipped);
+            continue;
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+    };
     match event {
         DownloadEvent::Added { id } => println!("Added: {}", id),
         DownloadEvent::Started { id } => println!("Started: {}", id),
@@ -441,7 +498,13 @@ let config = EngineConfig {
 ```
 
 You can also apply a replacement config at runtime with `engine.set_config(config)?;`.
-Queue concurrency and global bandwidth limits are applied to the live engine when you do this.
+`max_concurrent_downloads`, the global bandwidth limits, and `schedule_rules`
+apply to the live engine immediately (with or without the `http` feature).
+Downloads started afterwards also pick up `download_dir`,
+`max_connections_per_download`, `min_segment_size`, and the torrent settings.
+HTTP client settings (`user_agent`, timeouts, proxy, retries) and
+`database_path` are fixed when the engine is created. After `shutdown()`,
+`add_*` and `resume` return `EngineError::Shutdown`.
 
 ### Persistence & Custom Storage
 

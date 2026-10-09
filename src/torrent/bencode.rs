@@ -460,7 +460,12 @@ impl BencodeValue {
 
 /// Find the raw bytes of the "info" dictionary in a torrent file
 ///
-/// This is needed to calculate the info_hash (SHA-1 of the raw info dict)
+/// This is needed to calculate the info_hash (SHA-1 of the raw info dict).
+///
+/// The top-level dictionary is walked with the real parser, tracking byte
+/// offsets, so the returned span is exactly the value of the top-level
+/// `info` key. A byte-pattern search for `4:infod` would also match inside
+/// string values (e.g. a `comment` containing it) and hash the wrong bytes.
 pub fn find_info_dict_bytes(data: &[u8]) -> Result<&[u8]> {
     // First, parse to validate the structure
     let root = BencodeValue::parse_exact(data)?;
@@ -475,23 +480,27 @@ pub fn find_info_dict_bytes(data: &[u8]) -> Result<&[u8]> {
         ));
     }
 
-    // Now find the raw bytes of the info dict
-    // We need to find "4:info" followed by a dict
-    let info_key = b"4:info";
+    // Walk the top-level dict: `d` <key> <value> ... `e`. The structure has
+    // been validated above, so every step here parses.
+    let mut pos = 1; // skip 'd'
+    while pos < data.len() && data[pos] != b'e' {
+        let key_result = BencodeValue::parse_bytes(&data[pos..])?;
+        let is_info = matches!(&key_result.value, BencodeValue::Bytes(k) if k == b"info");
+        pos = data.len() - key_result.remaining.len();
 
-    // Find the position of "4:info" in the data
-    let mut pos = 0;
-    while pos < data.len() {
-        if data[pos..].starts_with(info_key) {
-            let info_start = pos + info_key.len();
-            if info_start < data.len() && data[info_start] == b'd' {
-                // Parse from here to find the end
-                let result = BencodeValue::parse(&data[info_start..])?;
-                let info_len = data.len() - info_start - result.remaining.len();
-                return Ok(&data[info_start..info_start + info_len]);
+        let value_result = BencodeValue::parse(&data[pos..])?;
+        let value_end = data.len() - value_result.remaining.len();
+
+        if is_info {
+            if data.get(pos) != Some(&b'd') {
+                return Err(EngineError::protocol(
+                    ProtocolErrorKind::InvalidTorrent,
+                    "'info' value is not a dict",
+                ));
             }
+            return Ok(&data[pos..value_end]);
         }
-        pos += 1;
+        pos = value_end;
     }
 
     Err(EngineError::protocol(
@@ -531,6 +540,55 @@ mod tests {
         s.push('€'); // 3 bytes: 48..51
         let value = BencodeValue::Bytes(s.into_bytes());
         let _ = format!("{value:?}"); // must not panic
+    }
+
+    #[test]
+    fn test_find_info_dict_bytes_basic() {
+        let info = b"d6:lengthi1e4:name4:real12:piece lengthi16384e6:pieces0:e";
+        let mut torrent = b"d8:announce17:http://t.example/".to_vec();
+        torrent.extend_from_slice(b"4:info");
+        torrent.extend_from_slice(info);
+        torrent.extend_from_slice(b"e");
+
+        assert_eq!(find_info_dict_bytes(&torrent).unwrap(), &info[..]);
+
+        // No info key
+        assert!(find_info_dict_bytes(b"d8:announce3:urle").is_err());
+        // Root is not a dict
+        assert!(find_info_dict_bytes(b"l4:infodee").is_err());
+        // info present but not a dict
+        assert!(find_info_dict_bytes(b"d4:infoi1ee").is_err());
+    }
+
+    #[test]
+    fn test_find_info_dict_ignores_decoy_in_string_values() {
+        // "comment" sorts before "info", and its value contains the exact
+        // byte pattern `4:infod...e` a naive search would latch onto.
+        let decoy = b"4:infod4:name4:evile";
+        let info = b"d6:lengthi1e4:name4:reale";
+        let mut torrent = b"d7:comment".to_vec();
+        torrent.extend_from_slice(format!("{}:", decoy.len()).as_bytes());
+        torrent.extend_from_slice(decoy);
+        torrent.extend_from_slice(b"4:info");
+        torrent.extend_from_slice(info);
+        torrent.extend_from_slice(b"e");
+
+        // Sanity: the file parses and the decoy really is a string value
+        let root = BencodeValue::parse_exact(&torrent).unwrap();
+        assert_eq!(
+            root.get("comment").and_then(|v| v.as_bytes()),
+            Some(&decoy[..])
+        );
+
+        assert_eq!(find_info_dict_bytes(&torrent).unwrap(), &info[..]);
+
+        // Same with the decoy in a key that sorts after "info" and a
+        // nested dict carrying its own "info" key: only the top-level
+        // value counts.
+        let mut torrent = b"d4:info".to_vec();
+        torrent.extend_from_slice(info);
+        torrent.extend_from_slice(b"4:nestd4:infod4:name4:evileee");
+        assert_eq!(find_info_dict_bytes(&torrent).unwrap(), &info[..]);
     }
 
     #[test]

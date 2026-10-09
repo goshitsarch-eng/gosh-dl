@@ -64,6 +64,22 @@ The 0.6.1 patch addresses the reproducible failures above. It does not claim
 that every optional feature is production-proven, and it is not a 1.0 API
 stability declaration.
 
+## 0.6.4 application audit
+
+A full audit of the engine (lifecycle, security, protocol input handling,
+recursive mirroring, web seeds, documentation) reproduced each defect with a
+failing test before fixing it; see the 0.6.4 changelog entry and the
+`tests/audit_*.rs` suites. Notable items: path traversal through torrent
+names and magnet `dn` on delete, the default encryption policy being unable
+to reach plaintext-only peers, pause/resume racing the HTTP worker on the
+`.part` file, peer tasks surviving cancel, and the streaming reader stalling
+on real-world piece sizes.
+
+Remaining validation gaps after 0.6.4: web seeds do not honour the HTTP
+proxy/TLS settings; DHT, LPD, PEX, uTP, and MSE are still validated with
+local fixtures rather than public swarms; Windows and macOS are exercised by
+CI only.
+
 ## 0.6.3 queue creation
 
 The CLI review exposed a race when an application starts downloads and then
