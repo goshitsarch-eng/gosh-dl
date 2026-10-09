@@ -192,6 +192,15 @@ pub struct DhKeyPair {
     public: [u8; 96],
 }
 
+/// A peer public value of 0, 1, p-1, or anything outside the group forces a
+/// trivial shared secret; such values are protocol violations.
+fn is_degenerate_dh_public(public: &[u8; 96]) -> bool {
+    let y = BigUint::from_bytes_be(public);
+    let p = BigUint::from_bytes_be(&DH_PRIME);
+    let one = BigUint::from(1u8);
+    y <= one || y >= &p - &one
+}
+
 impl DhKeyPair {
     /// Generate a new random key pair
     pub fn generate() -> Self {
@@ -368,6 +377,12 @@ pub enum MseHandshakeResult {
 // ============================================================================
 
 /// Perform MSE handshake as initiator (outgoing connection)
+///
+/// Any failure before the crypto negotiation completes is reported as
+/// [`MseHandshakeResult::Failed`], never as `Plaintext`: our DH public key
+/// has already been written to `stream`, so a plaintext-only peer has either
+/// closed the socket or consumed those bytes as a (bad) BitTorrent handshake.
+/// The caller falls back by opening a *fresh* plaintext connection.
 pub async fn mse_handshake_outgoing(
     mut stream: TcpStream,
     info_hash: Sha1Hash,
@@ -385,14 +400,20 @@ pub async fn mse_handshake_outgoing(
     send_buf.extend_from_slice(key_pair.public_bytes());
     send_buf.extend_from_slice(&padding);
 
-    if let Err(e) = timeout(HANDSHAKE_TIMEOUT, stream.write_all(&send_buf)).await {
-        return match config.policy {
-            EncryptionPolicy::Required => MseHandshakeResult::Failed(EngineError::network(
+    match timeout(HANDSHAKE_TIMEOUT, stream.write_all(&send_buf)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return MseHandshakeResult::Failed(EngineError::network(
+                NetworkErrorKind::ConnectionReset,
+                format!("Failed to send DH public key: {}", e),
+            ));
+        }
+        Err(_) => {
+            return MseHandshakeResult::Failed(EngineError::network(
                 NetworkErrorKind::Timeout,
-                format!("MSE handshake timeout: {}", e),
-            )),
-            _ => MseHandshakeResult::Plaintext(stream, vec![]),
-        };
+                "MSE handshake timeout sending DH public key",
+            ));
+        }
     }
 
     // Step 2: Receive Yb (96 bytes) + possible padding
@@ -400,23 +421,25 @@ pub async fn mse_handshake_outgoing(
     match timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut yb)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            return match config.policy {
-                EncryptionPolicy::Required => MseHandshakeResult::Failed(EngineError::network(
-                    NetworkErrorKind::ConnectionReset,
-                    format!("Failed to receive Yb: {}", e),
-                )),
-                _ => MseHandshakeResult::Plaintext(stream, vec![]),
-            };
+            return MseHandshakeResult::Failed(EngineError::network(
+                NetworkErrorKind::ConnectionReset,
+                format!("Failed to receive Yb: {}", e),
+            ));
         }
         Err(_) => {
-            return match config.policy {
-                EncryptionPolicy::Required => MseHandshakeResult::Failed(EngineError::network(
-                    NetworkErrorKind::Timeout,
-                    "Timeout receiving Yb",
-                )),
-                _ => MseHandshakeResult::Plaintext(stream, vec![]),
-            };
+            return MseHandshakeResult::Failed(EngineError::network(
+                NetworkErrorKind::Timeout,
+                "Timeout receiving Yb",
+            ));
         }
+    }
+    // A degenerate public value (0, 1, or p-1) would force a trivial shared
+    // secret; treat it as a protocol violation.
+    if is_degenerate_dh_public(&yb) {
+        return MseHandshakeResult::Failed(EngineError::protocol(
+            ProtocolErrorKind::PeerProtocol,
+            "Peer sent a degenerate DH public value",
+        ));
     }
 
     // Step 3: Compute shared secret S
@@ -487,11 +510,20 @@ pub async fn mse_handshake_outgoing(
     send_buf.extend_from_slice(&skey_hash);
     send_buf.extend_from_slice(&encrypted_part);
 
-    if let Err(e) = timeout(HANDSHAKE_TIMEOUT, stream.write_all(&send_buf)).await {
-        return MseHandshakeResult::Failed(EngineError::network(
-            NetworkErrorKind::Timeout,
-            format!("Failed to send crypto handshake: {}", e),
-        ));
+    match timeout(HANDSHAKE_TIMEOUT, stream.write_all(&send_buf)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return MseHandshakeResult::Failed(EngineError::network(
+                NetworkErrorKind::ConnectionReset,
+                format!("Failed to send crypto handshake: {}", e),
+            ));
+        }
+        Err(_) => {
+            return MseHandshakeResult::Failed(EngineError::network(
+                NetworkErrorKind::Timeout,
+                "Timeout sending crypto handshake",
+            ));
+        }
     }
 
     // Step 5: Receive response

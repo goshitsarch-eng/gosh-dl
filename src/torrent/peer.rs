@@ -34,6 +34,17 @@ const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum message size (16KB block + overhead)
 const MAX_MESSAGE_SIZE: usize = 32 * 1024;
 
+/// Largest wire message a connection accepts for a torrent with
+/// `num_pieces` pieces.
+///
+/// A bitfield (BEP 3) carries `ceil(num_pieces / 8)` bytes plus the message
+/// id, so for more than 262,144 pieces it legitimately exceeds
+/// [`MAX_MESSAGE_SIZE`]; the limit grows with the torrent (plus a few bytes
+/// of slack) while staying at the fixed cap for everything smaller.
+fn max_message_size(num_pieces: usize) -> usize {
+    MAX_MESSAGE_SIZE.max(num_pieces.div_ceil(8).saturating_add(5))
+}
+
 /// Default block size (16KB)
 pub const BLOCK_SIZE: u32 = 16384;
 
@@ -862,8 +873,9 @@ impl PeerConnection {
             return Ok(PeerMessage::KeepAlive);
         }
 
-        // Check for unreasonably large messages
-        if len > MAX_MESSAGE_SIZE {
+        // Check for unreasonably large messages (the bound scales with the
+        // torrent's bitfield size)
+        if len > max_message_size(self.num_pieces) {
             return Err(EngineError::protocol(
                 ProtocolErrorKind::PeerProtocol,
                 format!("Message too large: {} bytes", len),
@@ -1285,6 +1297,32 @@ mod tests {
         let encoded = msg.encode();
         let decoded = PeerMessage::decode(&encoded[4..]).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_max_message_size_scales_with_piece_count() {
+        // Small and typical torrents keep the fixed cap
+        assert_eq!(max_message_size(0), MAX_MESSAGE_SIZE);
+        assert_eq!(max_message_size(1000), MAX_MESSAGE_SIZE);
+        assert_eq!(max_message_size(200_000), MAX_MESSAGE_SIZE);
+        // A 262,144-piece bitfield is exactly 32 KiB + the id byte
+        assert!(max_message_size(262_144) > 262_144 / 8);
+
+        // 300,000 pieces: the bitfield message is 1 + ceil(300000/8) bytes,
+        // which the old fixed 32 KiB cap rejected.
+        let num_pieces = 300_000usize;
+        let bitfield = PeerMessage::Bitfield {
+            bitfield: vec![0xff; num_pieces.div_ceil(8)],
+        };
+        let wire = bitfield.encode();
+        let len = u32::from_be_bytes([wire[0], wire[1], wire[2], wire[3]]) as usize;
+        assert_eq!(len, num_pieces.div_ceil(8) + 1);
+        assert!(len > MAX_MESSAGE_SIZE, "test premise: exceeds fixed cap");
+        assert!(len <= max_message_size(num_pieces));
+        assert_eq!(PeerMessage::decode(&wire[4..]).unwrap(), bitfield);
+
+        // The limit stays tight: not a blank cheque for huge messages
+        assert!(max_message_size(num_pieces) < 2 * len);
     }
 
     #[test]

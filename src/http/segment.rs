@@ -8,7 +8,7 @@ use super::connection::RetryPolicy;
 use super::resume::{
     should_restart_without_ranges, validate_ranged_response, RangedResponseContext,
 };
-use super::ACCEPT_ENCODING_IDENTITY;
+use super::{cancellable, ACCEPT_ENCODING_IDENTITY};
 use crate::error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result, StorageErrorKind};
 use crate::storage::Segment;
 use crate::types::DownloadProgress;
@@ -312,11 +312,11 @@ impl SegmentedDownload {
             let redirect_scope = redirect_scope.clone();
 
             let handle = tokio::spawn(async move {
-                // Acquire permit
-                let _permit = semaphore
-                    .acquire()
-                    .await
-                    .map_err(|_| EngineError::Shutdown)?;
+                // Acquire permit (bail out promptly if cancelled while queued)
+                let _permit = match cancellable(&cancel_token, semaphore.acquire()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) | Err(_) => return Ok(()),
+                };
 
                 // Check cancellation
                 if cancel_token.is_cancelled() {
@@ -388,9 +388,10 @@ impl SegmentedDownload {
                     request = request.header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY);
 
                     // Send request
-                    let response = match request.send().await {
-                        Ok(r) => r,
-                        Err(e) => {
+                    let response = match cancellable(&cancel_token, request.send()).await {
+                        Err(_) => break 'retry Ok(()),
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => {
                             if let Some(m) = mirrors.as_ref() {
                                 m.report_url_failure(&request_url);
                             }
@@ -405,7 +406,12 @@ impl SegmentedDownload {
                                     err
                                 );
                                 let delay = retry_policy.delay_for_attempt(attempt - 1);
-                                tokio::time::sleep(delay).await;
+                                if cancellable(&cancel_token, tokio::time::sleep(delay))
+                                    .await
+                                    .is_err()
+                                {
+                                    break 'retry Ok(());
+                                }
                                 continue 'retry;
                             }
                             if !err.is_retryable() {
@@ -452,7 +458,12 @@ impl SegmentedDownload {
                                 status
                             );
                             let delay = retry_policy.delay_for_attempt(attempt - 1);
-                            tokio::time::sleep(delay).await;
+                            if cancellable(&cancel_token, tokio::time::sleep(delay))
+                                .await
+                                .is_err()
+                            {
+                                break 'retry Ok(());
+                            }
                             continue 'retry;
                         }
                         break 'retry Err(err);
@@ -628,9 +639,15 @@ impl SegmentedDownload {
                         bytes_since_progress.fetch_add(chunk_len, Ordering::Relaxed);
 
                         // Rate limiting: draw this chunk from every configured
-                        // budget (global engine limit, then per-download).
-                        for limiter in limiters.iter() {
-                            limiter.acquire(chunk_len).await;
+                        // budget (global engine limit, then per-download). The
+                        // wait must not outlive a pause/cancel.
+                        let limited = async {
+                            for limiter in limiters.iter() {
+                                limiter.acquire(chunk_len).await;
+                            }
+                        };
+                        if cancellable(&cancel_token, limited).await.is_err() {
+                            break 'retry Ok(());
                         }
 
                         // Emit progress at intervals. Speed is computed here
@@ -677,7 +694,12 @@ impl SegmentedDownload {
 
                     if stream_failed {
                         let delay = retry_policy.delay_for_attempt(attempt - 1);
-                        tokio::time::sleep(delay).await;
+                        if cancellable(&cancel_token, tokio::time::sleep(delay))
+                            .await
+                            .is_err()
+                        {
+                            break 'retry Ok(());
+                        }
                         continue 'retry;
                     }
 
@@ -1053,7 +1075,7 @@ pub(crate) async fn probe_request(request: reqwest::RequestBuilder) -> Result<Se
     let suggested_filename = headers
         .get("content-disposition")
         .and_then(|v| v.to_str().ok())
-        .and_then(parse_content_disposition);
+        .and_then(super::parse_content_disposition);
 
     Ok(ServerCapabilities {
         content_length,
@@ -1062,34 +1084,6 @@ pub(crate) async fn probe_request(request: reqwest::RequestBuilder) -> Result<Se
         last_modified,
         suggested_filename,
     })
-}
-
-/// Parse filename from Content-Disposition header
-fn parse_content_disposition(header: &str) -> Option<String> {
-    // Look for filename="..." or filename*=UTF-8''...
-    if let Some(start) = header.find("filename=") {
-        let rest = &header[start + 9..];
-        if let Some(stripped) = rest.strip_prefix('"') {
-            let end = stripped.find('"')?;
-            return Some(stripped[..end].to_string());
-        } else {
-            let end = rest.find(';').unwrap_or(rest.len());
-            return Some(rest[..end].trim().to_string());
-        }
-    }
-
-    if let Some(start) = header.find("filename*=") {
-        let rest = &header[start + 10..];
-        if let Some(quote_start) = rest.find("''") {
-            let encoded = &rest[quote_start + 2..];
-            let end = encoded.find(';').unwrap_or(encoded.len());
-            if let Ok(decoded) = urlencoding::decode(&encoded[..end]) {
-                return Some(decoded.to_string());
-            }
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -1151,6 +1145,7 @@ mod tests {
 
     #[test]
     fn test_parse_content_disposition() {
+        use super::super::parse_content_disposition;
         assert_eq!(
             parse_content_disposition("attachment; filename=\"test.zip\""),
             Some("test.zip".to_string())

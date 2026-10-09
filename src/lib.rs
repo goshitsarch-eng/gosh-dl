@@ -51,6 +51,7 @@
 pub mod config;
 pub mod engine;
 pub mod error;
+pub(crate) mod fsutil;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod limiter;

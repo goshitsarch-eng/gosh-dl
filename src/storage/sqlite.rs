@@ -760,26 +760,44 @@ impl Storage for SqliteStorage {
                 Ok((id_str, root_url, child_ids_json, created_at_str))
             })?;
 
+            // One corrupt row must not prevent the engine from starting: skip
+            // it with a warning, like unreadable runtime metadata elsewhere.
             let mut jobs = Vec::new();
             for row in rows {
                 let (id_str, root_url, child_ids_json, created_at_str) = row?;
-                let id = uuid::Uuid::parse_str(&id_str).map_err(|e| {
-                    EngineError::Database(format!("Invalid recursive job id '{}': {}", id_str, e))
-                })?;
-                let child_ids = serde_json::from_str(&child_ids_json).map_err(|e| {
-                    EngineError::Database(format!(
-                        "Failed to deserialize recursive child ids for {}: {}",
-                        id, e
-                    ))
-                })?;
-                let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| {
-                        EngineError::Database(format!(
-                            "Invalid recursive job timestamp for {}: {}",
-                            id, e
-                        ))
-                    })?;
+                let id = match uuid::Uuid::parse_str(&id_str) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping recursive job with invalid id '{}': {}",
+                            id_str,
+                            e
+                        );
+                        continue;
+                    }
+                };
+                let child_ids = match serde_json::from_str(&child_ids_json) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping recursive job {} with unreadable child ids: {}",
+                            id,
+                            e
+                        );
+                        continue;
+                    }
+                };
+                let created_at = match DateTime::parse_from_rfc3339(&created_at_str) {
+                    Ok(dt) => dt.with_timezone(&Utc),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping recursive job {} with invalid timestamp: {}",
+                            id,
+                            e
+                        );
+                        continue;
+                    }
+                };
                 jobs.push(TrackedRecursiveJob {
                     id,
                     root_url,
@@ -1370,6 +1388,32 @@ mod tests {
             .await
             .unwrap()
             .contains_key(&id));
+    }
+
+    #[cfg(feature = "recursive-http")]
+    #[tokio::test]
+    async fn test_corrupt_recursive_job_row_is_skipped() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let good = TrackedRecursiveJob {
+            id: uuid::Uuid::new_v4(),
+            root_url: "https://example.com/pub/".to_string(),
+            child_ids: vec![DownloadId::new()],
+            created_at: Utc::now(),
+        };
+        storage.save_recursive_job(&good).await.unwrap();
+        {
+            let conn = storage.conn.lock().await;
+            conn.execute(
+                "INSERT INTO recursive_jobs (id, root_url, child_ids_json, created_at) VALUES ('not-a-uuid', 'x', '[]', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let jobs = storage
+            .load_recursive_jobs()
+            .await
+            .expect("one corrupt row must not fail the whole load");
+        assert_eq!(jobs, vec![good]);
     }
 
     #[cfg(feature = "recursive-http")]

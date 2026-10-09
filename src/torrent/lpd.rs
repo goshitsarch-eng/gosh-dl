@@ -303,15 +303,17 @@ fn parse_announce(data: &[u8], source: SocketAddr, our_port: u16) -> Option<Loca
     let peer_port = port?;
     let hash_str = info_hash_hex?;
 
-    // Validate and parse hex info_hash
+    // Validate and parse hex info_hash. `len()` is a byte length, so a
+    // multi-byte UTF-8 character can hit exactly 40 bytes; decoding on the
+    // raw bytes (rather than slicing the &str at fixed offsets) rejects it
+    // instead of panicking on a char boundary.
     if hash_str.len() != 40 {
         return None;
     }
 
+    let decoded = hex::decode(hash_str).ok()?;
     let mut info_hash = [0u8; 20];
-    for i in 0..20 {
-        info_hash[i] = u8::from_str_radix(&hash_str[i * 2..i * 2 + 2], 16).ok()?;
-    }
+    info_hash.copy_from_slice(decoded.get(..20)?);
 
     // Build peer address using source IP + announced port
     let peer_addr = match source {
@@ -462,6 +464,28 @@ mod tests {
                        Port: 6882\r\n\
                        Infohash: 0123456789\r\n\
                        \r\n";
+        assert!(parse_announce(message.as_bytes(), source, 6881).is_none());
+    }
+
+    #[test]
+    fn test_parse_announce_non_ascii_infohash_does_not_panic() {
+        // 3-byte "€" + 37 ASCII chars = exactly 40 *bytes*; slicing the
+        // &str at byte 2 used to panic inside the multi-byte character and
+        // kill the LPD listener task.
+        let bad_hash = format!("\u{20AC}{}", "a".repeat(37));
+        assert_eq!(bad_hash.len(), 40);
+        let message = format!(
+            "BT-SEARCH * HTTP/1.1\r\nPort: 6882\r\nInfohash: {}\r\n\r\n",
+            bad_hash
+        );
+        let source = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345));
+        assert!(parse_announce(message.as_bytes(), source, 6881).is_none());
+
+        // Non-hex ASCII of the right length is also rejected
+        let message = format!(
+            "BT-SEARCH * HTTP/1.1\r\nPort: 6882\r\nInfohash: {}\r\n\r\n",
+            "g".repeat(40)
+        );
         assert!(parse_announce(message.as_bytes(), source, 6881).is_none());
     }
 

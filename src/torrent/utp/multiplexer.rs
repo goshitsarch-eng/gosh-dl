@@ -113,6 +113,11 @@ impl UtpMux {
         self.local_addr
     }
 
+    /// Number of registered (accepted or connected) connections.
+    pub(crate) fn connection_count(&self) -> usize {
+        self.connections.read().len()
+    }
+
     /// Start background receive and send tasks
     fn start_tasks(&mut self, mut send_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>) {
         // Receive task
@@ -371,6 +376,7 @@ impl Drop for UtpMux {
 
 #[cfg(test)]
 mod tests {
+    use super::super::state::ConnectionState;
     use super::*;
 
     #[tokio::test]
@@ -459,6 +465,60 @@ mod tests {
 
         sock.shutdown().await.ok();
         server.await.unwrap();
+    }
+
+    /// Wait until `mux` holds `expected` connections, or panic after 2s.
+    async fn wait_for_connection_count(mux: &UtpMux, expected: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while mux.connection_count() != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mux still holds {} connections, expected {}",
+                mux.connection_count(),
+                expected
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Dropping a socket while it is still connected must deregister it
+    /// from the multiplexer; the driver task is aborted on drop, so the
+    /// cleanup cannot rely on the driver loop finishing.
+    #[tokio::test]
+    async fn test_dropped_socket_deregisters_from_mux() {
+        let mux_a = Arc::new(UtpMux::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+        let mux_b = Arc::new(UtpMux::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+        let addr_b = mux_b.local_addr();
+
+        let server = {
+            let mux_b = Arc::clone(&mux_b);
+            tokio::spawn(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(10), mux_b.accept())
+                    .await
+                    .expect("accept timed out")
+                    .expect("accept failed")
+            })
+        };
+
+        let client =
+            tokio::time::timeout(std::time::Duration::from_secs(10), mux_a.connect(addr_b))
+                .await
+                .expect("connect timed out")
+                .expect("connect failed");
+        let server_sock = server.await.unwrap();
+
+        assert_eq!(mux_a.connection_count(), 1);
+        assert_eq!(mux_b.connection_count(), 1);
+        assert_eq!(client.state().await, ConnectionState::Connected);
+
+        // Drop the client while connected (no FIN, no reset): its entry
+        // must still disappear from mux_a.
+        drop(client);
+        wait_for_connection_count(&mux_a, 0).await;
+
+        // Same for the accepted side.
+        drop(server_sock);
+        wait_for_connection_count(&mux_b, 0).await;
     }
 
     /// Transfer through a lossy UDP proxy: retransmissions must recover.

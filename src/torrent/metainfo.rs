@@ -70,6 +70,20 @@ pub struct FileInfo {
     pub md5sum: Option<String>,
 }
 
+/// Reject torrent names and file paths that would escape the save directory.
+///
+/// The piece manager re-checks components before every write, but the
+/// engine also uses these names for lifecycle paths (delete on cancel), so
+/// untrusted metainfo must never carry `..`, absolute, or empty paths.
+fn validate_torrent_path(path: &std::path::Path, what: &str) -> Result<()> {
+    crate::fsutil::check_relative_path(path).map_err(|rejection| {
+        EngineError::protocol(
+            ProtocolErrorKind::InvalidTorrent,
+            format!("Invalid torrent: {}", rejection.describe(what)),
+        )
+    })
+}
+
 impl Metainfo {
     /// Parse a .torrent file from bytes
     pub fn parse(data: &[u8]) -> Result<Self> {
@@ -157,7 +171,8 @@ impl Metainfo {
             )
         })?;
 
-        // Name (required)
+        // Name (required). It becomes the output file or directory name, so
+        // it must stay inside the save directory.
         let name = dict
             .get(b"name".as_slice())
             .and_then(|v| v.as_string())
@@ -165,6 +180,7 @@ impl Metainfo {
                 EngineError::protocol(ProtocolErrorKind::InvalidTorrent, "Missing 'name' in info")
             })?
             .to_string();
+        validate_torrent_path(std::path::Path::new(&name), "'name'")?;
 
         // Piece length (required)
         let piece_length = dict
@@ -189,6 +205,19 @@ impl Metainfo {
         // BitTorrent typically uses 256 KiB to 16 MiB piece sizes
         const MIN_PIECE_LENGTH: u64 = 16 * 1024; // 16 KiB
         const MAX_PIECE_LENGTH: u64 = 64 * 1024 * 1024; // 64 MiB
+                                                        // Hard ceiling: a piece is buffered and hashed in memory, so an
+                                                        // attacker-supplied piece length of (say) 2^62 would abort the
+                                                        // process on the first allocation instead of being a bad torrent.
+        const MAX_PIECE_LENGTH_HARD: u64 = 256 * 1024 * 1024; // 256 MiB
+        if piece_length > MAX_PIECE_LENGTH_HARD {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::InvalidTorrent,
+                format!(
+                    "Invalid 'piece length': {} exceeds the {} byte maximum",
+                    piece_length, MAX_PIECE_LENGTH_HARD
+                ),
+            ));
+        }
         if !(MIN_PIECE_LENGTH..=MAX_PIECE_LENGTH).contains(&piece_length) {
             tracing::warn!(
                 "Unusual piece length {} (typical range: {} - {})",
@@ -343,6 +372,7 @@ impl Metainfo {
                 })?;
                 path.push(component_str);
             }
+            validate_torrent_path(&path, "file path")?;
 
             let md5sum = file_dict
                 .get(b"md5sum".as_slice())
@@ -356,7 +386,12 @@ impl Metainfo {
                 md5sum,
             });
 
-            offset += length;
+            offset = offset.checked_add(length).ok_or_else(|| {
+                EngineError::protocol(
+                    ProtocolErrorKind::InvalidTorrent,
+                    "Invalid torrent: total file size overflows",
+                )
+            })?;
         }
 
         Ok((files, offset))
@@ -606,6 +641,18 @@ mod tests {
 
         // Non-existent piece
         assert!(metainfo.piece_range(1).is_none());
+    }
+
+    #[test]
+    fn rejects_absurd_piece_length_and_overflowing_sizes() {
+        // One 2^62-byte piece: passes the piece-count check, would abort on
+        // the first allocation.
+        let huge = b"d4:infod6:lengthi4611686018427387904e4:name1:a12:piece lengthi4611686018427387904e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        assert!(Metainfo::parse(huge).is_err());
+
+        // File offsets must not wrap.
+        let overflow = b"d4:infod5:filesld6:lengthi9223372036854775807e4:pathl1:aeed6:lengthi9223372036854775807e4:pathl1:beed6:lengthi9223372036854775807e4:pathl1:ceee4:name1:d12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        assert!(Metainfo::parse(overflow).is_err());
     }
 
     #[test]

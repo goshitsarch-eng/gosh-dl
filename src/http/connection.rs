@@ -235,8 +235,10 @@ impl RetryPolicy {
 
     /// Calculate delay for a given attempt (0-indexed)
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        // Exponential backoff
-        let base = self.initial_delay_ms * 2u64.pow(attempt.min(10));
+        // Exponential backoff (saturating: user-supplied delays can be huge)
+        let base = self
+            .initial_delay_ms
+            .saturating_mul(2u64.pow(attempt.min(10)));
         let capped = base.min(self.max_delay_ms);
 
         // Add jitter: ±jitter_factor randomness
@@ -256,7 +258,11 @@ impl RetryPolicy {
     }
 }
 
-/// Execute a request with retry logic
+/// Execute a request with retry logic.
+///
+/// `max_attempts` counts *retries*, matching the download paths: the
+/// operation always runs once, then up to `max_attempts` more times for
+/// retryable errors (so `max_retries: 0` means "try exactly once").
 pub async fn with_retry<F, T, Fut>(
     pool: &ConnectionPool,
     policy: &RetryPolicy,
@@ -268,7 +274,7 @@ where
 {
     let mut last_error = None;
 
-    for attempt in 0..policy.max_attempts {
+    for attempt in 0..=policy.max_attempts {
         let start = Instant::now();
 
         match operation().await {
@@ -403,6 +409,35 @@ mod tests {
         assert!(speed > 0);
 
         assert_eq!(calc.total(), 3000);
+    }
+
+    #[tokio::test]
+    async fn with_retry_always_attempts_once() {
+        // Original failure: `max_retries: 0` produced "Max retries exceeded"
+        // without ever running the operation.
+        let pool = ConnectionPool::new(&HttpConfig::default()).unwrap();
+        let policy = RetryPolicy::new(0, 1, 1);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = with_retry(&pool, &policy, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, EngineError>(42)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A retryable failure is retried exactly `max_attempts` times.
+        let policy = RetryPolicy::new(2, 1, 1);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let err = with_retry(&pool, &policy, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(EngineError::network(NetworkErrorKind::Timeout, "slow"))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.is_retryable());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
