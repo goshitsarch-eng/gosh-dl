@@ -602,7 +602,9 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.3...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.4...HEAD
+[0.6.4]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.3...v0.6.4
+[0.6.3]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/goshitsarch-eng/gosh-dl/compare/d475e65feedf1fd5da88bb9e29d99bc8696467a0...v0.6.1
 [0.6.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.5.0...d475e65feedf1fd5da88bb9e29d99bc8696467a0
