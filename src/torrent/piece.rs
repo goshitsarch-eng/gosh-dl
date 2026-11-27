@@ -51,6 +51,12 @@ pub struct PieceManager {
     /// When set, piece selection prioritizes pieces at/after this position so
     /// the reader is never starved.
     stream_position: std::sync::atomic::AtomicU32,
+
+    /// First unrecoverable disk-write failure (disk full, permission denied,
+    /// ...). Peers and web seeds keep delivering data that cannot be stored,
+    /// so the downloader polls this and fails the torrent instead of
+    /// re-downloading the same pieces forever.
+    storage_error: parking_lot::Mutex<Option<String>>,
 }
 
 /// A piece being downloaded
@@ -229,7 +235,35 @@ impl PieceManager {
             wanted_pieces: RwLock::new(None),
             sequential_mode: RwLock::new(false),
             stream_position: std::sync::atomic::AtomicU32::new(u32::MAX),
+            storage_error: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// The first disk-write failure seen since the last call, if any.
+    ///
+    /// Taking the error clears it, so a download that is resumed after the
+    /// user freed up space starts with a clean slate.
+    pub fn take_storage_error(&self) -> Option<String> {
+        self.storage_error.lock().take()
+    }
+
+    fn record_storage_error(&self, index: u32, error: &EngineError) {
+        let mut slot = self.storage_error.lock();
+        if slot.is_none() {
+            *slot = Some(format!("Failed to write piece {}: {}", index, error));
+        }
+    }
+
+    /// Mark a piece as held, returning whether this call was the one that
+    /// flipped the bit. Peers (endgame duplicates) and web seeds can finish
+    /// the same piece concurrently; only the first may bump the counters.
+    fn mark_have(&self, index: u32) -> bool {
+        let mut have = self.have.write();
+        let Some(was_set) = have.get(index as usize).map(|b| *b) else {
+            return false;
+        };
+        have.set(index as usize, true);
+        !was_set
     }
 
     /// Enable or disable sequential download mode
@@ -509,11 +543,14 @@ impl PieceManager {
 
         for (i, has_piece) in peer_pieces.iter().enumerate() {
             if *has_piece {
-                if add {
-                    availability[i] = availability[i].saturating_add(1);
+                let Some(slot) = availability.get_mut(i) else {
+                    break;
+                };
+                *slot = if add {
+                    slot.saturating_add(1)
                 } else {
-                    availability[i] = availability[i].saturating_sub(1);
-                }
+                    slot.saturating_sub(1)
+                };
             }
         }
     }
@@ -667,19 +704,21 @@ impl PieceManager {
             return Ok(false);
         }
 
-        // Write to disk
-        self.write_piece(index, &data).await?;
-
-        // Update state
-        {
-            let mut have = self.have.write();
-            have.set(index as usize, true);
+        // Write to disk. On failure the piece must leave `pending`: it is
+        // fully received, so stale-piece cleanup would never touch it and
+        // piece selection would skip it forever, wedging the torrent.
+        if let Err(e) = self.write_piece(index, &data).await {
+            self.pending.write().remove(&index);
+            self.record_storage_error(index, &e);
+            return Err(e);
         }
 
-        // Only increment counters if we successfully removed the piece.
-        // This prevents double-counting in endgame mode when multiple peers
-        // send the same piece and both threads race through verify_and_save.
-        if self.pending.write().remove(&index).is_some() {
+        // Only the caller that flips the have-bit bumps the counters. This
+        // prevents double-counting when several peers (endgame) or a peer
+        // and a web seed finish the same piece at the same time.
+        let newly_have = self.mark_have(index);
+        self.pending.write().remove(&index);
+        if newly_have {
             self.verified_count.fetch_add(1, Ordering::Relaxed);
             self.verified_bytes
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -751,7 +790,22 @@ impl PieceManager {
 
             // Write data
             let write_end = data_offset + length as usize;
-            file.write_all(&data[data_offset..write_end]).await?;
+            let chunk = data.get(data_offset..write_end).ok_or_else(|| {
+                EngineError::protocol(
+                    ProtocolErrorKind::InvalidTorrent,
+                    format!(
+                        "Piece {} data ({} bytes) does not cover its file ranges",
+                        index,
+                        data.len()
+                    ),
+                )
+            })?;
+            file.write_all(chunk).await?;
+            // tokio's `File` hands the write to a blocking thread and reports
+            // its outcome on the *next* operation. Without this flush a
+            // failed write (disk full, I/O error) is dropped with the handle
+            // and the piece would be recorded as stored.
+            file.flush().await?;
 
             data_offset = write_end;
         }
@@ -826,6 +880,24 @@ impl PieceManager {
         if let Some(p) = pending.get_mut(&piece) {
             p.mark_requested(block_index, peer_id);
         }
+    }
+
+    /// Forget that a block was requested, so another peer can pick it up.
+    ///
+    /// Called when the peer the block was requested from chokes us or
+    /// disconnects; without it the block stays reserved until the whole
+    /// piece times out and is thrown away, received blocks included.
+    pub fn release_block_request(&self, piece: u32, block_index: u32) {
+        let mut pending = self.pending.write();
+        if let Some(p) = pending.get_mut(&piece) {
+            p.requested_blocks.remove(&block_index);
+        }
+    }
+
+    /// Number of pieces verified so far (cheap change detector for callers
+    /// that announce newly completed pieces).
+    pub fn verified_piece_count(&self) -> u64 {
+        self.verified_count.load(Ordering::Relaxed)
     }
 
     /// Get progress information
@@ -1102,17 +1174,20 @@ impl PieceManager {
         }
 
         // Write to disk
-        self.write_piece(index, data).await?;
-
-        // Update state
-        {
-            let mut have = self.have.write();
-            have.set(index as usize, true);
+        if let Err(e) = self.write_piece(index, data).await {
+            self.record_storage_error(index, &e);
+            return Err(e);
         }
 
-        self.verified_count.fetch_add(1, Ordering::Relaxed);
-        self.verified_bytes
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        // A peer may have completed the same piece while this one was being
+        // written; count it once.
+        if self.mark_have(index) {
+            self.verified_count.fetch_add(1, Ordering::Relaxed);
+            self.verified_bytes
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+        // Drop any half-downloaded copy peers were working on.
+        self.pending.write().remove(&index);
 
         tracing::debug!("Webseed piece {} written ({} bytes)", index, data.len());
 
@@ -1133,8 +1208,15 @@ impl PieceManager {
         // changes between this call and the subsequent endgame_requests() call.
         let _pending = self.pending.read();
 
+        // Only pieces the user asked for count: with file selection active,
+        // unwanted pieces must neither trigger endgame nor be started by it.
+        let wanted = self.wanted_pieces.read();
         let remaining: Vec<u32> = (0..self.num_pieces() as u32)
             .filter(|&i| !have[i as usize])
+            .filter(|&i| match &*wanted {
+                None => true,
+                Some(bits) => bits.get(i as usize).map(|b| *b).unwrap_or(false),
+            })
             .collect();
 
         // ENDGAME THRESHOLD: 10 pieces
@@ -1559,5 +1641,151 @@ mod tests {
                 path_str
             );
         }
+    }
+
+    /// Single-file metainfo whose piece hashes match `pieces`.
+    fn single_file_metainfo(name: &str, piece_length: u64, pieces: &[Vec<u8>]) -> Metainfo {
+        let total_size: u64 = pieces.iter().map(|p| p.len() as u64).sum();
+        let hashes = pieces
+            .iter()
+            .map(|p| {
+                let mut hasher = Sha1::new();
+                hasher.update(p);
+                hasher.finalize().into()
+            })
+            .collect();
+        Metainfo {
+            info_hash: [0u8; 20],
+            info: Info {
+                name: name.to_string(),
+                piece_length,
+                pieces: hashes,
+                files: vec![FileInfo {
+                    path: PathBuf::from(name),
+                    length: total_size,
+                    offset: 0,
+                    md5sum: None,
+                }],
+                total_size,
+                is_single_file: true,
+                private: false,
+            },
+            announce: None,
+            announce_list: Vec::new(),
+            creation_date: None,
+            comment: None,
+            created_by: None,
+            encoding: None,
+            url_list: Vec::new(),
+            httpseeds: Vec::new(),
+        }
+    }
+
+    /// Deliver one whole (single-block) piece to the manager.
+    fn receive_piece(pm: &PieceManager, index: u32, data: &[u8]) {
+        pm.start_piece(index).expect("piece exists");
+        assert!(pm
+            .add_block(index, 0, data.to_vec())
+            .expect("block accepted"));
+    }
+
+    /// Original failure: `write_piece` called `write_all` and dropped the
+    /// file. tokio performs the write on a blocking thread and reports its
+    /// result on the *next* operation, so a failed write (here: `ENOSPC`
+    /// from `/dev/full`) was never seen: the piece was recorded as stored
+    /// and the torrent "completed" with a hole in it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_piece_write_is_reported_not_recorded_as_stored() {
+        let piece = pattern_a(BLOCK_SIZE as usize);
+        // A single-file torrent named `full` saved into `/dev` writes to
+        // `/dev/full`, where every write fails with "No space left".
+        let metainfo =
+            single_file_metainfo("full", BLOCK_SIZE as u64, std::slice::from_ref(&piece));
+        let pm = PieceManager::new(Arc::new(metainfo), PathBuf::from("/dev"));
+
+        receive_piece(&pm, 0, &piece);
+        let result = pm.verify_and_save(0).await;
+
+        assert!(result.is_err(), "ENOSPC must surface, got {result:?}");
+        assert!(!pm.have_piece(0), "an unwritten piece is not held");
+        assert_eq!(pm.progress().verified_bytes, 0);
+        assert!(
+            pm.take_storage_error().is_some(),
+            "the failure is recorded for the downloader to act on"
+        );
+        assert!(pm.take_storage_error().is_none(), "and is reported once");
+    }
+
+    /// Original failure: after a failed write the fully received piece stayed
+    /// in `pending`. Stale-piece cleanup skips complete pieces and piece
+    /// selection skips pending ones, so the piece could never be fetched
+    /// again and the torrent could never finish.
+    #[tokio::test]
+    async fn piece_that_failed_to_write_can_be_downloaded_again() {
+        let piece = pattern_a(BLOCK_SIZE as usize);
+        let dir = tempfile::tempdir().unwrap();
+        // A directory occupies the output file's path: opening it for
+        // writing fails.
+        std::fs::create_dir(dir.path().join("out.bin")).unwrap();
+        let metainfo =
+            single_file_metainfo("out.bin", BLOCK_SIZE as u64, std::slice::from_ref(&piece));
+        let pm = PieceManager::new(Arc::new(metainfo), dir.path().to_path_buf());
+
+        receive_piece(&pm, 0, &piece);
+        assert!(pm.verify_and_save(0).await.is_err());
+        assert!(
+            pm.pending_pieces().is_empty(),
+            "the piece must leave the pending set"
+        );
+        let peer_has = bitvec![u8, Msb0; 1; 1];
+        assert_eq!(pm.select_piece(&peer_has), Some(0), "and be selectable");
+
+        // Once the obstacle is gone the same piece goes through.
+        std::fs::remove_dir(dir.path().join("out.bin")).unwrap();
+        pm.take_storage_error();
+        receive_piece(&pm, 0, &piece);
+        assert!(pm.verify_and_save(0).await.unwrap());
+        assert!(pm.have_piece(0));
+        assert_eq!(std::fs::read(dir.path().join("out.bin")).unwrap(), piece);
+    }
+
+    /// Original failure: endgame mode looked at every missing piece, wanted
+    /// or not. With file selection active, a torrent with at most ten
+    /// pieces missing overall entered endgame and started downloading the
+    /// pieces of files the user had deselected - and kept requesting them
+    /// after the selected files were complete.
+    #[test]
+    fn endgame_ignores_pieces_of_deselected_files() {
+        // Four one-piece files; only the first is selected.
+        let metainfo = multi_file_metainfo(PIECE_LEN, &[PIECE_LEN; 4]);
+        let pm = PieceManager::new(Arc::new(metainfo), PathBuf::from("."));
+        pm.set_selected_files(Some(&[0]));
+
+        assert_eq!(pm.endgame_pieces(), vec![0], "only the wanted piece");
+
+        // With nothing selected explicitly, all four are fair game.
+        pm.set_selected_files(None);
+        assert_eq!(pm.endgame_pieces(), vec![0, 1, 2, 3]);
+    }
+
+    /// A block reservation handed back (peer choked us or disconnected) is
+    /// immediately requestable again instead of staying reserved until the
+    /// whole piece times out.
+    #[test]
+    fn released_block_request_is_offered_again() {
+        let metainfo = multi_file_metainfo(PIECE_LEN * 2, &[PIECE_LEN * 2]);
+        let pm = PieceManager::new(Arc::new(metainfo), PathBuf::from("."));
+        pm.start_piece(0).unwrap();
+        assert_eq!(pm.get_block_requests(0).len(), 2);
+
+        pm.mark_block_requested(0, 0, 1);
+        pm.mark_block_requested(0, 1, 1);
+        assert!(pm.get_block_requests(0).is_empty());
+
+        pm.release_block_request(0, 1);
+        let again = pm.get_block_requests(0);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].offset, BLOCK_SIZE);
     }
 }

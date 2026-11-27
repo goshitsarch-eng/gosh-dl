@@ -345,12 +345,7 @@ impl TrackerClient {
             ));
         }
 
-        let body = response.bytes().await.map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::Other,
-                format!("Failed to read tracker response: {}", e),
-            )
-        })?;
+        let body = read_tracker_body(response).await?;
 
         // Parse bencoded response
         self.parse_http_response(&body)
@@ -583,37 +578,7 @@ impl TrackerClient {
         // Remove any path component
         let host_port = url.split('/').next().unwrap_or(url);
 
-        // Resolve address (async DNS lookup)
-        let addr = tokio::net::lookup_host(host_port)
-            .await
-            .map_err(|e| {
-                EngineError::network(
-                    NetworkErrorKind::DnsResolution,
-                    format!("Failed to resolve tracker: {}", e),
-                )
-            })?
-            .next()
-            .ok_or_else(|| {
-                EngineError::network(
-                    NetworkErrorKind::DnsResolution,
-                    "No addresses found for tracker",
-                )
-            })?;
-
-        // Create UDP socket
-        let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::Other,
-                format!("Failed to create UDP socket: {}", e),
-            )
-        })?;
-
-        socket.connect(addr).await.map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::ConnectionRefused,
-                format!("Failed to connect to tracker: {}", e),
-            )
-        })?;
+        let socket = self.udp_tracker_socket(host_port).await?;
 
         // Connect + announce with a bounded BEP 15 retry schedule: each entry
         // in UDP_RETRY_TIMEOUTS is one attempt, and only timeouts are retried
@@ -673,6 +638,66 @@ impl TrackerClient {
     /// UDP connect request
     ///
     /// `request_timeout` bounds the full connect round-trip.
+    /// Resolve a UDP tracker's `host:port` and return a socket connected
+    /// to it.
+    ///
+    /// The lookup is bounded (the system resolver can otherwise hang far
+    /// longer than any tracker timeout), and the socket is bound in the
+    /// address family of the resolved address: resolvers on dual-stack
+    /// hosts commonly list IPv6 first, and an IPv4-bound socket cannot
+    /// connect to an IPv6 address at all. IPv4 is preferred when both are
+    /// offered, since the compact peer list in a BEP 15 response is IPv4.
+    async fn udp_tracker_socket(&self, host_port: &str) -> Result<UdpSocket> {
+        let addrs: Vec<SocketAddr> = timeout(self.timeout, tokio::net::lookup_host(host_port))
+            .await
+            .map_err(|_| {
+                EngineError::network(
+                    NetworkErrorKind::Timeout,
+                    "Timed out resolving tracker address",
+                )
+            })?
+            .map_err(|e| {
+                EngineError::network(
+                    NetworkErrorKind::DnsResolution,
+                    format!("Failed to resolve tracker: {}", e),
+                )
+            })?
+            .collect();
+
+        let addr = addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or_else(|| addrs.first())
+            .copied()
+            .ok_or_else(|| {
+                EngineError::network(
+                    NetworkErrorKind::DnsResolution,
+                    "No addresses found for tracker",
+                )
+            })?;
+
+        let bind_addr = if addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
+            EngineError::network(
+                NetworkErrorKind::Other,
+                format!("Failed to create UDP socket: {}", e),
+            )
+        })?;
+
+        socket.connect(addr).await.map_err(|e| {
+            EngineError::network(
+                NetworkErrorKind::ConnectionRefused,
+                format!("Failed to connect to tracker: {}", e),
+            )
+        })?;
+
+        Ok(socket)
+    }
+
     async fn udp_connect(&self, socket: &UdpSocket, request_timeout: Duration) -> Result<i64> {
         let transaction_id: i32 = rand::rng().random();
 
@@ -1093,12 +1118,7 @@ impl TrackerClient {
             ));
         }
 
-        let body = response.bytes().await.map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::Other,
-                format!("Failed to read scrape response: {}", e),
-            )
-        })?;
+        let body = read_tracker_body(response).await?;
 
         // Parse response
         let value = BencodeValue::parse_exact(&body).map_err(|_| {
@@ -1176,36 +1196,7 @@ impl TrackerClient {
 
         let host_port = url.split('/').next().unwrap_or(url);
 
-        // Resolve address (async DNS lookup)
-        let addr = tokio::net::lookup_host(host_port)
-            .await
-            .map_err(|e| {
-                EngineError::network(
-                    NetworkErrorKind::DnsResolution,
-                    format!("Failed to resolve tracker: {}", e),
-                )
-            })?
-            .next()
-            .ok_or_else(|| {
-                EngineError::network(
-                    NetworkErrorKind::DnsResolution,
-                    "No addresses found for tracker",
-                )
-            })?;
-
-        let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::Other,
-                format!("Failed to create UDP socket: {}", e),
-            )
-        })?;
-
-        socket.connect(addr).await.map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::ConnectionRefused,
-                format!("Failed to connect to tracker: {}", e),
-            )
-        })?;
+        let socket = self.udp_tracker_socket(host_port).await?;
 
         // Connect
         let connection_id = self.udp_connect(&socket, self.timeout).await?;
@@ -1302,6 +1293,45 @@ impl Default for TrackerClient {
 /// byte; `trackerid` is opaque text supplied by the tracker's previous
 /// response and is percent-encoded so it cannot inject extra query
 /// parameters or break the URL.
+/// Largest HTTP tracker response we will buffer. A full non-compact peer
+/// list for `MAX_PEERS_PER_RESPONSE` peers is well under this; anything
+/// bigger is a broken or hostile tracker.
+const MAX_TRACKER_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Read an HTTP tracker response body, refusing to buffer more than
+/// [`MAX_TRACKER_RESPONSE_BYTES`].
+async fn read_tracker_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    let too_large = || {
+        EngineError::protocol(
+            ProtocolErrorKind::TrackerError,
+            format!(
+                "Tracker response exceeds {} bytes",
+                MAX_TRACKER_RESPONSE_BYTES
+            ),
+        )
+    };
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_TRACKER_RESPONSE_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        EngineError::network(
+            NetworkErrorKind::Other,
+            format!("Failed to read tracker response: {}", e),
+        )
+    })? {
+        if body.len() + chunk.len() > MAX_TRACKER_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn build_http_announce_url(tracker_url: &str, request: &AnnounceRequest) -> String {
     let mut url = tracker_url.to_string();
     if url.contains('?') {

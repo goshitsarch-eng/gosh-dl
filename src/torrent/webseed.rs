@@ -289,6 +289,7 @@ impl WebSeedManager {
 
         // Build HTTP client
         let client = Client::builder()
+            .connect_timeout(config.request_timeout)
             .read_timeout(config.request_timeout)
             .user_agent(&config.user_agent)
             .gzip(false)
@@ -539,7 +540,16 @@ impl WebSeedManager {
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
             // Expected response for Range request
         } else if status.is_success() {
-            // Server returned full content - we'll extract what we need
+            // Server ignored the Range header and is sending the whole
+            // resource. That is only usable when the whole resource is
+            // small: buffering a multi-gigabyte body to cut one piece out
+            // of it (once per piece, per connection) would exhaust memory.
+            if self.metainfo.info.total_size > MAX_UNRANGED_BODY {
+                return Err(EngineError::network(
+                    NetworkErrorKind::Other,
+                    "WebSeed does not support range requests",
+                ));
+            }
             tracing::debug!(
                 "WebSeed returned {} instead of 206, handling full response",
                 status
@@ -703,9 +713,16 @@ impl WebSeedManager {
                 ));
             }
 
-            // Bound the body by the requested range (206) or this file (200)
+            // Bound the body by the requested range (206) or this file
+            // (200). A 200 means the server ignored Range; see
+            // MAX_UNRANGED_BODY for why large files are refused.
             let max_len = if status == reqwest::StatusCode::PARTIAL_CONTENT {
                 *length
+            } else if file.length > MAX_UNRANGED_BODY {
+                return Err(EngineError::network(
+                    NetworkErrorKind::Other,
+                    "WebSeed does not support range requests",
+                ));
             } else {
                 file.length
             };
@@ -810,6 +827,10 @@ impl WebSeedManager {
 ///
 /// Per BEP 19, a base URL ending in `/` is a directory and the torrent name
 /// is appended; otherwise the URL already points at the file itself.
+/// Largest whole-resource body accepted from a web seed that answered a
+/// ranged request with `200 OK`.
+const MAX_UNRANGED_BODY: u64 = 32 * 1024 * 1024;
+
 fn getright_single_file_url(base_url: &str, name: &str) -> String {
     if base_url.ends_with('/') {
         format!("{}{}", base_url, urlencoding::encode(name))

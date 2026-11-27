@@ -955,7 +955,7 @@ fn row_to_status(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadStatus> {
         .unwrap_or_default();
 
     // Parse checksum
-    let checksum: Option<crate::http::ExpectedChecksum> =
+    let checksum: Option<crate::protocol::ExpectedChecksum> =
         checksum_json.and_then(|s| serde_json::from_str(&s).ok());
 
     // Parse mirrors
@@ -1204,7 +1204,7 @@ mod tests {
     async fn test_sqlite_checksum_persistence() {
         let storage = SqliteStorage::in_memory().await.unwrap();
         let mut status = create_test_status();
-        status.metadata.checksum = Some(crate::http::ExpectedChecksum::sha256(
+        status.metadata.checksum = Some(crate::protocol::ExpectedChecksum::sha256(
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ));
         let id = status.id;
@@ -1214,7 +1214,10 @@ mod tests {
 
         assert!(loaded.metadata.checksum.is_some());
         let checksum = loaded.metadata.checksum.unwrap();
-        assert_eq!(checksum.algorithm, crate::http::ChecksumAlgorithm::Sha256);
+        assert_eq!(
+            checksum.algorithm,
+            crate::protocol::ChecksumAlgorithm::Sha256
+        );
         assert_eq!(
             checksum.value,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -1249,7 +1252,7 @@ mod tests {
 
         status.priority = crate::priority_queue::DownloadPriority::Critical;
         status.metadata.cookies = vec!["auth=token".to_string()];
-        status.metadata.checksum = Some(crate::http::ExpectedChecksum::md5(
+        status.metadata.checksum = Some(crate::protocol::ExpectedChecksum::md5(
             "d41d8cd98f00b204e9800998ecf8427e",
         ));
         status.metadata.mirrors = vec!["https://backup.example.com/file.zip".to_string()];

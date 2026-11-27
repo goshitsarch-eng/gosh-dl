@@ -518,6 +518,13 @@ pub struct PeerConnection {
 
     // Buffer for reading
     read_buffer: BytesMut,
+    /// Length prefix of the message currently being received, and how much
+    /// of it (and of the body in `read_buffer`) has arrived. Kept on the
+    /// connection so a receive that times out mid-message resumes where it
+    /// stopped instead of losing the bytes it had already consumed.
+    recv_header: [u8; 4],
+    recv_header_filled: usize,
+    recv_body_filled: usize,
 
     // Extension protocol state (BEP 10)
     /// Whether extension handshake has been completed.
@@ -625,6 +632,9 @@ impl PeerConnection {
             last_activity: Instant::now(),
 
             read_buffer: BytesMut::with_capacity(MAX_MESSAGE_SIZE),
+            recv_header: [0u8; 4],
+            recv_header_filled: 0,
+            recv_body_filled: 0,
 
             extension_handshake_done: false,
             peer_extensions: HashMap::new(),
@@ -672,6 +682,9 @@ impl PeerConnection {
             last_activity: Instant::now(),
 
             read_buffer: BytesMut::with_capacity(MAX_MESSAGE_SIZE),
+            recv_header: [0u8; 4],
+            recv_header_filled: 0,
+            recv_body_filled: 0,
 
             extension_handshake_done: false,
             peer_extensions: HashMap::new(),
@@ -738,6 +751,9 @@ impl PeerConnection {
             last_activity: Instant::now(),
 
             read_buffer: BytesMut::with_capacity(MAX_MESSAGE_SIZE),
+            recv_header: [0u8; 4],
+            recv_header_filled: 0,
+            recv_body_filled: 0,
 
             extension_handshake_done: false,
             peer_extensions: HashMap::new(),
@@ -853,9 +869,20 @@ impl PeerConnection {
 
     /// Receive a message from the peer
     pub async fn recv(&mut self) -> Result<PeerMessage> {
+        // Every wait below is a single cancel-safe `read`, with the progress
+        // recorded on `self`. `read_exact` under a timeout would discard the
+        // bytes it had already pulled off the socket when the timer fires
+        // (and, on an encrypted stream, leave them out of the RC4 keystream),
+        // desynchronising the connection for good; callers treat a receive
+        // timeout as "peer is idle" and call `recv` again.
+
         // Read length prefix (4 bytes)
-        let mut len_buf = [0u8; 4];
-        timeout(DEFAULT_TIMEOUT, self.stream.read_exact(&mut len_buf))
+        while self.recv_header_filled < self.recv_header.len() {
+            let filled = self.recv_header_filled;
+            let n = timeout(
+                DEFAULT_TIMEOUT,
+                self.stream.read(&mut self.recv_header[filled..]),
+            )
             .await
             .map_err(|_| EngineError::network(NetworkErrorKind::Timeout, "Receive timeout"))?
             .map_err(|e| {
@@ -864,11 +891,20 @@ impl PeerConnection {
                     format!("Receive failed: {}", e),
                 )
             })?;
+            if n == 0 {
+                return Err(EngineError::network(
+                    NetworkErrorKind::ConnectionReset,
+                    "Receive failed: connection closed by peer",
+                ));
+            }
+            self.recv_header_filled += n;
+        }
 
-        let len = u32::from_be_bytes(len_buf) as usize;
+        let len = u32::from_be_bytes(self.recv_header) as usize;
 
         // Keep-alive message (length = 0)
         if len == 0 {
+            self.recv_header_filled = 0;
             self.last_activity = Instant::now();
             return Ok(PeerMessage::KeepAlive);
         }
@@ -883,19 +919,35 @@ impl PeerConnection {
         }
 
         // Read message body
-        self.read_buffer.resize(len, 0);
-        timeout(
-            DEFAULT_TIMEOUT,
-            self.stream.read_exact(&mut self.read_buffer),
-        )
-        .await
-        .map_err(|_| EngineError::network(NetworkErrorKind::Timeout, "Receive body timeout"))?
-        .map_err(|e| {
-            EngineError::network(
-                NetworkErrorKind::ConnectionReset,
-                format!("Receive body failed: {}", e),
+        if self.recv_body_filled == 0 {
+            self.read_buffer.resize(len, 0);
+        }
+        while self.recv_body_filled < len {
+            let filled = self.recv_body_filled;
+            let n = timeout(
+                DEFAULT_TIMEOUT,
+                self.stream.read(&mut self.read_buffer[filled..len]),
             )
-        })?;
+            .await
+            .map_err(|_| EngineError::network(NetworkErrorKind::Timeout, "Receive body timeout"))?
+            .map_err(|e| {
+                EngineError::network(
+                    NetworkErrorKind::ConnectionReset,
+                    format!("Receive body failed: {}", e),
+                )
+            })?;
+            if n == 0 {
+                return Err(EngineError::network(
+                    NetworkErrorKind::ConnectionReset,
+                    "Receive body failed: connection closed by peer",
+                ));
+            }
+            self.recv_body_filled += n;
+        }
+
+        // Message complete: the next call starts a fresh one.
+        self.recv_header_filled = 0;
+        self.recv_body_filled = 0;
 
         let msg = PeerMessage::decode(&self.read_buffer)?;
 

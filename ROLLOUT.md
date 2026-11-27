@@ -38,7 +38,7 @@ the packet-loss test or the release gate.
   recursive jobs, storage, Metalink, mock torrent peers, inbound connections,
   and uTP transfers.
 - Minimal-feature tests check that HTTP/torrent integrations remain optional.
-- Formatting, Clippy, Rust 1.85 compatibility with the committed lockfile,
+- Formatting, Clippy, Rust 1.89 compatibility with the committed lockfile,
   and verified Cargo packaging are release gates.
 - GitHub CI runs the feature matrix on Linux, macOS, and Windows, plus the
   four existing fuzz smoke targets. The release workflow runs this suite
@@ -63,6 +63,29 @@ the packet-loss test or the release gate.
 The 0.6.1 patch addresses the reproducible failures above. It does not claim
 that every optional feature is production-proven, and it is not a 1.0 API
 stability declaration.
+
+## 0.7.0 deep-dive audit
+
+A line-by-line read of the HTTP, engine, storage, and torrent core (piece
+manager, peer wire, trackers, web seeds, DHT/LPD/PEX glue, MSE handshake),
+with each defect reproduced by a failing test where a test could reach it;
+see the 0.7.0 changelog entry, `tests/deep_dive_regressions.rs` and
+`tests/deep_dive_torrent_regressions.rs`. Notable items: disk-write errors
+lost on drop (torrent pieces recorded as stored on a full disk), cancel with
+delete removing a whole same-named directory, stale persistence snapshots
+resurrecting cancelled downloads, `Have` messages never being sent, peer
+streams desynchronised by receive timeouts, and `HEAD`-only probing
+(issue #20). 0.6.4 was never tagged or published; 0.7.0 supersedes it.
+
+Remaining validation gaps after 0.7.0: the uTP socket/multiplexer/congestion
+code and the recursive crawler were only skimmed in this pass; a download's
+name taken from `Content-Disposition` is not known to the engine until
+completion, so `cancel(id, true)` before then can leave that `.part` file
+behind; two downloads given the same output name share one `.part` file;
+adding the same torrent twice is not detected; seeding torrents keep their
+concurrency slot; each torrent opens its own DHT, LPD, and uTP sockets; the
+items listed under 0.6.4 below still apply. The minimum Rust version is 1.89,
+required by the SQLite security fix.
 
 ## 0.6.4 application audit
 

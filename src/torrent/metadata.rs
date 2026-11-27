@@ -304,14 +304,14 @@ impl MetadataFetcher {
                     ));
                 }
 
-                // Validate piece size
-                let expected_size = if msg.piece < (total_size / METADATA_PIECE_SIZE) {
-                    METADATA_PIECE_SIZE
-                } else {
-                    total_size % METADATA_PIECE_SIZE
-                };
+                // Validate piece size: every piece is full-sized except
+                // possibly the last. (When the total is an exact multiple of
+                // the piece size the last piece is full-sized too; taking
+                // `total % piece` there would yield 0 and skip the check.)
+                let expected_size =
+                    METADATA_PIECE_SIZE.min(total_size - msg.piece * METADATA_PIECE_SIZE);
 
-                if data.len() != expected_size && expected_size != 0 {
+                if data.len() != expected_size {
                     return Err(EngineError::protocol(
                         ProtocolErrorKind::MetadataError,
                         format!(
@@ -417,35 +417,29 @@ impl MetadataFetcher {
         self.metadata.read().await.clone()
     }
 
-    /// Parse the metadata into a Metainfo struct.
-    ///
-    /// Note: This creates a synthetic Metainfo since we only have the info dict.
+    /// Parse the fetched metadata into a [`Metainfo`].
     pub async fn parse_metainfo(&self) -> Result<Option<Metainfo>> {
-        let Some(data) = self.get_metadata().await else {
+        let Some(torrent_bytes) = self.raw_torrent_bytes().await else {
             return Ok(None);
         };
-
-        // The metadata is just the info dict, not a full torrent
-        let info_value = BencodeValue::parse_exact(&data)?;
-
-        // Create a synthetic full torrent structure
-        let mut torrent_dict = std::collections::BTreeMap::new();
-        torrent_dict.insert(b"info".to_vec(), info_value);
-
-        let torrent_bytes = BencodeValue::Dict(torrent_dict).encode();
         let metainfo = Metainfo::parse(&torrent_bytes)?;
-
         Ok(Some(metainfo))
     }
 
-    /// Get the raw bencoded torrent data (synthetic, built from the info dict).
-    /// Returns `None` if metadata hasn't been fully received yet.
+    /// The fetched metadata wrapped as a minimal `.torrent` (`d4:info<info>e`).
+    ///
+    /// The info dict is embedded byte-for-byte. Parsing and re-encoding it
+    /// would silently canonicalise a non-canonical dict (unsorted keys, for
+    /// one), and the result would hash to a *different* info-hash than the
+    /// magnet link: the torrent would then announce and handshake with the
+    /// wrong hash after a restart.
     pub async fn raw_torrent_bytes(&self) -> Option<Vec<u8>> {
         let data = self.get_metadata().await?;
-        let info_value = BencodeValue::parse_exact(&data).ok()?;
-        let mut torrent_dict = std::collections::BTreeMap::new();
-        torrent_dict.insert(b"info".to_vec(), info_value);
-        Some(BencodeValue::Dict(torrent_dict).encode())
+        let mut torrent = Vec::with_capacity(data.len() + 8);
+        torrent.extend_from_slice(b"d4:info");
+        torrent.extend_from_slice(&data);
+        torrent.push(b'e');
+        Some(torrent)
     }
 
     /// Get the total metadata size (if known).
@@ -670,5 +664,47 @@ mod tests {
         let handshake = b"d13:metadata_sizei12345ee";
         let size = parse_metadata_size(handshake);
         assert_eq!(size, Some(12345));
+    }
+
+    /// Original failure: the fetched info dict was parsed and re-encoded to
+    /// build the `.torrent` kept for resume. Re-encoding canonicalises the
+    /// dict, so an info dict that was not byte-for-byte canonical produced a
+    /// torrent with a *different* info-hash than the magnet link.
+    #[tokio::test]
+    async fn fetched_metadata_keeps_its_info_hash() {
+        // Keys deliberately out of order ("pieces" before "name").
+        let mut info = b"d6:lengthi5e12:piece lengthi16384e6:pieces20:".to_vec();
+        info.extend_from_slice(&[0xAB; 20]);
+        info.extend_from_slice(b"4:name4:teste");
+
+        let mut hasher = Sha1::new();
+        hasher.update(&info);
+        let info_hash: [u8; 20] = hasher.finalize().into();
+
+        let fetcher = MetadataFetcher::new(info_hash);
+        let complete = fetcher
+            .process_message(MetadataMessage::data(0, info.len(), info.clone()))
+            .await
+            .unwrap();
+        assert!(complete);
+
+        let metainfo = fetcher.parse_metainfo().await.unwrap().unwrap();
+        assert_eq!(metainfo.info_hash, info_hash);
+        assert_eq!(metainfo.info.name, "test");
+
+        // The bytes persisted for crash recovery hash the same way.
+        let raw = fetcher.raw_torrent_bytes().await.unwrap();
+        assert_eq!(Metainfo::parse(&raw).unwrap().info_hash, info_hash);
+    }
+
+    /// The last piece of metadata whose size is an exact multiple of the
+    /// piece size must be full-sized; the old check computed an expected
+    /// size of zero for it and accepted anything.
+    #[tokio::test]
+    async fn last_metadata_piece_size_is_checked_for_exact_multiples() {
+        let fetcher = MetadataFetcher::new([0u8; 20]);
+        let total = METADATA_PIECE_SIZE * 2;
+        let short = MetadataMessage::data(1, total, vec![0u8; 10]);
+        assert!(fetcher.process_message(short).await.is_err());
     }
 }

@@ -283,6 +283,15 @@ pub struct TorrentDownloader {
 /// Maximum inbound connections waiting for their BitTorrent handshake.
 const MAX_PENDING_INBOUND_HANDSHAKES: usize = 64;
 
+/// Upper bound on remembered peer addresses. Trackers, DHT and above all PEX
+/// feed this set with unauthenticated addresses; without a bound a single
+/// peer could grow it (and the dial queue) without limit.
+const MAX_KNOWN_PEERS: usize = 5000;
+
+/// Trackers announced to at the same time. Announcing one after another
+/// makes every dead tracker (up to 35s each for UDP) delay the start.
+const TRACKER_ANNOUNCE_CONCURRENCY: usize = 8;
+
 /// Information about a connected peer
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -942,8 +951,19 @@ impl TorrentDownloader {
             tracker_id: None,
         };
 
-        for tracker_url in trackers {
-            match self.tracker_client.announce(&tracker_url, &request).await {
+        use futures::StreamExt;
+        let request = &request;
+        let mut announces = futures::stream::iter(trackers)
+            .map(|tracker_url| async move {
+                let result = self.tracker_client.announce(&tracker_url, request).await;
+                (tracker_url, result)
+            })
+            .buffer_unordered(TRACKER_ANNOUNCE_CONCURRENCY);
+
+        // Results are handled as they arrive, so peers from a fast tracker
+        // are usable while a dead one is still timing out.
+        while let Some((tracker_url, result)) = announces.next().await {
+            match result {
                 Ok(response) => {
                     tracing::info!(
                         "Announced to {}: {} peers, interval {}s",
@@ -963,12 +983,12 @@ impl TorrentDownloader {
                     }
 
                     // Add peers to known list
-                    let mut known = self.known_peers.write();
-                    for peer in response.peers {
-                        if let Some(addr) = peer.to_socket_addr() {
-                            known.insert(addr);
-                        }
-                    }
+                    self.add_known_peers(
+                        response
+                            .peers
+                            .iter()
+                            .filter_map(|peer| peer.to_socket_addr()),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("Failed to announce to {}: {}", tracker_url, e);
@@ -1251,8 +1271,19 @@ impl TorrentDownloader {
 
     /// Stop the download
     pub async fn stop(&self) -> Result<()> {
-        self.shutdown.store(true, Ordering::SeqCst);
         *self.state.write() = TorrentState::Stopped;
+        self.halt_tasks();
+
+        // Announce stopped
+        self.announce_to_trackers(AnnounceEvent::Stopped).await?;
+
+        Ok(())
+    }
+
+    /// Stop every background task of this torrent (discovery, web seeds,
+    /// inbound and outbound peers) without touching the state or trackers.
+    fn halt_tasks(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
 
         // Abort all discovery tasks (DHT, LPD, etc.)
         {
@@ -1284,11 +1315,6 @@ impl TorrentDownloader {
         for (_, handle) in self.peer_tasks.write().drain() {
             handle.abort();
         }
-
-        // Announce stopped
-        self.announce_to_trackers(AnnounceEvent::Stopped).await?;
-
-        Ok(())
     }
 
     /// Check if download is complete
@@ -1326,7 +1352,25 @@ impl TorrentDownloader {
     /// This is used by DHT, PEX, and LPD to add discovered peers.
     pub fn add_known_peers(&self, peers: impl IntoIterator<Item = SocketAddr>) {
         let mut known = self.known_peers.write();
+        let mut pruned = false;
         for peer in peers {
+            if known.len() >= MAX_KNOWN_PEERS && !known.contains(&peer) {
+                if !pruned {
+                    // Make room once per batch by forgetting addresses that
+                    // keep failing and are not connected right now.
+                    pruned = true;
+                    let active = self.peer_tasks.read();
+                    let mut backoff = self.peer_backoff.write();
+                    known.retain(|addr| {
+                        active.contains_key(addr)
+                            || backoff.get(addr).is_none_or(|(failures, _)| *failures < 2)
+                    });
+                    backoff.retain(|addr, _| known.contains(addr));
+                }
+                if known.len() >= MAX_KNOWN_PEERS {
+                    continue;
+                }
+            }
             known.insert(peer);
         }
     }
@@ -1355,9 +1399,10 @@ impl TorrentDownloader {
     /// This spawns tasks to connect to peers and download pieces.
     pub async fn run_peer_loop(self: Arc<Self>) -> Result<()> {
         // Use configurable intervals from TorrentConfig
-        let tick_duration = Duration::from_millis(self.config.tick_interval_ms);
-        let connect_duration = Duration::from_secs(self.config.connect_interval_secs);
-        let choking_duration = Duration::from_secs(self.config.choking_interval_secs);
+        // `tokio::time::interval` panics on a zero period.
+        let tick_duration = Duration::from_millis(self.config.tick_interval_ms.max(1));
+        let connect_duration = Duration::from_secs(self.config.connect_interval_secs.max(1));
+        let choking_duration = Duration::from_secs(self.config.choking_interval_secs.max(1));
         let max_pending_per_peer = self.config.max_pending_requests;
 
         let mut tick_interval = tokio::time::interval(tick_duration);
@@ -1367,6 +1412,7 @@ impl TorrentDownloader {
         // Active peer connections (addr -> connection task handle), owned by
         // the downloader so stop() can abort them.
         let active_connections = Arc::clone(&self.peer_tasks);
+        let mut fatal_error: Option<EngineError> = None;
 
         loop {
             tokio::select! {
@@ -1402,11 +1448,30 @@ impl TorrentDownloader {
 
                     // Cancel stale pending pieces that haven't made progress
                     // This allows pieces to be re-selected when peers disconnect mid-download
-                    {
+                    let storage_error = {
                         let pm_guard = self.piece_manager.read();
-                        if let Some(ref pm) = *pm_guard {
-                            pm.cancel_stale_pieces(self.config.request_timeout);
+                        match *pm_guard {
+                            Some(ref pm) => {
+                                pm.cancel_stale_pieces(self.config.request_timeout);
+                                pm.take_storage_error()
+                            }
+                            None => None,
                         }
+                    };
+
+                    // Data that cannot be written (disk full, permissions)
+                    // is a failure of the download, not something to retry
+                    // piece by piece forever while reporting "Downloading".
+                    if let Some(message) = storage_error {
+                        tracing::error!("Torrent {} stopped: {}", self.name(), message);
+                        *self.state.write() = TorrentState::Error;
+                        self.halt_tasks();
+                        fatal_error = Some(EngineError::storage(
+                            crate::error::StorageErrorKind::Io,
+                            self.save_dir.clone(),
+                            message,
+                        ));
+                        break;
                     }
                 }
 
@@ -1504,7 +1569,10 @@ impl TorrentDownloader {
             handle.abort();
         }
 
-        Ok(())
+        match fatal_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Run the choking algorithm to decide which peers to unchoke.
@@ -1798,10 +1866,36 @@ impl TorrentDownloader {
         choking_decisions: Arc<RwLock<HashMap<SocketAddr, bool>>>,
         metadata_only: bool,
     ) -> Result<()> {
+        // Undone by the guard on *every* exit: the normal end of the loop,
+        // an early `?` (a peer that drops right after the handshake), and
+        // the task being aborted. A leaked count would eventually read as
+        // "at max_peers" and refuse every inbound connection.
+        struct ConnectedPeer {
+            downloader: Arc<TorrentDownloader>,
+            addr: SocketAddr,
+            shared_stats: Arc<RwLock<HashMap<SocketAddr, PeerStats>>>,
+            choking_decisions: Arc<RwLock<HashMap<SocketAddr, bool>>>,
+        }
+        impl Drop for ConnectedPeer {
+            fn drop(&mut self) {
+                self.shared_stats.write().remove(&self.addr);
+                self.choking_decisions.write().remove(&self.addr);
+                self.downloader
+                    .stats
+                    .peers_connected
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         downloader
             .stats
             .peers_connected
             .fetch_add(1, Ordering::Relaxed);
+        let _connected = ConnectedPeer {
+            downloader: Arc::clone(&downloader),
+            addr,
+            shared_stats: Arc::clone(&shared_stats),
+            choking_decisions: Arc::clone(&choking_decisions),
+        };
 
         // Send extension handshake if supported
         if conn.supports_extensions() {
@@ -1819,11 +1913,22 @@ impl TorrentDownloader {
             None
         };
 
-        // Send our bitfield
-        let bitfield_opt = {
+        // Send our bitfield. The piece count is read *before* the bitfield
+        // snapshot: a piece finishing in between then shows up as a count
+        // change and is announced with a `Have`, rather than being missed.
+        let (bitfield_opt, mut announced_count) = {
             let pm_guard = downloader.piece_manager.read();
-            pm_guard.as_ref().map(|pm| pm.bitfield())
+            match pm_guard.as_ref() {
+                Some(pm) => {
+                    let count = pm.verified_piece_count();
+                    (Some(pm.bitfield()), count)
+                }
+                None => (None, 0),
+            }
         };
+        // Pieces this peer has been told about: the bitfield now, `Have`
+        // messages for everything completed later.
+        let mut announced = bitfield_opt.clone();
         if let Some(bitfield) = bitfield_opt {
             conn.send_bitfield(&bitfield).await.ok();
         }
@@ -1857,7 +1962,7 @@ impl TorrentDownloader {
             );
         }
 
-        loop {
+        'conn: loop {
             // Check shutdown
             if downloader.shutdown.load(Ordering::SeqCst) {
                 break;
@@ -1869,17 +1974,68 @@ impl TorrentDownloader {
                 break;
             }
 
-            // Receive message - DO NOT wrap in timeout as it corrupts the stream
-            // The recv() has its own internal 30s timeout
+            // Tell the peer about pieces completed since the last pass.
+            // Without `Have` messages peers only ever know the bitfield from
+            // connect time: they never request our newer pieces, so we look
+            // like a leech to tit-for-tat and get choked.
+            let pm_for_have = downloader.piece_manager.read().clone();
+            if let Some(pm) = pm_for_have {
+                let count = pm.verified_piece_count();
+                if count != announced_count {
+                    let have = pm.bitfield();
+                    let fresh: Vec<usize> = have
+                        .iter_ones()
+                        .filter(|&i| {
+                            !announced
+                                .as_ref()
+                                .and_then(|a| a.get(i).map(|b| *b))
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    for piece in fresh {
+                        if let Err(e) = conn.have(piece as u32).await {
+                            tracing::debug!("Peer {} have failed: {}", addr, e);
+                            break 'conn;
+                        }
+                    }
+                    announced = Some(have);
+                    announced_count = count;
+                }
+            }
+
+            // Receive message. recv() carries its own timeout and keeps a
+            // partially received message across calls, so a timeout here
+            // never loses bytes.
             match conn.recv().await {
                 Ok(msg) => {
                     match msg {
                         PeerMessage::KeepAlive => {}
 
                         PeerMessage::Choke => {
-                            // Peer choked us, clear pending
+                            // Peer choked us: our requests are void. Release
+                            // the block reservations so other peers can take
+                            // them now, instead of after the whole piece
+                            // times out and is discarded.
                             tracing::debug!("[{}] Peer choked us", addr);
+                            if let Some(ref pm) = *downloader.piece_manager.read() {
+                                for (piece, offset, _) in &pending_requests {
+                                    pm.release_block_request(*piece, *offset / BLOCK_SIZE);
+                                }
+                            }
                             pending_requests.clear();
+                        }
+
+                        PeerMessage::RejectRequest {
+                            index,
+                            begin,
+                            length,
+                        } => {
+                            // BEP 6: the peer will not serve this request.
+                            if pending_requests.remove(&(index, begin, length)) {
+                                if let Some(ref pm) = *downloader.piece_manager.read() {
+                                    pm.release_block_request(index, begin / BLOCK_SIZE);
+                                }
+                            }
                         }
 
                         PeerMessage::Unchoke => {
@@ -2041,11 +2197,16 @@ impl TorrentDownloader {
                                             );
                                         }
                                         Err(e) => {
-                                            tracing::warn!(
+                                            // A failed (possibly partial)
+                                            // write leaves the peer with a
+                                            // torn message; the connection
+                                            // cannot be used any further.
+                                            tracing::debug!(
                                                 "Failed to send piece to {}: {}",
                                                 addr,
                                                 e
                                             );
+                                            break 'conn;
                                         }
                                     }
                                 }
@@ -2391,10 +2552,18 @@ impl TorrentDownloader {
             // Send PEX message if enabled, supported, and interval elapsed
             if let Some(ref mut state) = pex_state {
                 if state.is_supported() && state.can_send() {
-                    // Get current known peers, excluding this peer
+                    // Share only peers we are actually connected to and
+                    // dialed ourselves (so the address is a real listen
+                    // address). Relaying every address we were merely told
+                    // about would make us an amplifier for bogus peers.
                     let current_peers: HashSet<SocketAddr> = {
-                        let peers = downloader.known_peers.read();
-                        peers.iter().filter(|p| **p != addr).cloned().collect()
+                        let connected = shared_stats.read();
+                        let dialed = downloader.peer_tasks.read();
+                        dialed
+                            .keys()
+                            .filter(|p| **p != addr && connected.contains_key(*p))
+                            .cloned()
+                            .collect()
                     };
 
                     if let Some(pex_msg) = state.build_message(&current_peers) {
@@ -2468,20 +2637,18 @@ impl TorrentDownloader {
             }
         }
 
-        // Clean up peer stats on exit
-        shared_stats.write().remove(&addr);
-        choking_decisions.write().remove(&addr);
-
         // Remove this peer's pieces from the availability counters so
-        // rarest-first reflects the live swarm.
+        // rarest-first reflects the live swarm, and hand its outstanding
+        // block requests back so other peers can pick them up right away.
+        // (Stats, choking state and the peer count are cleaned up by the
+        // `ConnectedPeer` guard.)
         if let Some(ref pm) = *downloader.piece_manager.read() {
             pm.update_availability(conn.peer_pieces(), false);
+            for (piece, offset, _) in &pending_requests {
+                pm.release_block_request(*piece, *offset / BLOCK_SIZE);
+            }
         }
 
-        downloader
-            .stats
-            .peers_connected
-            .fetch_sub(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2518,14 +2685,20 @@ impl TorrentDownloader {
 
         const DHT_LOOKUP_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
         const DHT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(1800); // 30 minutes
-
-        let mut lookup_timer = tokio::time::interval(DHT_LOOKUP_INTERVAL);
-        let mut announce_timer = tokio::time::interval(DHT_ANNOUNCE_INTERVAL);
+                                                                           // An empty result right after start usually means the routing table
+                                                                           // is still cold, not that the swarm is empty. Retry soon (backing
+                                                                           // off) instead of waiting a full interval: for a tracker-less magnet
+                                                                           // this lookup is the only source of peers.
+        const DHT_EMPTY_RETRY_MIN: Duration = Duration::from_secs(15);
 
         // Initial announce
-        if let Err(e) = dht_client.announce(&self.info_hash) {
+        if let Err(e) = dht_client.announce_async(&self.info_hash).await {
             tracing::debug!("DHT announce failed: {}", e);
         }
+
+        let mut next_lookup = tokio::time::Instant::now();
+        let mut next_announce = tokio::time::Instant::now() + DHT_ANNOUNCE_INTERVAL;
+        let mut empty_retry = DHT_EMPTY_RETRY_MIN;
 
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
@@ -2538,25 +2711,34 @@ impl TorrentDownloader {
             }
 
             tokio::select! {
-                _ = lookup_timer.tick() => {
+                _ = tokio::time::sleep_until(next_lookup) => {
                     // Skip lookup if paused
                     if state == TorrentState::Paused {
+                        next_lookup = tokio::time::Instant::now() + DHT_EMPTY_RETRY_MIN;
                         continue;
                     }
 
                     // Find peers from DHT
                     let peers = dht_client.find_peers_timeout(&self.info_hash, Duration::from_secs(30)).await;
-                    if !peers.is_empty() {
+                    let delay = if peers.is_empty() {
+                        let delay = empty_retry;
+                        empty_retry = (empty_retry * 2).min(DHT_LOOKUP_INTERVAL);
+                        delay
+                    } else {
                         tracing::debug!("DHT found {} peers for {}", peers.len(), self.name());
                         self.add_known_peers(peers);
-                    }
+                        empty_retry = DHT_EMPTY_RETRY_MIN;
+                        DHT_LOOKUP_INTERVAL
+                    };
+                    next_lookup = tokio::time::Instant::now() + delay;
                 }
 
-                _ = announce_timer.tick() => {
+                _ = tokio::time::sleep_until(next_announce) => {
                     // Re-announce to DHT
-                    if let Err(e) = dht_client.announce(&self.info_hash) {
+                    if let Err(e) = dht_client.announce_async(&self.info_hash).await {
                         tracing::debug!("DHT re-announce failed: {}", e);
                     }
+                    next_announce = tokio::time::Instant::now() + DHT_ANNOUNCE_INTERVAL;
                 }
             }
         }

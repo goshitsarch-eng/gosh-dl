@@ -17,7 +17,7 @@
 //! ```
 
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +56,10 @@ pub struct LpdService {
     socket: Arc<UdpSocket>,
     /// Port we're listening on for BitTorrent connections.
     listen_port: u16,
+    /// Random per-instance cookie sent with every announce (BEP 14), used to
+    /// recognise - and ignore - our own announcements when they come back
+    /// from the multicast group.
+    cookie: String,
     /// Shutdown signal sender.
     shutdown_tx: broadcast::Sender<()>,
     /// Whether the service is running.
@@ -80,6 +84,7 @@ impl LpdService {
         Ok(Self {
             socket: Arc::new(socket),
             listen_port,
+            cookie: format!("{:016x}", rand::random::<u64>()),
             shutdown_tx,
             running: Arc::new(AtomicBool::new(true)),
             tracked: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
@@ -121,7 +126,7 @@ impl LpdService {
             ));
         }
 
-        let message = build_announce_message(info_hash, self.listen_port);
+        let message = build_announce_message(info_hash, self.listen_port, &self.cookie);
 
         self.socket
             .send_to(message.as_bytes(), LPD_MULTICAST_GROUP)
@@ -157,7 +162,7 @@ impl LpdService {
         let socket = self.socket.clone();
         let running = self.running.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let our_port = self.listen_port;
+        let our_cookie = self.cookie.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
@@ -171,13 +176,15 @@ impl LpdService {
                     result = socket.recv_from(&mut buf) => {
                         match result {
                             Ok((len, source_addr)) => {
-                                if let Some(peer) = parse_announce(&buf[..len], source_addr, our_port) {
+                                if let Some(peer) = parse_announce(&buf[..len], source_addr, &our_cookie) {
                                     let _ = tx.send(peer);
                                 }
                             }
                             Err(e) => {
-                                // Log error but continue
+                                // Log and keep going, but not in a hot
+                                // loop if the error is persistent.
                                 tracing::debug!("LPD recv error: {}", e);
+                                tokio::time::sleep(Duration::from_millis(250)).await;
                             }
                         }
                     }
@@ -258,7 +265,7 @@ fn create_multicast_socket() -> Result<UdpSocket> {
 }
 
 /// Build an LPD announce message.
-fn build_announce_message(info_hash: &Sha1Hash, port: u16) -> String {
+fn build_announce_message(info_hash: &Sha1Hash, port: u16, cookie: &str) -> String {
     let hex_hash: String = info_hash.iter().map(|b| format!("{:02x}", b)).collect();
 
     format!(
@@ -266,8 +273,9 @@ fn build_announce_message(info_hash: &Sha1Hash, port: u16) -> String {
          Host: {}:{}\r\n\
          Port: {}\r\n\
          Infohash: {}\r\n\
+         cookie: {}\r\n\
          \r\n",
-        LPD_MULTICAST_ADDR, LPD_PORT, port, hex_hash
+        LPD_MULTICAST_ADDR, LPD_PORT, port, hex_hash, cookie
     )
 }
 
@@ -280,7 +288,7 @@ fn build_announce_message(info_hash: &Sha1Hash, port: u16) -> String {
 ///
 /// # Returns
 /// Parsed LocalPeer if valid, None otherwise.
-fn parse_announce(data: &[u8], source: SocketAddr, our_port: u16) -> Option<LocalPeer> {
+fn parse_announce(data: &[u8], source: SocketAddr, our_cookie: &str) -> Option<LocalPeer> {
     let text = std::str::from_utf8(data).ok()?;
 
     // Must be a BT-SEARCH message
@@ -290,6 +298,7 @@ fn parse_announce(data: &[u8], source: SocketAddr, our_port: u16) -> Option<Loca
 
     let mut port: Option<u16> = None;
     let mut info_hash_hex: Option<&str> = None;
+    let mut cookie: Option<&str> = None;
 
     for line in text.lines() {
         let line = line.trim();
@@ -297,7 +306,20 @@ fn parse_announce(data: &[u8], source: SocketAddr, our_port: u16) -> Option<Loca
             port = value.trim().parse().ok();
         } else if let Some(value) = line.strip_prefix("Infohash:") {
             info_hash_hex = Some(value.trim());
+        } else if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("cookie") {
+                cookie = Some(value.trim());
+            }
         }
+    }
+
+    // Our own announcement, echoed back by the multicast group. The cookie
+    // is the only reliable signal: matching on "same port from a private
+    // address" (the old test) also discards every other client on the LAN
+    // that happens to listen on the same port - with the default 6881,
+    // that is most of them.
+    if cookie.is_some_and(|c| c == our_cookie) {
+        return None;
     }
 
     let peer_port = port?;
@@ -323,23 +345,10 @@ fn parse_announce(data: &[u8], source: SocketAddr, our_port: u16) -> Option<Loca
         }
     };
 
-    // Skip if this is our own announcement
-    if peer_port == our_port && is_local_address(source.ip()) {
-        return None;
-    }
-
     Some(LocalPeer {
         addr: peer_addr,
         info_hash,
     })
-}
-
-/// Check if an IP address is a local address.
-fn is_local_address(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(addr) => addr.is_loopback() || addr.is_private() || addr.is_link_local(),
-        IpAddr::V6(addr) => addr.is_loopback(),
-    }
 }
 
 /// LPD manager that handles periodic announcements.
@@ -408,7 +417,8 @@ mod tests {
             0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
         ];
 
-        let message = build_announce_message(&info_hash, 6881);
+        let message = build_announce_message(&info_hash, 6881, "c0ffee");
+        assert!(message.contains("cookie: c0ffee\r\n"));
 
         assert!(message.starts_with("BT-SEARCH * HTTP/1.1\r\n"));
         assert!(message.contains("Host: 239.192.152.143:6771\r\n"));
@@ -426,7 +436,7 @@ mod tests {
                        \r\n";
 
         let source = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345));
-        let peer = parse_announce(message.as_bytes(), source, 6881);
+        let peer = parse_announce(message.as_bytes(), source, "ours");
 
         assert!(peer.is_some());
         let peer = peer.unwrap();
@@ -451,20 +461,20 @@ mod tests {
         // Not a BT-SEARCH message
         let message = "HTTP/1.1 200 OK\r\n\r\n";
         let source = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345));
-        assert!(parse_announce(message.as_bytes(), source, 6881).is_none());
+        assert!(parse_announce(message.as_bytes(), source, "ours").is_none());
 
         // Missing port
         let message = "BT-SEARCH * HTTP/1.1\r\n\
                        Infohash: 0123456789abcdef0123456789abcdef01234567\r\n\
                        \r\n";
-        assert!(parse_announce(message.as_bytes(), source, 6881).is_none());
+        assert!(parse_announce(message.as_bytes(), source, "ours").is_none());
 
         // Invalid info_hash length
         let message = "BT-SEARCH * HTTP/1.1\r\n\
                        Port: 6882\r\n\
                        Infohash: 0123456789\r\n\
                        \r\n";
-        assert!(parse_announce(message.as_bytes(), source, 6881).is_none());
+        assert!(parse_announce(message.as_bytes(), source, "ours").is_none());
     }
 
     #[test]
@@ -479,31 +489,37 @@ mod tests {
             bad_hash
         );
         let source = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 12345));
-        assert!(parse_announce(message.as_bytes(), source, 6881).is_none());
+        assert!(parse_announce(message.as_bytes(), source, "ours").is_none());
 
         // Non-hex ASCII of the right length is also rejected
         let message = format!(
             "BT-SEARCH * HTTP/1.1\r\nPort: 6882\r\nInfohash: {}\r\n\r\n",
             "g".repeat(40)
         );
-        assert!(parse_announce(message.as_bytes(), source, 6881).is_none());
+        assert!(parse_announce(message.as_bytes(), source, "ours").is_none());
     }
 
     #[test]
     fn test_parse_announce_self_filter() {
-        let message = "BT-SEARCH * HTTP/1.1\r\n\
-                       Port: 6881\r\n\
-                       Infohash: 0123456789abcdef0123456789abcdef01234567\r\n\
-                       \r\n";
+        let info_hash: Sha1Hash = [0x11; 20];
+        let ours = build_announce_message(&info_hash, 6881, "ours");
 
-        // Should filter out our own announcements (same port + local address)
-        let source = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 12345));
-        let peer = parse_announce(message.as_bytes(), source, 6881);
-        assert!(peer.is_none());
+        // Our own announcement (same cookie) is ignored wherever it comes from
+        let source = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 50), 6771));
+        assert!(parse_announce(ours.as_bytes(), source, "ours").is_none());
 
-        // Should accept from different port
-        let peer = parse_announce(message.as_bytes(), source, 6882);
-        assert!(peer.is_some());
+        // Another client on the LAN using the *same port* must be accepted:
+        // the old port-based filter dropped it as "ourselves".
+        let theirs = build_announce_message(&info_hash, 6881, "theirs");
+        let peer = parse_announce(theirs.as_bytes(), source, "ours").expect("LAN peer accepted");
+        assert_eq!(peer.addr.port(), 6881);
+
+        // Clients that send no cookie at all are accepted too
+        let no_cookie = "BT-SEARCH * HTTP/1.1\r\n\
+                         Port: 6881\r\n\
+                         Infohash: 0123456789abcdef0123456789abcdef01234567\r\n\
+                         \r\n";
+        assert!(parse_announce(no_cookie.as_bytes(), source, "ours").is_some());
     }
 
     #[test]

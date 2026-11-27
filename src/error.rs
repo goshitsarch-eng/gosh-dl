@@ -273,10 +273,41 @@ impl From<std::io::Error> for EngineError {
 #[cfg(any(feature = "http", feature = "torrent"))]
 impl From<reqwest::Error> for EngineError {
     fn from(err: reqwest::Error) -> Self {
+        // The underlying I/O error, when there is one, says more than
+        // reqwest's coarse categories.
+        let io_kind = {
+            let mut source = std::error::Error::source(&err);
+            let mut found = None;
+            while let Some(cause) = source {
+                if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                    found = Some(io.kind());
+                    break;
+                }
+                source = cause.source();
+            }
+            found
+        };
+
         let kind = if err.is_timeout() {
             NetworkErrorKind::Timeout
         } else if err.is_connect() {
-            NetworkErrorKind::ConnectionRefused
+            use std::io::ErrorKind;
+            match io_kind {
+                // The handshake was cut off, or the network is briefly
+                // down: transient, unlike a port nothing listens on.
+                Some(
+                    ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof,
+                ) => NetworkErrorKind::ConnectionReset,
+                Some(
+                    ErrorKind::HostUnreachable
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::NetworkDown,
+                ) => NetworkErrorKind::Unreachable,
+                _ => NetworkErrorKind::ConnectionRefused,
+            }
         } else if err.is_redirect() {
             NetworkErrorKind::TooManyRedirects
         } else if err.is_body() || err.is_decode() {
@@ -284,6 +315,14 @@ impl From<reqwest::Error> for EngineError {
             NetworkErrorKind::ConnectionReset
         } else if let Some(status) = err.status() {
             NetworkErrorKind::HttpStatus(status.as_u16())
+        } else if err.is_request() {
+            // The request went out on an established connection and no
+            // response came back: the server closed a kept-alive connection
+            // under us, the connection was reset, an HTTP/2 stream was
+            // refused. These are the classic transient failures; leaving
+            // them as `Other` made them non-retryable, which aborted every
+            // segment of a multi-connection download on one stale socket.
+            NetworkErrorKind::ConnectionReset
         } else {
             NetworkErrorKind::Other
         };

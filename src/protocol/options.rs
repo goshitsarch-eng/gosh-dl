@@ -6,6 +6,46 @@ use super::checksum::ExpectedChecksum;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// What to do when an HTTP download finishes and a file with its final name
+/// already exists.
+///
+/// HTTP downloads are written to `<name>.part` and renamed onto `<name>`
+/// once complete. The name can be taken by then: by a file that was there
+/// all along, or by one created while the download was running.
+///
+/// Set engine-wide with
+/// [`DownloadEngine::set_file_conflict_policy`](crate::DownloadEngine::set_file_conflict_policy).
+/// Torrents write straight to their final paths and are not affected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
+pub enum FileConflictPolicy {
+    /// Replace the existing file. This is the default, and the only
+    /// behaviour of releases before 0.7.0.
+    #[default]
+    Overwrite = 0,
+    /// Keep the existing file and save the download next to it under the
+    /// first free numbered name: `report.pdf` -> `report (1).pdf`. The
+    /// download's `metadata.filename` reports the name actually used.
+    Rename = 1,
+    /// Keep the existing file and fail the download with a storage error of
+    /// kind `AlreadyExists`. The finished data stays in the `.part` file;
+    /// once the application has moved the conflicting file out of the way,
+    /// `resume()` completes the download (segmented downloads only rename;
+    /// single-connection downloads fetch the file again).
+    Fail = 2,
+}
+
+impl FileConflictPolicy {
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Rename,
+            2 => Self::Fail,
+            _ => Self::Overwrite,
+        }
+    }
+}
+
 /// Priority levels for downloads
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,

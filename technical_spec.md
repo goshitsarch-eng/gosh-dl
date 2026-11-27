@@ -2,7 +2,7 @@
 
 A native Rust download engine supporting HTTP/HTTPS and BitTorrent protocols.
 
-Current implementation reference: **0.6.2**, requiring Rust **1.85+**.
+Current implementation reference: **0.7.0**, requiring Rust **1.89+**.
 See [ROLLOUT.md](ROLLOUT.md) for validation scope and remaining feature limits.
 
 ---
@@ -239,7 +239,7 @@ impl DownloadEngine {
 | HTTP pause / cancel (0.6.4) | Every wait on the HTTP path (probes, sends, body chunks, limiter debt, back-off) is cancellable. `pause` and `cancel` drain the worker (10 s bound; a straggler is re-awaited before the next lifecycle action) before returning or deleting files. |
 | Torrent stop (0.6.4) | `TorrentDownloader::stop()` aborts outbound and inbound peer tasks in addition to discovery tasks, so no peer can write a piece after cancel-with-delete. |
 | `resume` from `Error` (0.6.4) | Accepted for HTTP (uses the segments saved on failure) and torrents (reconstructs the worker). `resume_all` only resumes `Paused`. |
-| `cancel(id, true)` (0.6.4) | Re-validates the output name. HTTP: removes the `.part`, and the final file only if the download completed; never recurses into a directory. Torrent: removes the torrent's file/directory; a metadata-less magnet deletes nothing. |
+| `cancel(id, true)` (0.6.4) | Re-validates the output name. HTTP: removes the `.part`, and the final file only if the download completed; never recurses into a directory. Torrent: removes the torrent's file/directory; a metadata-less magnet deletes nothing. Since 0.7.0 a multi-file torrent's directory is not removed wholesale: only the files listed in the metainfo, then the directories left empty. |
 | After `shutdown()` (0.6.4) | `add_*` and `resume` return `EngineError::Shutdown`. |
 
 `DownloadReader::total_size()` is a snapshot at open time and can be `None`.
@@ -1337,6 +1337,35 @@ pub enum AllocationMode {
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+## Deep-dive audit (0.7.0)
+
+See the 0.7.0 changelog entry for the full list. Behavioural rules added:
+
+- **Probing.** Capabilities are probed with `HEAD`, then with
+  `GET` + `Range: bytes=0-0` if `HEAD` is refused; a `206` with
+  `Content-Range: bytes 0-0/<total>` establishes range support and size.
+- **Retries.** Both HTTP paths retry failed sends and `408`/`429`/`5xx` with
+  back-off. A `416` on a single-connection resume restarts from byte 0.
+- **Finishing.** `.part` -> final rename goes through `FileConflictPolicy`
+  (`Overwrite` default, `Rename`, `Fail`); for the latter two the name is
+  claimed atomically with `create_new` before the rename.
+- **Writes.** Every file write on a data path is followed by a flush before
+  progress is recorded, because tokio reports a failed write on the next
+  operation. A torrent write failure is stored on the `PieceManager` and
+  turns into a download failure on the peer loop's next tick.
+- **Saved segments** are only restored if they tile `[0, total_size)`
+  exactly.
+- **Persistence.** After a background snapshot save the live state is
+  re-checked: a removed download is deleted again, a no-longer-active one is
+  re-saved.
+- **`resume()`** claims the download for the duration of the call; an
+  overlapping call fails with `InvalidState`.
+- **Peers.** Completed pieces are announced with `Have`; receive state
+  survives a timeout mid-message; block reservations are released on choke,
+  reject, and disconnect; endgame only considers wanted pieces.
+- **Deleting torrent data** removes the metainfo's files and then empty
+  directories, never a directory tree.
 
 ## Audit hardening (0.6.4)
 

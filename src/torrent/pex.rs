@@ -27,6 +27,9 @@ pub const PEX_EXTENSION_NAME: &str = "ut_pex";
 /// well-behaved clients.
 const MAX_PEERS_PER_LIST: usize = 100;
 
+/// Maximum peers we put in one outgoing `added` / `dropped` list (BEP 11).
+const MAX_PEERS_PER_SEND: usize = 50;
+
 /// PEX flag bits for the added.f field.
 pub mod flags {
     /// Peer prefers encrypted connections.
@@ -273,8 +276,10 @@ fn encode_compact_peers_v6(peers: &[&SocketAddr]) -> Vec<u8> {
 pub struct PexState {
     /// Peers we've previously shared with this peer.
     shared_peers: HashSet<SocketAddr>,
-    /// Last time we sent a PEX message.
-    last_send: Instant,
+    /// Last time we sent a PEX message (`None` = never, so the first send is
+    /// allowed immediately; a timestamp "two minutes ago" would panic when
+    /// the monotonic clock is younger than that, i.e. right after boot).
+    last_send: Option<Instant>,
     /// Minimum interval between PEX messages.
     min_interval: Duration,
     /// Our extension ID for ut_pex (what the remote peer should use).
@@ -292,7 +297,7 @@ impl PexState {
         Self {
             shared_peers: HashSet::new(),
             // Allow immediate first send
-            last_send: Instant::now() - Duration::from_secs(120),
+            last_send: None,
             min_interval: Duration::from_secs(60),
             our_extension_id,
             peer_extension_id: None,
@@ -311,7 +316,8 @@ impl PexState {
 
     /// Check if enough time has passed to send a new PEX message.
     pub fn can_send(&self) -> bool {
-        self.last_send.elapsed() >= self.min_interval
+        self.last_send
+            .is_none_or(|last| last.elapsed() >= self.min_interval)
     }
 
     /// Build a PEX message with changes since last send.
@@ -322,14 +328,17 @@ impl PexState {
             return None;
         }
 
-        // Calculate diff
+        // Calculate diff. BEP 11 allows at most 50 added and 50 dropped
+        // peers per message; the rest go out with the next one.
         let added: Vec<_> = current_peers
             .difference(&self.shared_peers)
+            .take(MAX_PEERS_PER_SEND)
             .cloned()
             .collect();
         let dropped: Vec<_> = self
             .shared_peers
             .difference(current_peers)
+            .take(MAX_PEERS_PER_SEND)
             .cloned()
             .collect();
 
@@ -337,9 +346,14 @@ impl PexState {
             return None;
         }
 
-        // Update state
-        self.shared_peers = current_peers.clone();
-        self.last_send = Instant::now();
+        // Update state with exactly what this message carries
+        for peer in &added {
+            self.shared_peers.insert(*peer);
+        }
+        for peer in &dropped {
+            self.shared_peers.remove(peer);
+        }
+        self.last_send = Some(Instant::now());
 
         // Separate by IP version
         let (v4_added, v6_added): (Vec<_>, Vec<_>) = added.into_iter().partition(|a| a.is_ipv4());
@@ -373,7 +387,7 @@ impl PexState {
     /// Reset state (e.g., after reconnection).
     pub fn reset(&mut self) {
         self.shared_peers.clear();
-        self.last_send = Instant::now() - Duration::from_secs(120);
+        self.last_send = None;
     }
 }
 

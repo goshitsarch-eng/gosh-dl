@@ -72,8 +72,8 @@ pub use error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result, Storag
 pub use protocol::{ProtocolError, ProtocolResult};
 pub use types::{
     DownloadEvent, DownloadId, DownloadKind, DownloadMetadata, DownloadOptions, DownloadProgress,
-    DownloadState, DownloadStatus, GlobalStats, PeerInfo, TorrentFile, TorrentInfo,
-    TorrentStatusInfo,
+    DownloadState, DownloadStatus, FileConflictPolicy, GlobalStats, PeerInfo, TorrentFile,
+    TorrentInfo, TorrentStatusInfo,
 };
 
 #[cfg(feature = "recursive-http")]

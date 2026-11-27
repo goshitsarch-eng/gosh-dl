@@ -60,6 +60,10 @@ struct ManagedDownload {
     /// Lifetime torrent transfer totals restored from storage, consumed when
     /// the torrent (re)starts.
     restored_totals: Option<(u64, u64)>,
+    /// Set while a `resume()` call is rebuilding this download's worker, so
+    /// a second concurrent `resume()` cannot start another one on the same
+    /// files.
+    resuming: bool,
     /// Cached HTTP segment state for in-memory pause/resume (no storage needed)
     #[cfg(feature = "http")]
     cached_segments: Option<Vec<Segment>>,
@@ -586,9 +590,48 @@ impl DownloadEngine {
                     );
                 }
             }
+
+            self.reconcile_stale_snapshot(storage, status.id).await;
         }
 
         Ok(())
+    }
+
+    /// Undo a snapshot save that lost a race with a lifecycle change.
+    ///
+    /// Background saves write a status captured earlier. If the download was
+    /// cancelled, completed, failed, or paused while that write was in
+    /// flight, the stale "active" record lands *after* the authoritative
+    /// one: a cancelled download would come back after a restart, and a
+    /// completed one would be restored as paused. Re-checking after the
+    /// write and repairing the record closes that window, because any later
+    /// lifecycle save is issued after this point and therefore lands last.
+    async fn reconcile_stale_snapshot(&self, storage: &Arc<dyn Storage>, id: DownloadId) {
+        let current = {
+            let downloads = self.downloads.read();
+            downloads.get(&id).map(|d| d.status.clone())
+        };
+        match current {
+            None => {
+                if let Err(e) = storage.delete_segments(id).await {
+                    tracing::debug!("Failed to drop segments of removed download {}: {}", id, e);
+                }
+                if let Err(e) = storage.delete_download(id).await {
+                    tracing::debug!("Failed to drop record of removed download {}: {}", id, e);
+                }
+            }
+            Some(status) if !status.state.is_active() => {
+                if let Err(e) = storage.save_download(&status).await {
+                    tracing::debug!("Failed to re-persist download {}: {}", id, e);
+                }
+                if status.state == DownloadState::Completed {
+                    if let Err(e) = storage.delete_segments(id).await {
+                        tracing::debug!("Failed to drop segments of completed {}: {}", id, e);
+                    }
+                }
+            }
+            Some(_) => {}
+        }
     }
 
     /// Load persisted downloads from database on startup.
@@ -719,6 +762,7 @@ impl DownloadEngine {
                     #[cfg(feature = "torrent")]
                     cached_torrent_data: None,
                     restored_totals,
+                    resuming: false,
                     #[cfg(feature = "http")]
                     cached_segments,
                     #[cfg(feature = "http")]
@@ -961,6 +1005,7 @@ impl DownloadEngine {
                     #[cfg(feature = "torrent")]
                     cached_torrent_data: None,
                     restored_totals: None,
+                    resuming: false,
                     #[cfg(feature = "http")]
                     cached_segments: None,
                     #[cfg(feature = "http")]
@@ -1014,8 +1059,15 @@ impl DownloadEngine {
 
         // Start the download (no saved segments for new downloads)
         if !options.start_paused {
-            self.start_download(id, url.to_string(), options, None)
-                .await?;
+            if let Err(e) = self
+                .start_download(id, url.to_string(), options, None)
+                .await
+            {
+                // The caller never learns this id, so an entry left behind
+                // would sit in `Queued` forever with nothing driving it.
+                let _ = self.cancel(id, false).await;
+                return Err(e);
+            }
         }
 
         Ok(id)
@@ -1643,6 +1695,7 @@ impl DownloadEngine {
                     #[cfg(feature = "torrent")]
                     cached_torrent_data: options.start_paused.then(|| torrent_data.to_vec()),
                     restored_totals: None,
+                    resuming: false,
                     #[cfg(feature = "http")]
                     cached_segments: None,
                     #[cfg(feature = "http")]
@@ -1686,7 +1739,11 @@ impl DownloadEngine {
 
         // Start the torrent download
         if !options.start_paused {
-            self.start_torrent(id, metainfo, save_dir, options).await?;
+            if let Err(e) = self.start_torrent(id, metainfo, save_dir, options).await {
+                // See add_http: don't strand an entry the caller can't reach.
+                let _ = self.cancel(id, false).await;
+                return Err(e);
+            }
         }
 
         Ok(id)
@@ -1762,6 +1819,7 @@ impl DownloadEngine {
                     #[cfg(feature = "torrent")]
                     cached_torrent_data: None,
                     restored_totals: None,
+                    resuming: false,
                     #[cfg(feature = "http")]
                     cached_segments: None,
                     #[cfg(feature = "http")]
@@ -1801,7 +1859,11 @@ impl DownloadEngine {
 
         // Start the magnet download
         if !options.start_paused {
-            self.start_magnet(id, magnet, save_dir, options).await?;
+            if let Err(e) = self.start_magnet(id, magnet, save_dir, options).await {
+                // See add_http: don't strand an entry the caller can't reach.
+                let _ = self.cancel(id, false).await;
+                return Err(e);
+            }
         }
 
         Ok(id)
@@ -2542,6 +2604,19 @@ impl DownloadEngine {
                 match attempt_result {
                     Ok(result) => break Ok(result),
                     Err(err) => {
+                        // A pause or cancel is not a mirror failure: don't
+                        // burn through (and blacklist) the remaining mirrors.
+                        if cancel_token_clone.is_cancelled() {
+                            break Err(err);
+                        }
+                        // Nor is a local problem (disk, name conflict,
+                        // invalid name): another mirror can't fix it.
+                        if matches!(
+                            err,
+                            EngineError::Storage { .. } | EngineError::InvalidInput { .. }
+                        ) {
+                            break Err(err);
+                        }
                         if let Some(next_url) = mirror_manager.failover_from(&attempt_url) {
                             if next_url != attempt_url {
                                 tracing::warn!(
@@ -2829,9 +2904,9 @@ impl DownloadEngine {
         // Get download info and determine type
         #[allow(unused_variables)]
         let (kind, url, options, has_torrent_handle) = {
-            let downloads = self.downloads.read();
+            let mut downloads = self.downloads.write();
             let download = downloads
-                .get(&id)
+                .get_mut(&id)
                 .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
 
             // Check if can be resumed (retrying a failure is a resume too)
@@ -2844,6 +2919,18 @@ impl DownloadEngine {
                     current_state: format!("{:?}", download.status.state),
                 });
             }
+
+            // Claim the download: the state only changes once the new worker
+            // is being built (after awaits below), so without this two
+            // overlapping resume() calls would both pass the check above and
+            // start two workers writing the same files.
+            if download.resuming {
+                return Err(EngineError::InvalidState {
+                    action: "resume",
+                    current_state: "resume already in progress".to_string(),
+                });
+            }
+            download.resuming = true;
 
             #[cfg(feature = "torrent")]
             let has_torrent_handle = matches!(download.handle, Some(DownloadHandle::Torrent(_)));
@@ -2879,6 +2966,21 @@ impl DownloadEngine {
                 has_torrent_handle,
             )
         };
+
+        // Released on every exit path, including an early `?` return and the
+        // caller dropping this future mid-await.
+        struct ResumeClaim<'a> {
+            engine: &'a DownloadEngine,
+            id: DownloadId,
+        }
+        impl Drop for ResumeClaim<'_> {
+            fn drop(&mut self) {
+                if let Some(download) = self.engine.downloads.write().get_mut(&self.id) {
+                    download.resuming = false;
+                }
+            }
+        }
+        let _claim = ResumeClaim { engine: self, id };
 
         #[allow(unreachable_code)]
         {
@@ -3032,11 +3134,36 @@ impl DownloadEngine {
     /// recreate the files afterwards. Torrents that never received metadata
     /// have no output name and nothing on disk, so nothing is deleted.
     pub async fn cancel(&self, id: DownloadId, delete_files: bool) -> Result<()> {
+        #[cfg(feature = "torrent")]
+        let mut torrent_files: Option<Vec<std::path::PathBuf>> = None;
+        #[cfg(feature = "torrent")]
+        let mut cached_torrent_data: Option<Vec<u8>> = None;
         let (handle, save_path, recursive_group_id, pending_http) = {
             let mut downloads = self.downloads.write();
             let download = downloads
                 .remove(&id)
                 .ok_or_else(|| EngineError::NotFound(id.to_string()))?;
+
+            // Deleting a torrent's data needs its file list; capture it
+            // while the entry (and its handle) are still at hand.
+            #[cfg(feature = "torrent")]
+            if delete_files && download.status.kind != crate::types::DownloadKind::Http {
+                torrent_files = match &download.handle {
+                    Some(DownloadHandle::Torrent(h)) => h
+                        .downloader
+                        .metainfo()
+                        .map(|m| m.info.files.iter().map(|f| f.path.clone()).collect()),
+                    _ => None,
+                }
+                .or_else(|| {
+                    download
+                        .status
+                        .torrent_info
+                        .as_ref()
+                        .map(|info| info.files.iter().map(|f| f.path.clone()).collect())
+                });
+                cached_torrent_data = download.cached_torrent_data.clone();
+            }
 
             let save_path = if delete_files {
                 // HTTP downloads always carry a name ("download" is the
@@ -3125,13 +3252,31 @@ impl DownloadEngine {
         // Delete files and segments if requested
         if let Some((path, is_torrent, completed)) = save_path {
             if is_torrent {
-                // Torrent data is written straight to its final paths: a
-                // directory for multi-file torrents, a file otherwise.
-                if path.is_dir() {
-                    tokio::fs::remove_dir_all(&path).await.ok();
-                } else if path.is_file() {
-                    tokio::fs::remove_file(&path).await.ok();
+                #[cfg(feature = "torrent")]
+                {
+                    // Fall back to the persisted metainfo (a restored
+                    // download that was never resumed has no live handle).
+                    if torrent_files.is_none() {
+                        let data = match cached_torrent_data {
+                            Some(data) => Some(data),
+                            None => match &self.storage {
+                                Some(storage) => storage.load_torrent_data(id).await.ok().flatten(),
+                                None => None,
+                            },
+                        };
+                        torrent_files =
+                            data.and_then(|data| Metainfo::parse(&data).ok()).map(|m| {
+                                m.info
+                                    .files
+                                    .iter()
+                                    .map(|f| f.path.clone())
+                                    .collect::<Vec<_>>()
+                            });
+                    }
+                    Self::delete_torrent_output(id, &path, torrent_files.as_deref()).await;
                 }
+                #[cfg(not(feature = "torrent"))]
+                let _ = &path;
             } else {
                 // HTTP: the final path is only ours once the download
                 // completed (the `.part` is renamed onto it). Before that an
@@ -3172,6 +3317,71 @@ impl DownloadEngine {
         self.remove_recursive_group_member(recursive_group_id, id);
 
         Ok(())
+    }
+
+    /// Delete the files a torrent wrote under `root` (`save_dir/name`).
+    ///
+    /// A single-file torrent's root is the file itself. A multi-file
+    /// torrent's root is a directory, and only the files listed in the
+    /// metainfo are removed, followed by whatever directories that leaves
+    /// empty. The directory is never removed wholesale: a torrent can be
+    /// named after a folder the user already had (`Documents`, `Music`),
+    /// and everything else in it must survive.
+    #[cfg(feature = "torrent")]
+    async fn delete_torrent_output(
+        id: DownloadId,
+        root: &std::path::Path,
+        files: Option<&[std::path::PathBuf]>,
+    ) {
+        let Ok(meta) = tokio::fs::symlink_metadata(root).await else {
+            return; // nothing on disk
+        };
+        if meta.is_file() {
+            tokio::fs::remove_file(root).await.ok();
+            return;
+        }
+        if !meta.is_dir() {
+            // A symlink (or something stranger) sharing the torrent's name
+            // was not created by us.
+            return;
+        }
+        let Some(files) = files else {
+            tracing::warn!(
+                "Not deleting {:?} for {}: the torrent's file list is unavailable",
+                root,
+                id
+            );
+            return;
+        };
+
+        let mut dirs: std::collections::BTreeSet<std::path::PathBuf> =
+            std::collections::BTreeSet::new();
+        for relative in files {
+            if crate::fsutil::check_relative_path(relative).is_err() {
+                continue;
+            }
+            let file_path = root.join(relative);
+            tokio::fs::remove_file(&file_path).await.ok();
+            let mut dir = file_path.parent();
+            while let Some(d) = dir {
+                if !d.starts_with(root) {
+                    break;
+                }
+                dirs.insert(d.to_path_buf());
+                if d == root {
+                    break;
+                }
+                dir = d.parent();
+            }
+        }
+        dirs.insert(root.to_path_buf());
+        // Deepest first; `remove_dir` refuses non-empty directories, which
+        // is exactly the protection wanted for files that are not ours.
+        let mut dirs: Vec<_> = dirs.into_iter().collect();
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+        for dir in dirs {
+            tokio::fs::remove_dir(&dir).await.ok();
+        }
     }
 
     /// Pause every active or queued download.
@@ -3940,6 +4150,24 @@ impl DownloadEngine {
         Ok(())
     }
 
+    /// Choose what happens when an HTTP download finishes and a file with
+    /// its final name already exists: overwrite it (the default), save
+    /// under a numbered name, or fail and keep the `.part` file. See
+    /// [`FileConflictPolicy`](crate::FileConflictPolicy).
+    ///
+    /// Applies to every download that completes from now on. The setting is
+    /// not persisted; set it again after creating the engine.
+    #[cfg(feature = "http")]
+    pub fn set_file_conflict_policy(&self, policy: crate::types::FileConflictPolicy) {
+        self.http.set_file_conflict_policy(policy);
+    }
+
+    /// The current [`FileConflictPolicy`](crate::FileConflictPolicy).
+    #[cfg(feature = "http")]
+    pub fn file_conflict_policy(&self) -> crate::types::FileConflictPolicy {
+        self.http.file_conflict_policy()
+    }
+
     /// Get current configuration
     pub fn get_config(&self) -> EngineConfig {
         self.config.read().clone()
@@ -3968,9 +4196,14 @@ impl DownloadEngine {
 
         // Persist in background (fire-and-forget)
         if let Some(storage) = self.storage.as_ref().map(Arc::clone) {
+            let engine = self.self_ref.clone();
             tokio::spawn(async move {
                 if let Err(e) = storage.save_download(&status_to_save).await {
                     tracing::debug!("Failed to persist priority change for {}: {}", id, e);
+                }
+                // The snapshot may have raced a cancel or a state change.
+                if let Some(engine) = engine.upgrade() {
+                    engine.reconcile_stale_snapshot(&storage, id).await;
                 }
             });
         }

@@ -116,20 +116,17 @@ impl DhtClient {
             }
         };
 
-        // Collect peers from the DHT lookup.
-        // The get_peers() call performs blocking network I/O, so we run it on a
-        // blocking thread to avoid starving the Tokio runtime.
+        // Collect peers from the DHT lookup through mainline's async API:
+        // batches arrive on a stream as nodes answer, and the stream ends
+        // when the lookup is done.
         // Note: The `mainline` crate only returns IPv4 peers (SocketAddrV4).
         // DHT IPv6 support depends on the upstream crate adding it.
-        let dht = self.dht.clone();
-        let peers: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
-            dht.get_peers(id)
-                .flatten()
-                .map(SocketAddr::V4)
-                .collect::<Vec<_>>()
-        })
-        .await
-        .unwrap_or_default();
+        use futures::StreamExt;
+        let mut batches = Dht::clone(&self.dht).as_async().get_peers(id);
+        let mut peers: Vec<SocketAddr> = Vec::new();
+        while let Some(batch) = batches.next().await {
+            peers.extend(batch.into_iter().map(SocketAddr::V4));
+        }
 
         // Update cache
         if !peers.is_empty() {
@@ -187,13 +184,44 @@ impl DhtClient {
             )
         })?;
 
-        // Announce with our listen port
-        // The mainline crate's announce_peer returns a result we can map
+        // Announce with our listen port. This is mainline's blocking call,
+        // kept for callers on a plain thread; async code should use
+        // `announce_async`.
+        #[allow(deprecated)]
         self.dht
             .announce_peer(id, Some(self.listen_port))
             .map_err(|e| EngineError::protocol(ProtocolErrorKind::DhtError, e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Announce without blocking the async runtime.
+    ///
+    /// [`announce`](Self::announce) waits for the DHT put query to finish,
+    /// which takes seconds on a cold routing table; calling it directly from
+    /// async code stalls a runtime worker (the whole runtime, on a
+    /// current-thread one) for that long.
+    pub async fn announce_async(&self, info_hash: &Sha1Hash) -> Result<()> {
+        if !self.is_running() {
+            return Err(EngineError::protocol(
+                ProtocolErrorKind::DhtError,
+                "DHT client is not running",
+            ));
+        }
+
+        let id = Id::from_bytes(info_hash).map_err(|e| {
+            EngineError::protocol(
+                ProtocolErrorKind::DhtError,
+                format!("Failed to convert info_hash to DHT Id: {}", e),
+            )
+        })?;
+
+        Dht::clone(&self.dht)
+            .as_async()
+            .announce_peer(id, Some(self.listen_port))
+            .await
+            .map(|_| ())
+            .map_err(|e| EngineError::protocol(ProtocolErrorKind::DhtError, e.to_string()))
     }
 
     /// Get cached peers for an info_hash without querying the network.

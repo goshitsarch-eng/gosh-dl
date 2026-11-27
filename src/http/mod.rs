@@ -26,13 +26,13 @@ pub use segment::{calculate_segment_count, probe_server, SegmentedDownload, Serv
 use crate::config::EngineConfig;
 use crate::error::{EngineError, NetworkErrorKind, ProtocolErrorKind, Result, StorageErrorKind};
 use crate::storage::Segment;
-use crate::types::DownloadProgress;
+use crate::types::{DownloadProgress, FileConflictPolicy};
 
 use futures::StreamExt;
 use parking_lot::RwLock;
 use reqwest::{Client, Response};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
@@ -76,6 +76,87 @@ pub(crate) fn partial_path_for(save_path: &Path) -> PathBuf {
     )
 }
 
+/// Most numbered names tried by [`FileConflictPolicy::Rename`].
+const MAX_RENAME_CANDIDATES: u32 = 10_000;
+
+/// `report.pdf` -> `report (2).pdf`; `README` -> `README (2)`.
+fn numbered_sibling(target: &Path, n: u32) -> PathBuf {
+    let stem = target
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = match target.extension() {
+        Some(ext) => format!("{} ({}).{}", stem, n, ext.to_string_lossy()),
+        None => format!("{} ({})", stem, n),
+    };
+    target.with_file_name(name)
+}
+
+/// Move a finished `.part` file onto its final name, honouring the conflict
+/// policy, and return the path actually used.
+///
+/// For `Rename` and `Fail` the name is claimed with `create_new` first, so
+/// "is it free?" and "take it" are one atomic step: a file appearing between
+/// a check and the rename can't be clobbered, and two downloads finishing at
+/// once can't both pick the same numbered name.
+pub(crate) async fn finalize_partial(
+    part: &Path,
+    target: &Path,
+    policy: FileConflictPolicy,
+) -> Result<PathBuf> {
+    let io_error = |path: &Path, what: &str, e: std::io::Error| {
+        EngineError::storage(StorageErrorKind::Io, path, format!("{}: {}", what, e))
+    };
+
+    if policy == FileConflictPolicy::Overwrite {
+        tokio::fs::rename(part, target)
+            .await
+            .map_err(|e| io_error(target, "Failed to rename file", e))?;
+        return Ok(target.to_path_buf());
+    }
+
+    for n in 0..=MAX_RENAME_CANDIDATES {
+        let candidate = if n == 0 {
+            target.to_path_buf()
+        } else {
+            numbered_sibling(target, n)
+        };
+        let claimed = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await;
+        match claimed {
+            Ok(placeholder) => {
+                drop(placeholder);
+                // Replaces the empty placeholder we just created.
+                if let Err(e) = tokio::fs::rename(part, &candidate).await {
+                    tokio::fs::remove_file(&candidate).await.ok();
+                    return Err(io_error(&candidate, "Failed to rename file", e));
+                }
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if policy == FileConflictPolicy::Fail {
+                    return Err(EngineError::storage(
+                        StorageErrorKind::AlreadyExists,
+                        target,
+                        "A file with this name already exists; \
+                         the finished download was left in its .part file",
+                    ));
+                }
+            }
+            Err(e) => return Err(io_error(&candidate, "Failed to create file", e)),
+        }
+    }
+
+    Err(EngineError::storage(
+        StorageErrorKind::AlreadyExists,
+        target,
+        "No free file name found for the finished download",
+    ))
+}
+
 /// Reject filenames that would escape the save directory.
 ///
 /// Filenames can come from untrusted sources (Content-Disposition headers,
@@ -108,6 +189,9 @@ pub struct HttpDownloader {
     pool: Arc<ConnectionPool>,
     config: HttpDownloaderConfig,
     retry_policy: RetryPolicy,
+    /// [`FileConflictPolicy`] as its `u8` discriminant; shared with running
+    /// segmented downloads so a change applies to whatever finishes next.
+    conflict_policy: Arc<AtomicU8>,
 }
 
 /// Configuration for HTTP downloader
@@ -145,12 +229,47 @@ impl HttpDownloader {
                 default_user_agent: config.user_agent.clone(),
             },
             retry_policy,
+            conflict_policy: Arc::new(AtomicU8::new(FileConflictPolicy::default() as u8)),
         })
+    }
+
+    /// Choose what happens when a finished download's name is already taken.
+    /// Applies to every download that completes from now on.
+    pub fn set_file_conflict_policy(&self, policy: FileConflictPolicy) {
+        self.conflict_policy.store(policy as u8, Ordering::Relaxed);
+    }
+
+    /// The current [`FileConflictPolicy`].
+    pub fn file_conflict_policy(&self) -> FileConflictPolicy {
+        FileConflictPolicy::from_u8(self.conflict_policy.load(Ordering::Relaxed))
     }
 
     /// Get the underlying client
     fn client(&self) -> &Client {
         self.pool.client()
+    }
+
+    /// A `GET` for `url` carrying the caller's headers, for the ranged-GET
+    /// capability probe (which adds `Accept-Encoding` and `Range` itself).
+    fn probe_get_request(
+        &self,
+        url: &str,
+        user_agent: &str,
+        referer: Option<&str>,
+        headers: &[(String, String)],
+        cookies: Option<&[String]>,
+    ) -> reqwest::RequestBuilder {
+        let mut request = self.client().get(url).header("User-Agent", user_agent);
+        if let Some(referer) = referer {
+            request = request.header("Referer", referer);
+        }
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        if let Some(cookies) = cookies.filter(|c| !c.is_empty()) {
+            request = request.header("Cookie", cookies.join("; "));
+        }
+        request
     }
 
     /// Get the retry policy
@@ -208,6 +327,7 @@ impl HttpDownloader {
             None,
             None,
             None,
+            None,
             cancel_token,
             progress_callback,
         )
@@ -230,6 +350,9 @@ impl HttpDownloader {
         >,
         validators: Option<SharedValidators>,
         download_limiter: Option<Arc<crate::limiter::RateLimiter>>,
+        // Capabilities the caller has just probed, to avoid asking the
+        // server the same question twice. `None` = probe here.
+        probed: Option<ServerCapabilities>,
         cancel_token: CancellationToken,
         progress_callback: F,
     ) -> Result<PathBuf>
@@ -266,7 +389,9 @@ impl HttpDownloader {
             }
         }
 
-        // Send HEAD request first to get metadata
+        // Probe for metadata: HEAD first, then a one-byte ranged GET for
+        // servers that refuse HEAD (pre-signed GET-only URLs, 405s). The GET
+        // builder already carries every header and `Accept-Encoding`.
         let mut head_request = self.client().head(url).header("User-Agent", ua);
         if let Some(referer) = referer {
             head_request = head_request.header("Referer", referer);
@@ -279,55 +404,42 @@ impl HttpDownloader {
                 head_request = head_request.header("Cookie", cookie_list.join("; "));
             }
         }
-        head_request = head_request.header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY);
-        let head_response = cancellable(&cancel_token, head_request.send()).await?;
+        let probe = match probed {
+            Some(capabilities) => Ok((capabilities, None)),
+            None => {
+                let get_probe = self.probe_get_request(url, ua, referer, headers, cookies);
+                cancellable(
+                    &cancel_token,
+                    segment::probe_with_get_fallback(head_request, get_probe),
+                )
+                .await?
+                .map(|(capabilities, final_url)| (capabilities, Some(final_url)))
+            }
+        };
 
-        let (content_length, supports_range, suggested_filename, etag, last_modified) =
-            match head_response {
-                Ok(resp) if resp.status().is_success() => {
-                    #[cfg(feature = "recursive-http")]
-                    if let Some(scope) = redirect_scope.as_ref() {
-                        crate::http::crawl::validate_redirect_scope(resp.url(), scope)?;
-                    }
-                    let length = resp
-                        .headers()
-                        .get("content-length")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok());
-
-                    let supports_range = resp
-                        .headers()
-                        .get("accept-ranges")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| v.contains("bytes"))
-                        .unwrap_or(false);
-
-                    // Try to get filename from Content-Disposition
-                    let suggested = resp
-                        .headers()
-                        .get("content-disposition")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(parse_content_disposition);
-
-                    let etag = resp
-                        .headers()
-                        .get("etag")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-
-                    let last_modified = resp
-                        .headers()
-                        .get("last-modified")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-
-                    (length, supports_range, suggested, etag, last_modified)
+        let (content_length, supports_range, suggested_filename, etag, last_modified) = match probe
+        {
+            Ok((capabilities, _final_url)) => {
+                #[cfg(feature = "recursive-http")]
+                if let (Some(scope), Some(final_url)) =
+                    (redirect_scope.as_ref(), _final_url.as_ref())
+                {
+                    crate::http::crawl::validate_redirect_scope(final_url, scope)?;
                 }
-                _ => {
-                    // HEAD failed, we'll get metadata from GET response
-                    (None, false, None, None, None)
-                }
-            };
+                (
+                    capabilities.content_length,
+                    capabilities.supports_range,
+                    capabilities.suggested_filename,
+                    capabilities.etag,
+                    capabilities.last_modified,
+                )
+            }
+            Err(err) => {
+                // Neither probe worked; the download's own GET decides.
+                tracing::debug!("Probing {} failed ({}); downloading unprobed", url, err);
+                (None, false, None, None, None)
+            }
+        };
 
         // Publish the server's current validators so the caller can persist
         // them for the next session. (On HEAD failure both stay None; the
@@ -441,8 +553,30 @@ impl HttpDownloader {
                 }
             }
 
-            // Send the request
-            let response = cancellable(&cancel_token, attempt_request.send()).await??;
+            // Send the request. A failed send or a transient status (408,
+            // 429, 5xx) is retried with the same back-off as a mid-stream
+            // failure; the segmented path already did this, so only small or
+            // non-range downloads used to fail on the first hiccup.
+            let response = match cancellable(&cancel_token, attempt_request.send()).await? {
+                Ok(response) => response,
+                Err(e) => {
+                    let err = EngineError::from(e);
+                    if self.retry_policy.should_retry(stream_attempt, &err) {
+                        stream_attempt += 1;
+                        let delay = self.retry_policy.delay_for_attempt(stream_attempt - 1);
+                        tracing::warn!(
+                            "Request for {} failed (attempt {}/{}), retrying: {}",
+                            url,
+                            stream_attempt,
+                            self.retry_policy.max_attempts,
+                            err
+                        );
+                        cancellable(&cancel_token, tokio::time::sleep(delay)).await?;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
             #[cfg(feature = "recursive-http")]
             if let Some(scope) = redirect_scope.as_ref() {
                 crate::http::crawl::validate_redirect_scope(response.url(), scope)?;
@@ -450,11 +584,38 @@ impl HttpDownloader {
 
             // Check response status
             let status = response.status();
+            if resume_from > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                // The partial file is already as long as (or longer than) the
+                // remote one: it was complete but never renamed, or the
+                // remote file shrank. Either way there is nothing to append;
+                // restart from byte 0 instead of failing on every resume.
+                tracing::warn!(
+                    "HTTP resume for {} from byte {} was rejected with 416. Restarting from byte 0.",
+                    url,
+                    resume_from
+                );
+                allow_resume = false;
+                continue;
+            }
             if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-                return Err(EngineError::network(
+                let err = EngineError::network(
                     NetworkErrorKind::HttpStatus(status.as_u16()),
                     format!("HTTP error: {}", status),
-                ));
+                );
+                if self.retry_policy.should_retry(stream_attempt, &err) {
+                    stream_attempt += 1;
+                    let delay = self.retry_policy.delay_for_attempt(stream_attempt - 1);
+                    tracing::warn!(
+                        "{} returned {} (attempt {}/{}), retrying",
+                        url,
+                        status,
+                        stream_attempt,
+                        self.retry_policy.max_attempts
+                    );
+                    cancellable(&cancel_token, tokio::time::sleep(delay)).await?;
+                    continue;
+                }
+                return Err(err);
             }
 
             if resume_from > 0 {
@@ -593,17 +754,11 @@ impl HttpDownloader {
                     }
 
                     // Rename .part file to final name
-                    tokio::fs::rename(&part_path, &save_path)
-                        .await
-                        .map_err(|e| {
-                            EngineError::storage(
-                                StorageErrorKind::Io,
-                                &save_path,
-                                format!("Failed to rename file: {}", e),
-                            )
-                        })?;
+                    let final_path =
+                        finalize_partial(&part_path, &save_path, self.file_conflict_policy())
+                            .await?;
 
-                    return Ok(save_path);
+                    return Ok(final_path);
                 }
                 Err(e) => {
                     // Keep .part file for potential resume
@@ -865,18 +1020,23 @@ impl HttpDownloader {
         if let Some(cookies) = cookies.filter(|c| !c.is_empty()) {
             probe = probe.header("Cookie", cookies.join("; "));
         }
-        let capabilities = cancellable(&cancel_token, segment::probe_request(probe))
-            .await?
-            .unwrap_or_else(|err| {
-                tracing::debug!("HEAD probe failed for {} ({}); trying GET", url, err);
-                ServerCapabilities {
-                    content_length: None,
-                    supports_range: false,
-                    etag: None,
-                    last_modified: None,
-                    suggested_filename: None,
-                }
-            });
+        let get_probe = self.probe_get_request(url, ua, referer, headers, cookies);
+        let probed = cancellable(
+            &cancel_token,
+            segment::probe_with_get_fallback(probe, get_probe),
+        )
+        .await?
+        .map(|(capabilities, _)| capabilities);
+        let capabilities = probed.unwrap_or_else(|err| {
+            tracing::debug!("Probing {} failed ({}); downloading unprobed", url, err);
+            ServerCapabilities {
+                content_length: None,
+                supports_range: false,
+                etag: None,
+                last_modified: None,
+                suggested_filename: None,
+            }
+        });
 
         // NOTE: the shared cell must keep the *saved* validators until the
         // segmented-vs-single decision below — the single-connection fallback
@@ -956,6 +1116,8 @@ impl HttpDownloader {
                 capabilities.last_modified,
             );
 
+            download.set_file_conflict_policy(Arc::clone(&self.conflict_policy));
+
             // Stripe segments across mirrors when more than one URL exists.
             if let Some(mirrors) = mirror_manager {
                 if mirrors.available_count() > 1 {
@@ -971,6 +1133,20 @@ impl HttpDownloader {
                 .await
                 .unwrap_or(false);
             match saved_segments {
+                Some(segments)
+                    if part_exists && !segment::segments_cover(&segments, total_size) =>
+                {
+                    // Without validators (no ETag / Last-Modified) a changed
+                    // remote size is only visible here. Segments laid out
+                    // for another size can never add up to this one, so
+                    // resuming them would fail the same way on every retry.
+                    tracing::warn!(
+                        "Saved segments for {} do not match the current size ({} bytes); restarting",
+                        url,
+                        total_size
+                    );
+                    download.init_segments(max_connections, min_segment_size);
+                }
                 Some(segments) if part_exists => {
                     tracing::debug!("Restoring {} saved segments", segments.len());
                     download.restore_segments(segments);
@@ -1057,6 +1233,8 @@ impl HttpDownloader {
                             redirect_scope,
                             validators,
                             download_limiter.clone(),
+                            // Ranges just misbehaved: probe afresh.
+                            None,
                             cancel_token,
                             {
                                 let progress_callback = Arc::clone(&progress_callback);
@@ -1068,6 +1246,10 @@ impl HttpDownloader {
                 }
                 return Err(err);
             }
+
+            // The name actually used (differs from `save_path` when the
+            // conflict policy renamed the file).
+            let save_path = download_ref.final_path();
 
             // Verify checksum if provided
             if let Some(expected) = checksum {
@@ -1096,6 +1278,9 @@ impl HttpDownloader {
                     redirect_scope,
                     validators,
                     download_limiter,
+                    // Already probed above (a failed probe included: asking
+                    // again would only repeat the same refused requests).
+                    Some(capabilities),
                     cancel_token,
                     {
                         let progress_callback = Arc::clone(&progress_callback);

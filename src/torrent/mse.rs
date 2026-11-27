@@ -392,7 +392,11 @@ pub async fn mse_handshake_outgoing(
     let key_pair = DhKeyPair::generate();
 
     // Step 1: Send Ya + random padding
-    let padding_len = rand::rng().random_range(config.min_padding..=config.max_padding);
+    // Clamp rather than trust the caller: an inverted range would panic
+    // and the protocol allows at most 512 bytes of padding.
+    let max_padding = config.max_padding.min(512);
+    let min_padding = config.min_padding.min(max_padding);
+    let padding_len = rand::rng().random_range(min_padding..=max_padding);
     let mut padding = vec![0u8; padding_len];
     rand::RngExt::fill(&mut rand::rng(), &mut padding[..]);
 
@@ -478,8 +482,17 @@ pub async fn mse_handshake_outgoing(
     if config.allow_rc4 {
         crypto_provide |= CRYPTO_RC4;
     }
-    if config.allow_plaintext {
+    // With encryption *required*, never offer the plaintext method: the peer
+    // would be free to select it and the "encrypted" stream would carry the
+    // payload in the clear.
+    if config.allow_plaintext && config.policy != EncryptionPolicy::Required {
         crypto_provide |= CRYPTO_PLAINTEXT;
+    }
+    if crypto_provide == 0 {
+        return MseHandshakeResult::Failed(EngineError::protocol(
+            ProtocolErrorKind::PeerProtocol,
+            "No acceptable encryption method is enabled",
+        ));
     }
 
     // Create encryption keys for the encrypted part
@@ -535,6 +548,18 @@ pub async fn mse_handshake_outgoing(
 
     match receive_crypto_response(&mut stream, decrypt_cipher, config).await {
         Ok((crypto_method, final_decrypt)) => {
+            // The peer must pick exactly one method, and one we offered.
+            // Anything else (zero, several bits, an unoffered method) would
+            // otherwise be treated as "not RC4" and silently run plaintext.
+            if crypto_method.count_ones() != 1 || crypto_method & crypto_provide == 0 {
+                return MseHandshakeResult::Failed(EngineError::protocol(
+                    ProtocolErrorKind::PeerProtocol,
+                    format!(
+                        "Peer selected crypto method {:#x}, offered {:#x}",
+                        crypto_method, crypto_provide
+                    ),
+                ));
+            }
             // Reuse encrypt_cipher from step 4: its state has advanced past
             // the handshake payload. A fresh cipher would desync with the peer.
             MseHandshakeResult::Encrypted(Box::new(EncryptedStream::new(

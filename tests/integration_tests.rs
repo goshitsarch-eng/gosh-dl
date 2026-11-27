@@ -2421,7 +2421,10 @@ async fn test_download_500_error() {
         .mount(&mock_server)
         .await;
 
-    let engine = create_test_engine(&temp_dir).await;
+    // A 500 is transient, so the single-connection path retries it with
+    // back-off (as the segmented path always did) before giving up. Use a
+    // fast retry schedule so the test doesn't sit through the default one.
+    let engine = create_fast_retry_engine(&temp_dir, 2).await;
     let mut events = engine.subscribe();
 
     let url = format!("{}/server-error.txt", mock_server.uri());
@@ -2430,15 +2433,29 @@ async fn test_download_500_error() {
         .await
         .expect("Failed to add download");
 
-    // Wait for failure (may take longer due to retries)
     let failed = wait_for_event(
         &mut events,
-        |e| matches!(e, DownloadEvent::Failed { id: eid, retryable, .. } if *eid == id),
+        |e| matches!(e, DownloadEvent::Failed { id: eid, retryable, .. } if *eid == id && *retryable),
         Duration::from_secs(30),
     )
     .await;
 
-    assert!(failed.is_some(), "Download should fail with 500");
+    assert!(
+        failed.is_some(),
+        "Download should fail with a retryable 500"
+    );
+
+    // One initial GET plus `max_retries` retries. (The capability probe
+    // also falls back to a one-byte ranged GET when HEAD fails; that one
+    // carries a Range header and is not a download attempt.)
+    let gets = mock_server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && !r.headers.contains_key("range"))
+        .count();
+    assert_eq!(gets, 3, "expected 1 attempt + 2 retries, saw {gets} GETs");
 
     engine.shutdown().await.ok();
 }

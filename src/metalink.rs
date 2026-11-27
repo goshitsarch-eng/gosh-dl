@@ -48,7 +48,7 @@ fn xml_error(err: impl std::fmt::Display) -> EngineError {
 fn file_name_attr(e: &BytesStart<'_>) -> Result<String> {
     for attr in e.attributes() {
         let attr = attr.map_err(xml_error)?;
-        if attr.key.local_name().as_ref() == b"name" {
+        if attr.key.local_name().as_ref() == "name" {
             let name = attr
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(xml_error)?
@@ -65,7 +65,7 @@ fn file_name_attr(e: &BytesStart<'_>) -> Result<String> {
 }
 
 /// Find an attribute by local name, returning its unescaped value.
-fn attr_by_local_name(e: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>> {
+fn attr_by_local_name(e: &BytesStart<'_>, key: &str) -> Result<Option<String>> {
     for attr in e.attributes() {
         let attr = attr.map_err(xml_error)?;
         if attr.key.local_name().as_ref() == key {
@@ -86,13 +86,13 @@ fn read_leaf_text(reader: &mut Reader<&[u8]>) -> Result<String> {
     let mut out = String::new();
     loop {
         match reader.read_event().map_err(xml_error)? {
-            Event::Text(t) => out.push_str(&t.decode().map_err(xml_error)?),
-            Event::CData(t) => out.push_str(&t.decode().map_err(xml_error)?),
+            Event::Text(t) => out.push_str(&t.xml10_content()),
+            Event::CData(t) => out.push_str(&t.xml10_content()),
             Event::GeneralRef(r) => {
                 if let Some(ch) = r.resolve_char_ref().map_err(xml_error)? {
                     out.push(ch);
                 } else {
-                    match r.decode().map_err(xml_error)?.as_ref() {
+                    match r.xml10_content().as_ref() {
                         "amp" => out.push('&'),
                         "lt" => out.push('<'),
                         "gt" => out.push('>'),
@@ -141,16 +141,16 @@ fn parse_file(reader: &mut Reader<&[u8]>, start: &BytesStart<'_>) -> Result<Meta
     loop {
         match reader.read_event().map_err(xml_error)? {
             Event::Start(e) => match e.local_name().as_ref() {
-                b"size" => {
+                "size" => {
                     let text = read_leaf_text(reader)?;
                     size =
                         Some(text.parse::<u64>().map_err(|_| {
                             parse_error(format!("invalid <size> value: {:?}", text))
                         })?);
                 }
-                b"hash" => {
+                "hash" => {
                     let hash_type =
-                        attr_by_local_name(&e, b"type")?.map(|t| t.trim().to_ascii_lowercase());
+                        attr_by_local_name(&e, "type")?.map(|t| t.trim().to_ascii_lowercase());
                     let value = read_leaf_text(reader)?.to_ascii_lowercase();
                     match hash_type.as_deref() {
                         Some("sha-256") | Some("sha256") => {
@@ -165,8 +165,8 @@ fn parse_file(reader: &mut Reader<&[u8]>, start: &BytesStart<'_>) -> Result<Meta
                         _ => {}
                     }
                 }
-                b"url" => {
-                    let priority = attr_by_local_name(&e, b"priority")?
+                "url" => {
+                    let priority = attr_by_local_name(&e, "priority")?
                         .and_then(|p| p.trim().parse::<u64>().ok())
                         .unwrap_or(DEFAULT_URL_PRIORITY);
                     let url = read_leaf_text(reader)?;
@@ -227,11 +227,11 @@ pub fn parse_metalink(xml: &[u8]) -> Result<Vec<MetalinkFile>> {
                     return Err(parse_error("content after </metalink>"));
                 }
                 if !saw_root {
-                    if e.local_name().as_ref() != b"metalink" {
+                    if e.local_name().as_ref() != "metalink" {
                         return Err(parse_error("root element is not <metalink>"));
                     }
                     saw_root = true;
-                } else if e.local_name().as_ref() == b"file" {
+                } else if e.local_name().as_ref() == "file" {
                     files.push(parse_file(&mut reader, &e)?);
                 } else {
                     // <published>, <generator>, <origin>, unknown elements...
@@ -243,12 +243,12 @@ pub fn parse_metalink(xml: &[u8]) -> Result<Vec<MetalinkFile>> {
                     return Err(parse_error("content after </metalink>"));
                 }
                 if !saw_root {
-                    if e.local_name().as_ref() != b"metalink" {
+                    if e.local_name().as_ref() != "metalink" {
                         return Err(parse_error("root element is not <metalink>"));
                     }
                     saw_root = true;
                     closed_root = true;
-                } else if e.local_name().as_ref() == b"file" {
+                } else if e.local_name().as_ref() == "file" {
                     // <file name="..."/> — valid name, but no URLs.
                     files.push(MetalinkFile {
                         name: file_name_attr(&e)?,
@@ -259,7 +259,7 @@ pub fn parse_metalink(xml: &[u8]) -> Result<Vec<MetalinkFile>> {
                 }
             }
             Event::End(_) => closed_root = true,
-            Event::Text(t) if !t.decode().map_err(xml_error)?.trim().is_empty() => {
+            Event::Text(t) if !t.xml10_content().trim().is_empty() => {
                 return Err(parse_error("unexpected text outside a Metalink element"));
             }
             Event::Eof => break,

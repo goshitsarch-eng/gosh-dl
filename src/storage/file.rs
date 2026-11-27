@@ -100,6 +100,11 @@ impl FileStorage {
         {
             let mut file = tokio::fs::File::create(&tmp).await?;
             tokio::io::AsyncWriteExt::write_all(&mut file, bytes).await?;
+            // tokio defers write errors to the next operation, and
+            // `sync_all` swallows them: flush first so a failed write (disk
+            // full) aborts here instead of renaming a truncated record over
+            // the good one.
+            tokio::io::AsyncWriteExt::flush(&mut file).await?;
             // Flush data to disk before the rename: on power loss the rename
             // can survive while unsynced data doesn't, leaving a truncated
             // record at the final path.

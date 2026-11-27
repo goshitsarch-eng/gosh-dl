@@ -579,6 +579,49 @@ impl EngineConfig {
             ));
         }
 
+        // NaN compares false against everything, so the check above lets it
+        // through; a NaN ratio would never be reached and seed forever.
+        if self.seed_ratio.is_nan() {
+            return Err(EngineError::invalid_input("seed_ratio", "Must be a number"));
+        }
+
+        // These drive `tokio::time::interval`, which panics on a zero
+        // period: the torrent task would die silently and the download
+        // would sit in `Downloading` forever.
+        if self.torrent.tick_interval_ms == 0 {
+            return Err(EngineError::invalid_input(
+                "torrent.tick_interval_ms",
+                "Must be at least 1",
+            ));
+        }
+        if self.torrent.connect_interval_secs == 0 {
+            return Err(EngineError::invalid_input(
+                "torrent.connect_interval_secs",
+                "Must be at least 1",
+            ));
+        }
+        if self.torrent.choking_interval_secs == 0 {
+            return Err(EngineError::invalid_input(
+                "torrent.choking_interval_secs",
+                "Must be at least 1",
+            ));
+        }
+
+        // MSE padding is drawn from `min..=max` (an empty range panics) and
+        // the protocol caps each pad at 512 bytes.
+        if self.torrent.encryption.min_padding > self.torrent.encryption.max_padding {
+            return Err(EngineError::invalid_input(
+                "torrent.encryption.min_padding",
+                "Must be <= max_padding",
+            ));
+        }
+        if self.torrent.encryption.max_padding > 512 {
+            return Err(EngineError::invalid_input(
+                "torrent.encryption.max_padding",
+                "Must be at most 512",
+            ));
+        }
+
         // Check port range
         if self.torrent.listen_port_range.0 > self.torrent.listen_port_range.1 {
             return Err(EngineError::invalid_input(

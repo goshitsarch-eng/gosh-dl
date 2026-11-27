@@ -24,7 +24,7 @@ mod types;
 pub use checksum::{ChecksumAlgorithm, ExpectedChecksum};
 pub use error::{ProtocolError, ProtocolResult};
 pub use events::DownloadEvent;
-pub use options::{DownloadOptions, DownloadPriority};
+pub use options::{DownloadOptions, DownloadPriority, FileConflictPolicy};
 #[cfg(feature = "recursive-http")]
 pub use recursive::{
     RecursiveEntry, RecursiveJob, RecursiveJobEvent, RecursiveJobProgress, RecursiveJobState,

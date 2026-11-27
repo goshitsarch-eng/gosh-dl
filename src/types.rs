@@ -23,6 +23,7 @@ pub use crate::protocol::{
     DownloadState,
     DownloadStatus,
     ExpectedChecksum,
+    FileConflictPolicy,
     GlobalStats,
     // Torrent types
     PeerInfo,

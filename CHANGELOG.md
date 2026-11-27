@@ -7,6 +7,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-26
+
+Deep-dive audit of the whole engine, plus issues #20 and #21. The defects
+below are covered by new tests in `tests/deep_dive_regressions.rs`,
+`tests/deep_dive_torrent_regressions.rs`, and the affected modules; each
+integration test was confirmed to fail against 0.6.4 before the fix.
+
+0.6.4 was never tagged or published to crates.io, so for users of the
+published crate this release also contains everything listed under 0.6.4
+below.
+
+### Security
+- `cancel(id, true)` on a multi-file torrent ran `remove_dir_all` on
+  `<save_dir>/<torrent name>`. A torrent named after a directory that already
+  existed took every other file in it along. Only the files listed in the
+  torrent are removed now, followed by the directories that leaves empty.
+- `rusqlite` 0.43 / `libsqlite3-sys` 0.40 for the bundled-SQLite advisory
+  RUSTSEC-2026-0459. This raises the minimum supported Rust version to 1.89.
+- With `EncryptionPolicy::Required` the MSE handshake still offered the
+  plaintext method, and any `crypto_select` that was not RC4 (including
+  values that were never offered) was treated as plaintext. Plaintext is no
+  longer offered when encryption is required and the selection is validated.
+- Hardened untrusted input: HTTP tracker responses are capped at 2 MiB; a web
+  seed that ignores `Range` is refused for resources over 32 MiB instead of
+  being buffered whole, once per piece; the known-peer set is capped at 5000
+  addresses; PEX only relays peers we dialed and are connected to, at most
+  50 per message.
+
+### Added
+- `DownloadEngine::set_file_conflict_policy` with `FileConflictPolicy`
+  (`Overwrite`, `Rename`, `Fail`) controls what happens when a finished HTTP
+  download's name is already taken (#21). The default is unchanged
+  (`Overwrite`). `Rename` saves as `name (1).ext`; `Fail` keeps the data in
+  the `.part` file and reports a storage error of kind `AlreadyExists`, after
+  which `resume()` completes the download.
+- `DhtClient::announce_async`, which does not block the async runtime.
+
+### Changed
+- Minimum supported Rust version is 1.89 (was 1.85).
+- Dependencies: `rusqlite` 0.43, `mainline` 8, `sha1`/`sha2`/`md-5` 0.11,
+  `base64` 0.23, `dirs` 7, `num-bigint` 0.5, `quick-xml` 0.42, `scraper`
+  0.29, `tokio-tungstenite` 0.30, and all compatible updates. `parking_lot`
+  stays on 0.12 (0.13 requires Rust 1.95).
+- Capability probing falls back from `HEAD` to `GET` + `Range: bytes=0-0`
+  when `HEAD` is refused (#20). URLs that answer `GET` only, such as
+  pre-signed S3-style URLs, now get multi-connection downloads and resume
+  instead of a single connection that restarted from byte 0 every time.
+- The single-connection HTTP path retries failed requests and transient
+  statuses (`408`, `429`, `5xx`) with back-off, as the segmented path already
+  did. Requests that die on an established connection without a response are
+  classified as retryable instead of aborting every segment.
+- A segment's retry budget starts over once it has made progress, so a long
+  transfer is no longer limited to `max_retries` interruptions in total.
+- Tracker announces run concurrently; dead trackers no longer delay the start
+  of a torrent by the sum of their timeouts.
+- An empty DHT lookup is retried after 15s (backing off) rather than after
+  five minutes.
+- The bencode parser accepts dictionaries with unsorted keys, as sent by many
+  trackers; duplicate keys are still rejected.
+- Zero-valued `tick_interval_ms`, `connect_interval_secs` and
+  `choking_interval_secs`, an inverted or oversized MSE padding range, and a
+  NaN `seed_ratio` are rejected by `EngineConfig::validate`.
+
+### Fixed
+- Disk-write errors could be lost. tokio reports a failed file write on the
+  next operation, and several paths dropped or synced the file first:
+  torrent pieces were recorded as stored when the write had failed (disk
+  full), segmented HTTP progress was advanced past a failed write and left a
+  hole after resume, and `FileStorage` could rename a truncated record over
+  a good one.
+- A torrent piece that could not be written stayed in the pending set
+  forever and the torrent hung in `Downloading`. The piece is released, and
+  an unwritable output now fails the download with a `Failed` event.
+- Resuming a single-connection download whose `.part` file was already
+  complete got `416` and failed on every attempt; it restarts from byte 0.
+- A segment body longer than its range was written before it was checked and
+  overwrote the next segment's data.
+- Saved segments were resumed without checking that they match the current
+  file size; a changed remote file without validators failed on every retry.
+- A snapshot written by the periodic persistence task could land after a
+  cancel, completion, or pause and overwrite the newer record: cancelled
+  downloads reappeared after a restart and completed ones were restored as
+  paused.
+- Two overlapping `resume()` calls could both start a worker; for torrents
+  restored from storage that meant two downloaders on the same files.
+- A failed `add_http` / `add_torrent` / `add_magnet` start left an entry in
+  `Queued` that the caller had no id for.
+- `Have` messages were never sent, so peers only knew the pieces we held at
+  connect time.
+- A receive timeout in the middle of a peer message discarded the bytes
+  already read and desynchronised the stream (permanently, with RC4).
+- The connected-peer count leaked when a peer dropped right after the
+  handshake, eventually refusing all inbound connections at `max_peers`.
+- Blocks requested from a peer that then choked us or disconnected stayed
+  reserved until the whole piece timed out and was discarded.
+- Endgame mode ignored file selection and downloaded pieces of deselected
+  files whenever ten or fewer pieces were missing overall.
+- UDP trackers were unreachable when the resolver returned an IPv6 address
+  first; DNS resolution for UDP trackers is now bounded as well.
+- Local Peer Discovery discarded every LAN peer that listened on the same
+  port as this client; own announcements are recognised by a BEP 14 cookie.
+- `ChokingManager::new` and `PexState::new` panicked when the system had
+  been up for less than a minute or two (`Instant` subtraction).
+- Magnet metadata was re-encoded before being stored, which changed the
+  info-hash of a non-canonical info dict.
+- A piece completed by a peer and a web seed at the same time was counted
+  twice.
+- Mirror failover also ran on pause/cancel and for local storage errors.
+- The `storage` feature did not compile without `http`.
+- DHT announces blocked a runtime worker thread for several seconds.
+
 ## [0.6.4] - 2026-10-09
 
 Application audit release: every item below was reproduced with a failing
@@ -602,7 +713,8 @@ adds proper infrastructure, and restructures the public API.
 - Crash recovery and resume
 - Segment-level progress tracking for HTTP downloads
 
-[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.4...HEAD
+[Unreleased]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.3...v0.7.0
 [0.6.4]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/goshitsarch-eng/gosh-dl/compare/v0.6.1...v0.6.2

@@ -93,11 +93,11 @@ for the rollout audit and remaining validation work.
 
 ## Quick Start
 
-Requires Rust 1.85 or newer. Add the published crate to your `Cargo.toml`:
+Requires Rust 1.89 or newer. Add the published crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gosh-dl = "0.6.4"
+gosh-dl = "0.7.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -106,7 +106,7 @@ Optional features: `recursive-http` (directory mirroring) and `metalink`
 
 ```toml
 [dependencies]
-gosh-dl = { version = "0.6.4", features = ["recursive-http"] }
+gosh-dl = { version = "0.7.0", features = ["recursive-http"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -205,9 +205,21 @@ repair, and deletion. `max_connections: Some(0)` is rejected.
 `cancel(id, true)` re-validates the output path before deleting anything. For
 an HTTP download it removes the `.part` file, and the final file only if the
 download had completed; a pre-existing file or directory that merely shares
-the name is left alone. For torrents it removes the torrent's file or
-directory; a magnet that never received metadata has nothing on disk and
-nothing is deleted.
+the name is left alone. For torrents it removes the files listed in the
+torrent and any directories that leaves empty; other files in a directory
+that shares the torrent's name are kept. A magnet that never received
+metadata has nothing on disk and nothing is deleted.
+
+When an HTTP download finishes, its `.part` file is renamed onto the final
+name. By default an existing file with that name is replaced. Call
+`engine.set_file_conflict_policy(..)` to change that for the whole engine:
+`FileConflictPolicy::Rename` keeps the existing file and saves the download
+as `name (1).ext`, `name (2).ext`, ... (the status's `metadata.filename`
+reports the name used); `FileConflictPolicy::Fail` keeps the existing file,
+leaves the finished data in the `.part` file and fails the download with a
+storage error of kind `AlreadyExists`, so the application can resolve the
+conflict and call `resume(id)`. The policy is not persisted; set it after
+creating the engine.
 
 `pause(id)` and `cancel(id, ..)` return only after the HTTP worker has stopped
 (bounded wait), so a resume that follows cannot race the previous worker's
@@ -219,9 +231,13 @@ still supports ranges and the remote file is unchanged; a failed torrent
 re-checks its pieces and re-enters the queue. `resume_all()` leaves failed
 downloads alone.
 
-HEAD probes carry the same custom headers, Referer, and cookies as the
-download. If the probe fails, the engine tries GET as a single stream and
-ignores metadata from the failed HEAD response.
+Capability probes carry the same custom headers, Referer, and cookies as the
+download. The engine probes with HEAD first; if the server refuses HEAD (a
+pre-signed URL that is only valid for GET, a `405`), it probes with
+`GET` + `Range: bytes=0-0` instead, so such URLs still get multi-connection
+downloads and resume. If both probes fail, the engine downloads with a single
+GET. Transient failures (timeouts, dropped connections, `408`/`429`/`5xx`)
+are retried with back-off on both the single- and multi-connection paths.
 
 Pausing a torrent stops its worker, its peer connections, and releases its
 concurrency slot. Resume reconstructs a worker from available metainfo and
@@ -684,7 +700,7 @@ A standalone `gosh-dl` CLI application is now available and can be found here: [
 
 ### What Rust version is required?
 
-gosh-dl requires Rust 1.85+ for async trait support.
+gosh-dl requires Rust 1.89+ (set by the bundled-SQLite dependency that carries current security fixes).
 
 ### Does gosh-dl work on Windows?
 

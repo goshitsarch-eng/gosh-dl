@@ -78,7 +78,7 @@ impl ChokingManager {
             config,
             last_recalculate: Instant::now(),
             // Allow immediate first optimistic selection
-            last_optimistic_rotate: Instant::now() - Duration::from_secs(60),
+            last_optimistic_rotate: instant_ago(Duration::from_secs(60)),
             optimistic_peer: None,
             rng_counter: 0,
         }
@@ -208,7 +208,7 @@ impl ChokingManager {
 
     /// Force recalculation on next call (useful after peer disconnect).
     pub fn invalidate(&mut self) {
-        self.last_recalculate = Instant::now() - self.config.recalculate_interval;
+        self.last_recalculate = instant_ago(self.config.recalculate_interval);
     }
 
     /// Remove a peer from optimistic slot if it disconnects.
@@ -216,9 +216,21 @@ impl ChokingManager {
         if self.optimistic_peer.as_ref() == Some(addr) {
             self.optimistic_peer = None;
             // Allow immediate re-selection
-            self.last_optimistic_rotate = Instant::now() - self.config.optimistic_interval;
+            self.last_optimistic_rotate = instant_ago(self.config.optimistic_interval);
         }
     }
+}
+
+/// `Instant::now() - ago`, without the panic.
+///
+/// `Instant - Duration` panics when the result would precede the platform's
+/// monotonic epoch, which is typically boot time: a client started within
+/// the first minute of uptime (a service launched at login, say) used to
+/// crash in `ChokingManager::new`. Falling back to "now" merely delays the
+/// first rotation by one interval in that corner case.
+fn instant_ago(ago: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_sub(ago).unwrap_or(now)
 }
 
 #[cfg(test)]

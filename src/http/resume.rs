@@ -84,53 +84,24 @@ pub async fn check_resume(
         0
     };
 
-    // Send HEAD request to check server capabilities
-    let response = client
-        .head(url)
-        .header("User-Agent", user_agent)
-        .header("Accept-Encoding", ACCEPT_ENCODING_IDENTITY)
-        .send()
-        .await
-        .map_err(|e| {
-            EngineError::protocol(
-                ProtocolErrorKind::InvalidResponse,
-                format!("HEAD request failed: {}", e),
-            )
-        })?;
-
-    if !response.status().is_success() {
-        return Err(EngineError::protocol(
+    // Check server capabilities: HEAD, falling back to a one-byte ranged
+    // GET for servers that refuse HEAD (pre-signed GET-only URLs).
+    let (capabilities, _) = super::segment::probe_with_get_fallback(
+        client.head(url).header("User-Agent", user_agent),
+        client.get(url).header("User-Agent", user_agent),
+    )
+    .await
+    .map_err(|e| {
+        EngineError::protocol(
             ProtocolErrorKind::InvalidResponse,
-            format!("HEAD request returned: {}", response.status()),
-        ));
-    }
+            format!("Capability probe failed: {}", e),
+        )
+    })?;
 
-    let headers = response.headers();
-
-    // Check Accept-Ranges header
-    let supports_range = headers
-        .get("accept-ranges")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("bytes"))
-        .unwrap_or(false);
-
-    // Get ETag
-    let etag = headers
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    // Get Last-Modified
-    let last_modified = headers
-        .get("last-modified")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    // Get Content-Length
-    let content_length = headers
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
+    let supports_range = capabilities.supports_range;
+    let etag = capabilities.etag;
+    let last_modified = capabilities.last_modified;
+    let content_length = capabilities.content_length;
 
     // Determine if we can resume
     let can_resume = if existing_size == 0 {

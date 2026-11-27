@@ -266,7 +266,6 @@ impl BencodeValue {
 
         let mut items = BTreeMap::new();
         let mut remaining = &data[1..]; // Skip 'd'
-        let mut last_key: Option<Vec<u8>> = None;
 
         while !remaining.is_empty() && remaining[0] != b'e' {
             // Parse key (must be a string)
@@ -281,16 +280,18 @@ impl BencodeValue {
                 }
             };
 
-            // Keys must be in sorted order
-            if let Some(ref lk) = last_key {
-                if &key <= lk {
-                    return Err(EngineError::protocol(
-                        ProtocolErrorKind::BencodeParse,
-                        "Dict keys not in sorted order",
-                    ));
-                }
+            // The spec asks for sorted keys, but plenty of trackers and a
+            // fair number of .torrent files in the wild don't comply, and
+            // every mainstream client accepts them. Order is therefore not
+            // enforced; nothing here depends on it (the info-hash is taken
+            // from the raw bytes, never from a re-encoding). A *repeated*
+            // key is still rejected: which value wins would be ambiguous.
+            if items.contains_key(&key) {
+                return Err(EngineError::protocol(
+                    ProtocolErrorKind::BencodeParse,
+                    "Duplicate dict key",
+                ));
             }
-            last_key = Some(key.clone());
 
             remaining = key_result.remaining;
 
@@ -732,5 +733,32 @@ mod tests {
             Some(3)
         );
         assert!(value.get("missing").is_none());
+    }
+
+    /// Original behaviour: a dictionary whose keys were not in sorted order
+    /// was rejected outright. Real trackers and a number of .torrent files
+    /// don't sort their keys, so their responses were unusable ("Invalid
+    /// tracker response encoding").
+    #[test]
+    fn test_unsorted_dict_keys_are_accepted() {
+        // "peers" before "interval": out of order, as some trackers send it.
+        let value = BencodeValue::parse_exact(b"d5:peers0:8:intervali1800ee").unwrap();
+        assert_eq!(value.get("interval").and_then(|v| v.as_int()), Some(1800));
+        assert!(value.get("peers").is_some());
+
+        // The info dict is located from the raw bytes, so its hash input is
+        // untouched by the parser's (sorted) in-memory representation.
+        let info = b"d4:name1:x6:lengthi1ee";
+        let mut torrent = b"d4:info".to_vec();
+        torrent.extend_from_slice(info);
+        torrent.extend_from_slice(b"8:announce3:urle");
+        assert_eq!(find_info_dict_bytes(&torrent).unwrap(), &info[..]);
+    }
+
+    #[test]
+    fn test_duplicate_dict_keys_are_rejected() {
+        // Which value wins would be ambiguous.
+        assert!(BencodeValue::parse_exact(b"d1:ai1e1:ai2ee").is_err());
+        assert!(BencodeValue::parse_exact(b"d1:ai1e1:bi2e1:ai3ee").is_err());
     }
 }

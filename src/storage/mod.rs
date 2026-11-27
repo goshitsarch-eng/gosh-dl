@@ -74,7 +74,9 @@ impl Segment {
 
     /// Get the total size of this segment
     pub fn size(&self) -> u64 {
-        self.end - self.start + 1
+        // Saturating: a corrupt persisted record (end < start) must not
+        // panic the caller.
+        self.end.saturating_sub(self.start).saturating_add(1)
     }
 
     /// Check if segment is complete
